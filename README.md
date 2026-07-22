@@ -10,18 +10,27 @@ Declarative YAML playbooks for multi-step AI automations — CLI-first Ruby gem 
 
 ## Quick start
 
+### Standalone (`riggs serve`)
+
 ```bash
 bundle install
 bundle exec rake install   # or use bin/riggs from the repo
 cd /path/to/your/project
 riggs setup
 riggs identity:show
+riggs config:show
 riggs workflow:validate example_triage
 riggs workflow:simulate example_triage
 riggs workflow:run example_triage --ticket="Login ERROR timeout" --auto-approve
 riggs memory:persist "Users hit OAuth expiry on login"
 riggs memory:recall "OAuth login"
+
+# Web UI + JSON API (no Rails required)
+riggs serve --port 4567
+# open http://127.0.0.1:4567 — switch user, edit config, run playbooks
 ```
+
+Auth for the web app: logged-in cookie (User page), `X-Riggs-User` header, `?user=`, or `Riggs.identity_mapper` in a host process.
 
 ## Identity & RBAC
 
@@ -43,8 +52,32 @@ riggs workflow:run example_triage --user=eng_bob --auto-approve
 Workflows live in `config/riggs/workflows/*.yml`. See `example_triage.yml` for branching (`if contains ERROR`), HITL (`gates: [approval]`), templates (`{{workflow.step.var}}`), and `max_llm_calls` / `timeout_seconds` guardrails.
 
 ```bash
+# Interactive composer (TTY): prompts for triggers, relay_chain, steps, gates
 riggs workflow:new my_playbook
+
+# Scripts / CI: skip prompts
+riggs workflow:new my_playbook --non-interactive --trigger=keyword --keywords=triage,ticket
 ```
+
+Hand-edit YAML anytime; `workflow:validate` / the composer’s post-write check catch cycles and bad `next` refs.
+
+## Triggers
+
+Playbooks declare `triggers:` (manual and/or keyword). Keyword match is used to find which playbook fits incoming text; manual means “run from CLI/UI” and does not match arbitrary text by itself.
+
+```yaml
+triggers:
+  - type: manual
+  - type: keyword
+    keywords: [triage, ticket]
+```
+
+```bash
+riggs triggers:list
+riggs triggers:match "please triage this"
+```
+
+Web: `/triggers` and `GET /api/triggers/match?q=…` (requires `read_workflow`).
 
 ## Providers & relay chain
 
@@ -136,24 +169,54 @@ riggs mcp:ping github
 
 **Note:** Cursor/Claude/Codex CLI providers do not use native tool APIs yet — tools are advertised in the system prompt and `TOOL:` lines are parsed.
 
-## Rails engine
+## Rails host vs standalone
+
+**Standalone** — CLI + `riggs serve` against `Dir.pwd` (`.agent_hubrc` + `db/riggs.sqlite3`). Best for PM config and engineer ops without a Rails app.
+
+**Rails host** — optional thin engine that mounts the same Rack app:
 
 ```ruby
 # Gemfile
 gem "riggs"
-gem "rails" # host app
+gem "rails" # host app only
 
 # config/routes.rb
 mount Riggs::Engine => "/riggs"
+
+# optional identity bridge
+Riggs.identity_mapper = ->(request) {
+  # map host current_user → hubrc user key
+  request.env["warden"]&.user&.riggs_user_id
+}
 ```
 
-Pass identity with `X-Riggs-User` header or map `current_user` via a host helper.
+Pass identity with `X-Riggs-User`, the web User picker, or `Riggs.identity_mapper`. There is no duplicated controller logic — Engine routes forward to `Riggs::Web::App`.
+
+### PM configuration walkthrough
+
+1. `riggs setup` (or open Config in the web UI).
+2. As a PM user, edit users/roles, providers, MCP servers, and memory paths under **Config** (or `PATCH /api/config`).
+3. Add playbooks under `config/riggs/workflows/` (CLI `workflow:new` or hand-edit YAML).
+4. Engineers run playbooks from **Playbooks** or `riggs workflow:run`; approve HITL via **Runs** (`POST /api/sessions/:id/approve|reject`) — decision is audited; interactive resume still works best from CLI until full pause/resume storage lands.
+5. Inspect memory under **Memory** (`GET /api/memory/search?q=`).
+
+Stable JSON API (same app): `GET/PATCH /api/config`, `GET /api/workflows`, `POST /api/workflows/:name/run`, `GET /api/sessions/:id`, `GET /api/sessions/:id/audit`, `POST .../approve|reject`, `GET /api/memory/search`, `GET /api/skills`, `GET /api/mcp/servers`, `GET /api/triggers`, `GET /api/triggers/match?q=`.
 
 ## Development
 
 ```bash
 bundle exec rake test
+bundle exec rubocop
 ```
+
+Default CI is Rails-free (Ruby 4.0 + Rack::Test). sqlite-memory extensions are optional locally via `RIGGS_VECTOR_EXT` / `RIGGS_MEMORY_EXT` / `RIGGS_EMBED_MODEL` — CI uses the FTS fallback.
+
+### Cutting a release
+
+1. Bump [`lib/riggs/version.rb`](lib/riggs/version.rb) and update [`CHANGELOG.md`](CHANGELOG.md).
+2. Ensure Phase 4+ sources are tracked (`lib/riggs/web/**`, `config_store.rb`) so `gem build` includes them (`git ls-files` drives the gemspec).
+3. `bundle exec rake test && bundle exec rubocop`
+4. `gem build riggs.gemspec` then publish when ready (`gem push` — not automated here).
 
 ## License
 

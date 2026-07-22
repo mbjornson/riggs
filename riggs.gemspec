@@ -44,6 +44,11 @@ Gem::Specification.new do |spec|
 
   spec.add_dependency "concurrent-ruby", "~> 1.2"
   spec.add_dependency "psych", ">= 4.0"
+  spec.add_dependency "rack", ">= 2.2", "< 4"
+  spec.add_dependency "rackup", ">= 2.1"
   spec.add_dependency "sqlite3", ">= 1.6"
   spec.add_dependency "thor", "~> 1.3"
+  spec.add_dependency "webrick", ">= 1.8"
+
+  spec.add_development_dependency "rack-test", ">= 2.0"
 end

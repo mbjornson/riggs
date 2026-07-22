@@ -1,0 +1,23 @@
+<h1>Sessions</h1>
+<p class="lead">Recent runs from SQLite.</p>
+
+<div class="panel">
+  <% if sessions.empty? %>
+    <p class="muted">No sessions yet.</p>
+  <% else %>
+    <table>
+      <thead><tr><th>ID</th><th>Workflow</th><th>User</th><th>Status</th><th>Started</th></tr></thead>
+      <tbody>
+        <% sessions.each do |s| %>
+          <tr>
+            <td><a class="mono" href="<%= h(url("/sessions/#{s['id']}")) %>"><%= h(s['id'].to_s[0, 8]) %>…</a></td>
+            <td><%= h(s['workflow_name'].to_s) %></td>
+            <td><%= h(s['user_id'].to_s) %></td>
+            <td><%= h(s['status'].to_s) %></td>
+            <td class="muted"><%= h(s['started_at'].to_s) %></td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  <% end %>
+</div>

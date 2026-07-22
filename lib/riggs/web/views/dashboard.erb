@@ -1,0 +1,29 @@
+<h1>Riggs</h1>
+<p class="lead">PM configuration and playbook operations for this project.</p>
+
+<div class="grid">
+  <div class="tile">
+    <strong>Playbooks</strong>
+    <a href="<%= h(url('/workflows')) %>">Browse &amp; run</a>
+  </div>
+  <div class="tile">
+    <strong>Configuration</strong>
+    <a href="<%= h(url('/config')) %>">Users, providers, MCP</a>
+  </div>
+  <div class="tile">
+    <strong>Runs / HITL</strong>
+    <a href="<%= h(url('/sessions')) %>">Sessions &amp; gates</a>
+  </div>
+  <div class="tile">
+    <strong>Memory</strong>
+    <a href="<%= h(url('/memory')) %>">Namespaced recall</a>
+  </div>
+</div>
+
+<div class="panel">
+  <p class="muted" style="margin:0">
+    Signed in as <strong><%= h(@identity[:id]) %></strong>
+    (<%= h(@identity[:permissions].join(', ')) %>).
+    Use <code>X-Riggs-User</code> or the User page to switch.
+  </p>
+</div>

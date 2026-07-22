@@ -54,13 +54,14 @@ module Riggs
     end
 
     def update_session(session_id, status:, ended: false)
+      sid = utf8(session_id)
       if ended
         @db.execute(
           "UPDATE riggs_sessions SET status = ?, ended_at = CURRENT_TIMESTAMP WHERE id = ?",
-          [status, session_id]
+          [status, sid]
         )
       else
-        @db.execute("UPDATE riggs_sessions SET status = ? WHERE id = ?", [status, session_id])
+        @db.execute("UPDATE riggs_sessions SET status = ? WHERE id = ?", [status, sid])
       end
     end
 
@@ -69,21 +70,22 @@ module Riggs
       @db.execute(
         "INSERT INTO riggs_steps (id, session_id, step_key, label, status, input_preview, output_var_name) " \
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [id, session_id, step_key, label, status, input_preview, output_var_name]
+        [id, utf8(session_id), step_key, label, status, input_preview, output_var_name]
       )
       id
     end
 
     def update_step(step_id, status:, gate_decided: false)
+      sid = utf8(step_id)
       if gate_decided
         @db.execute(
           "UPDATE riggs_steps SET status = ?, gate_decided_at = CURRENT_TIMESTAMP, executed_at = CURRENT_TIMESTAMP WHERE id = ?",
-          [status, step_id]
+          [status, sid]
         )
       else
         @db.execute(
           "UPDATE riggs_steps SET status = ?, executed_at = CURRENT_TIMESTAMP WHERE id = ?",
-          [status, step_id]
+          [status, sid]
         )
       end
     end
@@ -91,23 +93,35 @@ module Riggs
     def audit(session_id:, event_type:, payload: {})
       @db.execute(
         "INSERT INTO riggs_audit (session_id, event_type, payload) VALUES (?, ?, ?)",
-        [session_id, event_type, JSON.generate(payload)]
+        [utf8(session_id), event_type, JSON.generate(payload)]
       )
     end
 
     def list_audit(session_id)
       @db.execute(
         "SELECT id, event_type, payload, created_at FROM riggs_audit WHERE session_id = ? ORDER BY id ASC",
-        [session_id]
+        [utf8(session_id)]
       )
     end
 
     def find_session(session_id)
-      @db.get_first_row("SELECT * FROM riggs_sessions WHERE id = ?", [session_id])
+      @db.get_first_row("SELECT * FROM riggs_sessions WHERE id = ?", [utf8(session_id)])
     end
 
     def close
       @db&.close
+    end
+
+    # Rack path captures are often ASCII-8BIT; sqlite3 binds those as BLOBs.
+    def self.utf8(value)
+      str = value.to_s
+      str = str.dup if str.frozen?
+      str.force_encoding(Encoding::UTF_8)
+      str.valid_encoding? ? str : str.encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
+    end
+
+    def utf8(value)
+      self.class.utf8(value)
     end
 
     private

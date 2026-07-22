@@ -11,6 +11,7 @@ end
 
 require_relative "riggs/version"
 require_relative "riggs/identity"
+require_relative "riggs/config_store"
 require_relative "riggs/storage"
 require_relative "riggs/memory/service"
 require_relative "riggs/workflow/loader"
@@ -20,6 +21,7 @@ require_relative "riggs/skills/registry"
 require_relative "riggs/mcp/client"
 require_relative "riggs/mcp/manager"
 require_relative "riggs/triggers"
+require_relative "riggs/web/app"
 require_relative "riggs/cli/commands"
 
 begin

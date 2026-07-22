@@ -1,0 +1,33 @@
+<h1><%= h(workflow[:display_name] || name) %></h1>
+<p class="lead mono"><%= h(name) %></p>
+
+<div class="panel">
+  <% if report[:valid] %>
+    <p>✅ Valid playbook</p>
+  <% else %>
+    <p>❌ <%= h(report[:errors].join('; ')) %></p>
+  <% end %>
+  <table>
+    <thead><tr><th>Step</th><th>Label</th><th>Gates</th><th>Next</th></tr></thead>
+    <tbody>
+      <% workflow[:steps].each do |s| %>
+        <tr>
+          <td class="mono"><%= h(s.id) %></td>
+          <td><%= h(s.label) %></td>
+          <td><%= h(Array(s.gates).join(', ')) %></td>
+          <td class="mono"><%= h(s.next.to_s) %></td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+</div>
+
+<h2>Run</h2>
+<form method="post" action="<%= h(url("/workflows/#{name}/run")) %>" class="panel">
+  <div class="row">
+    <label>ticket<input name="ticket" placeholder="Login ERROR timeout" size="40"></label>
+    <label><input type="checkbox" name="auto_approve" value="1" checked> auto-approve gates</label>
+  </div>
+  <p><button type="submit">Run playbook</button></p>
+  <p class="muted">Requires <code>run_workflow</code>. Interactive CLI gates: use <code>riggs workflow:run</code>.</p>
+</form>

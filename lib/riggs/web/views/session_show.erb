@@ -1,0 +1,41 @@
+<h1>Session</h1>
+<p class="lead mono"><%= h(session['id']) %></p>
+
+<div class="panel">
+  <table>
+    <tr><th>Workflow</th><td><%= h(session['workflow_name'].to_s) %></td></tr>
+    <tr><th>User</th><td><%= h(session['user_id'].to_s) %></td></tr>
+    <tr><th>Status</th><td><%= h(session['status'].to_s) %></td></tr>
+    <tr><th>Namespace</th><td><%= h(session['memory_namespace'].to_s) %></td></tr>
+    <tr><th>Started</th><td><%= h(session['started_at'].to_s) %></td></tr>
+    <tr><th>Ended</th><td><%= h(session['ended_at'].to_s) %></td></tr>
+  </table>
+</div>
+
+<% if session['status'].to_s == 'awaiting_approval' || session['status'].to_s == 'approved_pending_resume' %>
+  <div class="panel">
+    <p>HITL: record approve/reject. Full step resume from a paused GraphEngine may require CLI re-run with <code>--auto-approve</code> until pause/resume storage lands.</p>
+    <form method="post" action="<%= h(url("/sessions/#{session['id']}/approve")) %>" style="display:inline">
+      <button type="submit">Approve</button>
+    </form>
+    <form method="post" action="<%= h(url("/sessions/#{session['id']}/reject")) %>" style="display:inline">
+      <button type="submit" class="danger">Reject</button>
+    </form>
+  </div>
+<% end %>
+
+<h2>Audit</h2>
+<div class="panel">
+  <table>
+    <thead><tr><th>When</th><th>Event</th><th>Payload</th></tr></thead>
+    <tbody>
+      <% audit.each do |row| %>
+        <tr>
+          <td class="muted"><%= h(row['created_at'].to_s) %></td>
+          <td><%= h(row['event_type'].to_s) %></td>
+          <td class="mono"><%= h(row['payload'].to_s[0, 200]) %></td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+</div>

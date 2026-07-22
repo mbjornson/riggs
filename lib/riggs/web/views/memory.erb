@@ -1,0 +1,29 @@
+<h1>Memory</h1>
+<p class="lead">Recall in namespace <code><%= h(@identity[:memory_namespace]) %></code>.</p>
+
+<form method="get" action="<%= h(url('/memory')) %>" class="panel">
+  <div class="row">
+    <label>Query<input name="q" value="<%= h(query) %>" size="40"></label>
+    <button type="submit">Search</button>
+  </div>
+</form>
+
+<div class="panel">
+  <% if query.empty? %>
+    <p class="muted">Enter a query to search.</p>
+  <% elsif hits.empty? %>
+    <p class="muted">No hits.</p>
+  <% else %>
+    <table>
+      <thead><tr><th>Score</th><th>Content</th></tr></thead>
+      <tbody>
+        <% hits.each do |hit| %>
+          <tr>
+            <td><%= h((hit[:score] || hit['score']).to_s) %></td>
+            <td><%= h((hit[:content] || hit['content'] || hit[:text] || hit.to_s).to_s) %></td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  <% end %>
+</div>

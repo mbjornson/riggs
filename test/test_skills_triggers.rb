@@ -18,6 +18,8 @@ class TestSkillsAndTriggers < Minitest::Test
     with_tmp_project do
       workflow = Riggs::Workflow::Loader.load(path: "config/riggs/workflows/example_triage.yml")
       assert Riggs::Triggers.match(workflow, text: "please triage this")
+      refute Riggs::Triggers.match(workflow, text: "unrelated hello")
+      assert Riggs::Triggers.match(workflow, text: nil), "blank text matches manual"
       refute Riggs::Triggers.match(
         { triggers: [{ type: "keyword", keywords: ["invoice"] }] },
         text: "hello"
