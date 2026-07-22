@@ -71,4 +71,14 @@ class TestLoader < Minitest::Test
     assert_equal "debug", Riggs::Workflow::Loader.resolve_next(step, outputs: { "c_result" => "foo ERROR bar" })
     assert_equal "summarize", Riggs::Workflow::Loader.resolve_next(step, outputs: { "c_result" => "all good" })
   end
+
+  def test_unmet_conditional_next_without_else_ends_workflow
+    step = Riggs::Workflow::StepNode.from_hash(id: "c", next: "if contains ERROR: escalate")
+    assert_nil Riggs::Workflow::Loader.resolve_next(step, outputs: { "c_result" => "classification=OK" })
+  end
+
+  def test_unmet_gate_conditional_next_ends_workflow
+    step = Riggs::Workflow::StepNode.from_hash(id: "g", next: "if gate.approved: deploy")
+    assert_nil Riggs::Workflow::Loader.resolve_next(step, outputs: {}, gate_decision: :rejected)
+  end
 end

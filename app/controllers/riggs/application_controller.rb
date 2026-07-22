@@ -23,7 +23,7 @@ module Riggs
 
     def require_riggs_permission!(*perms)
       return if Identity.permitted?(riggs_identity, *perms) ||
-                perms.flatten.map(&:to_s).any? { |p| riggs_identity[:permissions].include?(p) }
+                perms.flatten.map(&:to_s).intersect?(riggs_identity[:permissions])
 
       render plain: "Forbidden", status: :forbidden
     end

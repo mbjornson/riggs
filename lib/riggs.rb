@@ -18,6 +18,7 @@ require_relative "riggs/workflow/graph_engine"
 require_relative "riggs/providers/router"
 require_relative "riggs/skills/registry"
 require_relative "riggs/mcp/client"
+require_relative "riggs/mcp/manager"
 require_relative "riggs/triggers"
 require_relative "riggs/cli/commands"
 

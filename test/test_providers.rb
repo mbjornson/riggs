@@ -1,11 +1,12 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "rbconfig"
 
 class TestProviders < Minitest::Test
   FakeRunner = Struct.new(:handler) do
-    def run(**kwargs)
-      handler.call(**kwargs)
+    def run(**)
+      handler.call(**)
     end
   end
 
@@ -39,6 +40,21 @@ class TestProviders < Minitest::Test
       }
     )
     result = router.call(chain: %w[fail mock], messages: [{ role: "user", content: "hi" }])
+    assert_equal "mock", result[:provider]
+    assert_equal 2, result[:relay_attempt]
+  end
+
+  def test_unknown_provider_name_raises_instead_of_mocking
+    router = Riggs::Providers::Router.new
+    err = assert_raises(Riggs::Providers::Error) do
+      router.call(chain: ["anthorpic"], messages: [{ role: "user", content: "hi" }])
+    end
+    assert_match(/anthorpic/, err.message)
+  end
+
+  def test_unknown_provider_fails_over_to_next_in_chain
+    router = Riggs::Providers::Router.new
+    result = router.call(chain: %w[anthorpic mock], messages: [{ role: "user", content: "hi" }])
     assert_equal "mock", result[:provider]
     assert_equal 2, result[:relay_attempt]
   end
@@ -130,8 +146,8 @@ class TestProviders < Minitest::Test
   def test_cursor_cli_requires_api_key
     ENV.delete("CURSOR_API_KEY")
     provider = Riggs::Providers::CursorCli.new(name: "cursor", options: {
-      runner: FakeRunner.new(->(**_) { raise "should not run" })
-    })
+                                                 runner: FakeRunner.new(->(**_) { raise "should not run" })
+                                               })
     assert_raises(Riggs::Providers::Error) do
       provider.complete(messages: [{ role: "user", content: "hi" }])
     end
@@ -140,6 +156,33 @@ class TestProviders < Minitest::Test
   def test_cli_runner_missing_binary
     assert_raises(Riggs::Providers::Error) do
       Riggs::Providers::CliRunner.run(command: "riggs-nonexistent-binary-xyz", args: [], timeout: 1)
+    end
+  end
+
+  def test_cli_runner_kills_child_on_timeout
+    Dir.mktmpdir do |dir|
+      pid_file = File.join(dir, "pid")
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      assert_raises(Riggs::Providers::TimeoutError) do
+        Riggs::Providers::CliRunner.run(
+          command: RbConfig.ruby,
+          args: ["-e", "File.write(ARGV[0], Process.pid); sleep 15", pid_file],
+          timeout: 1
+        )
+      end
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+      assert_operator elapsed, :<, 5, "run must return promptly on timeout, took #{elapsed.round(1)}s"
+
+      pid = File.read(pid_file).to_i
+      dead = false
+      20.times do
+        Process.kill(0, pid)
+        sleep 0.05
+      rescue Errno::ESRCH
+        dead = true
+        break
+      end
+      assert dead, "child process #{pid} still running after timeout"
     end
   end
 
@@ -177,6 +220,49 @@ class TestProviders < Minitest::Test
     ENV.delete("CURSOR_API_KEY")
   end
 
+  def test_cursor_cloud_completes_through_router_when_tools_present
+    ENV["CURSOR_API_KEY"] = "crsr_test"
+    http = lambda { |method, path, _body|
+      case [method, path]
+      when [:post, "/v1/agents"]
+        {
+          "agent" => { "id" => "bc-1", "latestRunId" => "run-1" },
+          "run" => { "id" => "run-1", "status" => "CREATING" }
+        }
+      when [:get, "/v1/agents/bc-1/runs/run-1"]
+        { "id" => "run-1", "status" => "FINISHED", "result" => "cloud done", "durationMs" => 12 }
+      else
+        raise "unexpected #{method} #{path}"
+      end
+    }
+
+    router = Riggs::Providers::Router.new(
+      hub_providers: {
+        "cursor_cloud" => {
+          type: "cursor_cloud",
+          http_client: http,
+          repos: [{ url: "https://github.com/org/repo" }],
+          poll_interval_seconds: 0
+        }
+      }
+    )
+    result = router.call(
+      chain: ["cursor_cloud"],
+      messages: [{ role: "user", content: "ship it" }],
+      tools: [{ name: "lookup_runbook", description: "d", input_schema: { type: "object" } }]
+    )
+    assert_equal "cloud done", result[:content]
+    assert_equal "cursor_cloud", result[:provider]
+  ensure
+    ENV.delete("CURSOR_API_KEY")
+  end
+
+  def test_cursor_cloud_request_uses_bearer_auth
+    provider = Riggs::Providers::CursorCloud.new(name: "cursor_cloud", options: {})
+    req = provider.send(:build_request, :post, URI("https://api.cursor.com/v1/agents"), api_key: "crsr_k", body: {})
+    assert_equal "Bearer crsr_k", req["authorization"]
+  end
+
   def test_cursor_cloud_requires_repos
     ENV["CURSOR_API_KEY"] = "crsr_test"
     provider = Riggs::Providers::CursorCloud.new(name: "cursor_cloud", options: { repos: [] })
@@ -188,22 +274,40 @@ class TestProviders < Minitest::Test
     ENV.delete("CURSOR_API_KEY")
   end
 
-  def test_router_failover_cursor_to_mock
-    ENV["CURSOR_API_KEY"] = "crsr_test"
-    failing_runner = FakeRunner.new(lambda { |**_|
-      raise Riggs::Providers::RateLimitError, "cli 429"
-    })
+  def test_mock_tool_calls_when_tools_present
+    mock = Riggs::Providers::Mock.new(name: "mock")
+    tools = [{ name: "lookup_runbook", description: "x", input_schema: {} }]
+    result = mock.complete(
+      messages: [{ role: "user", content: "please lookup runbook for oauth" }],
+      tools: tools
+    )
+    refute_empty result[:tool_calls]
+    assert_equal "lookup_runbook", result[:tool_calls].first[:name]
+  end
 
-    router = Riggs::Providers::Router.new(
-      hub_providers: {
-        "cursor" => { type: "cursor", runner: failing_runner },
-        "mock" => { type: "mock" }
+  def test_anthropic_includes_tools_in_body
+    captured = nil
+    provider = Riggs::Providers::Anthropic.new(
+      name: "claude",
+      options: {
+        api_key: "sk-test",
+        http_client: lambda { |body|
+          captured = body
+          {
+            provider: "claude",
+            content: "ok",
+            tool_calls: [],
+            usage: {},
+            raw: {}
+          }
+        }
       }
     )
-    # CursorCli receives options including runner from hub config
-    result = router.call(chain: %w[cursor mock], messages: [{ role: "user", content: "hi" }])
-    assert_equal "mock", result[:provider]
-  ensure
-    ENV.delete("CURSOR_API_KEY")
+    provider.complete(
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ name: "lookup_runbook", description: "d", input_schema: { type: "object" } }]
+    )
+    assert captured[:tools]
+    assert_equal "lookup_runbook", captured[:tools].first[:name]
   end
 end

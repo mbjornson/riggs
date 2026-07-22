@@ -17,7 +17,7 @@ module Riggs
       end
 
       def child_env
-        { "CURSOR_API_KEY" => ENV["CURSOR_API_KEY"] }.compact
+        { "CURSOR_API_KEY" => ENV.fetch("CURSOR_API_KEY", nil) }.compact
       end
 
       def argv_for(prompt)

@@ -1,26 +1,48 @@
 AllCops:
   NewCops: enable
-  TargetRubyVersion: 3.2
+  TargetRubyVersion: 4.0
   SuggestExtensions: false
 
-# Relaxed for CLI/Thor args & YAML parsing, strict elsewhere
 Layout/LineLength:
-  Max: 120
+  Max: 130
 
+# Codebase convention is double quotes throughout
 Style/StringLiterals:
-  EnforcedStyle: single_quotes
+  EnforcedStyle: double_quotes
 
-Style/FrozenStringLiteralComment: true
+Style/FrozenStringLiteralComment:
+  Enabled: true
 
+Style/Documentation:
+  Enabled: false
+
+# CLI/engine methods are long by nature; revisit per-method if they grow
+Metrics:
+  Enabled: false
+
+# Thor/CLI arg blocks intentionally ambiguous
 Lint/AmbiguousBlockAssociation:
-  Enabled: false # Thor/CLI arg blocks intentionally ambiguous
+  Enabled: false
 
-Security/Open:
-  Enabled: true
+# Provider#complete keyword args are an interface contract; renaming them
+# to _tools/_system would break every caller
+Lint/UnusedMethodArgument:
+  AllowUnusedKeywordArguments: true
 
-Performance:
-  Enabled: true
+Naming/MethodParameterName:
+  MinNameLength: 1
 
-# Workflow YAML config files → allow relaxed style
-InheritFrom:
-  - rubocop-rails (optional later when you mount the engine)
+# MemoryService#persist returns a success boolean but is not a predicate
+Naming/PredicateMethod:
+  AllowedMethods:
+    - persist
+
+# Entrypoint defines Riggs::Error before requiring files that subclass it;
+# test_helper reopens Minitest::Test to mix in helpers
+Style/OneClassPerFile:
+  Exclude:
+    - lib/riggs.rb
+    - test/test_helper.rb
+
+Style/ClassAndModuleChildren:
+  Enabled: false

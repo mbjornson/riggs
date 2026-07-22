@@ -17,8 +17,8 @@ module Riggs
       end
 
       def child_env
-        key = ENV["CODEX_API_KEY"]
-        key = ENV["OPENAI_API_KEY"] if key.nil? || key.empty?
+        key = ENV.fetch("CODEX_API_KEY", nil)
+        key = ENV.fetch("OPENAI_API_KEY", nil) if key.nil? || key.empty?
         { "CODEX_API_KEY" => key }.compact
       end
 

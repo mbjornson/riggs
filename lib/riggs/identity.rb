@@ -8,7 +8,7 @@ module Riggs
 
     DEFAULT_ROLES = {
       pm: %w[edit_workflow manage_skills configure_memory publish read_workflow inspect_run],
-      engineer: %w[run_workflow approve_gates read_workflow inspect_run],
+      engineer: %w[run_workflow approve_gates read_workflow inspect_run manage_mcp],
       viewer: %w[read_workflow inspect_run]
     }.freeze
 

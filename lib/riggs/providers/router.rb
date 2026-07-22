@@ -35,30 +35,29 @@ module Riggs
         @registry = registry || BUILTINS
       end
 
-      def call(chain:, messages:, system: nil, timeout: 60, session_id: nil)
+      def call(chain:, messages:, system: nil, timeout: 60, session_id: nil, tools: nil)
         names = Array(chain).map(&:to_s)
         names = ["mock"] if names.empty?
         last_error = nil
 
         names.each_with_index do |name, idx|
           provider = build(name)
-          begin
-            result = provider.complete(messages: messages, system: system, timeout: timeout)
-            @audit&.call(
-              session_id: session_id,
-              event_type: "provider_success",
-              payload: { provider: name, attempt: idx + 1 }
-            )
-            return result.merge(relay_attempt: idx + 1)
-          rescue RateLimitError, TimeoutError, Error => e
-            last_error = e
-            @audit&.call(
-              session_id: session_id,
-              event_type: "provider_failover",
-              payload: { provider: name, attempt: idx + 1, error: e.class.name, message: e.message }
-            )
-            next
-          end
+          result = provider.complete(messages: messages, system: system, timeout: timeout, tools: tools)
+          result[:tool_calls] ||= []
+          @audit&.call(
+            session_id: session_id,
+            event_type: "provider_success",
+            payload: { provider: name, attempt: idx + 1 }
+          )
+          return result.merge(relay_attempt: idx + 1)
+        rescue RateLimitError, TimeoutError, Error => e
+          last_error = e
+          @audit&.call(
+            session_id: session_id,
+            event_type: "provider_failover",
+            payload: { provider: name, attempt: idx + 1, error: e.class.name, message: e.message }
+          )
+          next
         end
 
         raise Error, "All providers in relay_chain failed: #{last_error&.message}"
@@ -73,9 +72,8 @@ module Riggs
         if step.provider && !step.provider.empty?
           # Named chain lookup: provider: "default" or a hub/workflow alias with relay_chain
           named = provider_config(step.provider)
-          if named[:relay_chain]
-            return Array(named[:relay_chain]).map(&:to_s)
-          end
+          return Array(named[:relay_chain]).map(&:to_s) if named[:relay_chain]
+
           return [step.provider.to_s]
         end
 
@@ -97,7 +95,9 @@ module Riggs
         end
 
         type_key = opts[:type]&.to_s || key
-        klass = @registry[key] || @registry[type_key] || Mock
+        klass = @registry[key] || @registry[type_key]
+        raise Error, "Unknown provider '#{key}' (no registry entry for '#{key}' or type '#{type_key}')" unless klass
+
         klass.new(name: key, options: opts)
       end
 
@@ -106,8 +106,8 @@ module Riggs
         key = name.to_s
         hub = @hub_providers[key.to_sym] || @hub_providers[key] || {}
         wf = @workflow_providers[key.to_sym] || @workflow_providers[key] || {}
-        hub = hub.is_a?(Hash) ? hub : {}
-        wf = wf.is_a?(Hash) ? wf : {}
+        hub = {} unless hub.is_a?(Hash)
+        wf = {} unless wf.is_a?(Hash)
         Identity.deep_symbolize(hub).merge(Identity.deep_symbolize(wf))
       end
     end

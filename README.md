@@ -4,7 +4,7 @@ Declarative YAML playbooks for multi-step AI automations — CLI-first Ruby gem 
 
 ## Requirements
 
-- Ruby >= 3.2
+- Ruby >= 4.0
 - SQLite3
 - Optional: [sqlite-vector](https://github.com/sqliteai/sqlite-vector) + [sqlite-memory](https://github.com/sqliteai/sqlite-memory) for hybrid semantic search
 
@@ -108,15 +108,33 @@ If extensions are missing, Riggs automatically uses namespaced FTS5 in `riggs_me
 
 ## Skills & MCP
 
-- Skills: `config/riggs/skills/<name>/SKILL.yml`
-- MCP servers in `.agent_hubrc`:
+Skills live in `config/riggs/skills/<name>/SKILL.yml` (optional `prompt.md`). Load by name or pin a version:
+
+```bash
+riggs skills:list
+riggs skills:show triage_v1
+riggs skills:show triage_v1@1.0.0
+```
+
+Skill YAML may declare `tools:` and optional `mcp_servers:` allow-list. GraphEngine runs a multi-turn tool loop: provider may return native `tool_calls` (Anthropic/OpenAI) or `TOOL:name|{json}` (Mock/CLI fallback), results are executed via MCP or built-ins (`lookup_runbook`), then fed back until final text.
+
+Configure multiple MCP servers in `.agent_hubrc`:
 
 ```yaml
 mcp_servers:
   github:
     command: npx
     args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "…"
 ```
+
+```bash
+riggs mcp:list          # engineer (manage_mcp)
+riggs mcp:ping github
+```
+
+**Note:** Cursor/Claude/Codex CLI providers do not use native tool APIs yet — tools are advertised in the system prompt and `TOOL:` lines are parsed.
 
 ## Rails engine
 

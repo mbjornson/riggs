@@ -18,8 +18,8 @@ module Riggs
 
       def child_env
         {
-          "ANTHROPIC_API_KEY" => ENV["ANTHROPIC_API_KEY"],
-          "CLAUDE_CODE_OAUTH_TOKEN" => ENV["CLAUDE_CODE_OAUTH_TOKEN"]
+          "ANTHROPIC_API_KEY" => ENV.fetch("ANTHROPIC_API_KEY", nil),
+          "CLAUDE_CODE_OAUTH_TOKEN" => ENV.fetch("CLAUDE_CODE_OAUTH_TOKEN", nil)
         }.compact
       end
 

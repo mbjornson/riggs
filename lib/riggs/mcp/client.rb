@@ -31,6 +31,7 @@ module Riggs
       def start!
         return self if @wait_thr&.alive?
 
+        @initialized = false
         @stdin, @stdout, @wait_thr = Open3.popen2(@env.transform_keys(&:to_s), @command, *@args)
         initialize_session!
         self
@@ -86,31 +87,25 @@ module Riggs
         write({ jsonrpc: "2.0", method: method, params: params })
       end
 
+      # MCP stdio transport: newline-delimited JSON-RPC messages.
       def write(obj)
-        line = JSON.generate(obj)
-        @stdin.write("Content-Length: #{line.bytesize}\r\n\r\n#{line}")
+        @stdin.write("#{JSON.generate(obj)}\n")
         @stdin.flush
       end
 
       def read_response(expected_id)
-        headers = {}
         loop do
           line = @stdout.gets
           raise Error, "MCP server closed unexpectedly" if line.nil?
 
-          line = line.strip
-          break if line.empty?
+          data = JSON.parse(line)
+          next unless data.key?("id") # server notification — not our response
 
-          k, v = line.split(":", 2)
-          headers[k.strip.downcase] = v.strip if k && v
+          raise Error, data.dig("error", "message") || "MCP error" if data["error"]
+          raise Error, "Unexpected MCP id" if data["id"] != expected_id
+
+          return data["result"] || {}
         end
-        length = headers["content-length"].to_i
-        body = @stdout.read(length)
-        data = JSON.parse(body)
-        raise Error, data.dig("error", "message") || "MCP error" if data["error"]
-        raise Error, "Unexpected MCP id" if data["id"] && data["id"] != expected_id
-
-        data["result"] || {}
       end
     end
   end

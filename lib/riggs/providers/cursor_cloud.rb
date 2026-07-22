@@ -13,8 +13,8 @@ module Riggs
       TERMINAL = %w[FINISHED ERROR CANCELLED EXPIRED].freeze
       SUCCESS = "FINISHED"
 
-      def complete(messages:, system: nil, timeout: 60)
-        api_key = options[:api_key] || ENV["CURSOR_API_KEY"]
+      def complete(messages:, system: nil, timeout: 60, tools: nil)
+        api_key = options[:api_key] || ENV.fetch("CURSOR_API_KEY", nil)
         raise Error, "CURSOR_API_KEY not set" if api_key.nil? || api_key.empty?
 
         repos = Array(options[:repos])
@@ -30,9 +30,7 @@ module Riggs
 
         run = poll_run!(api_key: api_key, agent_id: agent_id, run_id: run_id, timeout: timeout)
         status = run["status"].to_s.upcase
-        unless status == SUCCESS
-          raise Error, "cursor_cloud run #{status}: #{run['result'] || run.inspect}"
-        end
+        raise Error, "cursor_cloud run #{status}: #{run['result'] || run.inspect}" unless status == SUCCESS
 
         {
           provider: name,
@@ -99,7 +97,8 @@ module Riggs
 
           raise TimeoutError, "cursor_cloud poll timed out after #{timeout}s" if Time.now >= deadline
 
-          sleep([interval, [deadline - Time.now, 0.1].max].min)
+          remaining = [deadline - Time.now, 0.1].max
+          sleep([interval, remaining].min)
         end
       end
 
@@ -110,6 +109,9 @@ module Riggs
       end
 
       def request_json(method, path, api_key:, body: nil)
+        # Allow tests to inject a fake HTTP layer
+        return options[:http_client].call(method, path, body) if options[:http_client]
+
         base = (options[:base_url] || DEFAULT_BASE).to_s.chomp("/")
         uri = URI("#{base}#{path}")
         http = Net::HTTP.new(uri.host, uri.port)
@@ -117,6 +119,13 @@ module Riggs
         http.open_timeout = 30
         http.read_timeout = 60
 
+        res = http.request(build_request(method, uri, api_key: api_key, body: body))
+        handle_response(res)
+      rescue Net::OpenTimeout, Net::ReadTimeout => e
+        raise TimeoutError, e.message
+      end
+
+      def build_request(method, uri, api_key:, body: nil)
         req =
           case method
           when :get then Net::HTTP::Get.new(uri)
@@ -126,19 +135,8 @@ module Riggs
 
         req["content-type"] = "application/json"
         req["authorization"] = "Bearer #{api_key}"
-        # Also support Basic auth style used in Cursor curl docs
-        req.basic_auth(api_key, "")
         req.body = JSON.generate(body) if body
-
-        # Allow tests to inject a fake HTTP layer
-        if options[:http_client]
-          return options[:http_client].call(method, path, body)
-        end
-
-        res = http.request(req)
-        handle_response(res)
-      rescue Net::OpenTimeout, Net::ReadTimeout => e
-        raise TimeoutError, e.message
+        req
       end
 
       def handle_response(res)

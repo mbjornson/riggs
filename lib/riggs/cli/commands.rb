@@ -11,6 +11,7 @@ require_relative "../memory/service"
 require_relative "../storage"
 require_relative "../skills/registry"
 require_relative "../mcp/client"
+require_relative "../mcp/manager"
 require_relative "../providers/router"
 
 module Riggs
@@ -30,7 +31,10 @@ module Riggs
     map "memory:recall" => :memory_recall
     map "memory:persist" => :memory_persist
     map "skills:list" => :skills_list
+    map "skills:show" => :skills_show
     map "providers:ping" => :providers_ping
+    map "mcp:list" => :mcp_list
+    map "mcp:ping" => :mcp_ping
 
     desc "setup", "Create .agent_hubrc, db/, config/riggs/workflows/, and SQLite database."
     def setup
@@ -71,14 +75,14 @@ module Riggs
         },
         "roles" => {
           "pm" => %w[edit_workflow manage_skills configure_memory publish read_workflow inspect_run],
-          "engineer" => %w[run_workflow approve_gates read_workflow inspect_run],
+          "engineer" => %w[run_workflow approve_gates read_workflow inspect_run manage_mcp],
           "viewer" => %w[read_workflow inspect_run]
         },
         "sqlite_path" => File.join(db_dir, "riggs.sqlite3"),
         "sqlite_memory" => {
-          "vector_path" => ENV["RIGGS_VECTOR_EXT"],
-          "memory_path" => ENV["RIGGS_MEMORY_EXT"],
-          "embed_model" => ENV["RIGGS_EMBED_MODEL"]
+          "vector_path" => ENV.fetch("RIGGS_VECTOR_EXT", nil),
+          "memory_path" => ENV.fetch("RIGGS_MEMORY_EXT", nil),
+          "embed_model" => ENV.fetch("RIGGS_EMBED_MODEL", nil)
         },
         "providers" => {
           "mock" => { "type" => "mock" },
@@ -99,8 +103,12 @@ module Riggs
       }
 
       config_file = File.expand_path(".agent_hubrc", base_dir)
-      File.write(config_file, Psych.dump(hub_cfg))
-      puts "✅ Created #{config_file}"
+      if File.exist?(config_file)
+        puts "⏭️  Keeping existing #{config_file} (delete it and re-run setup to regenerate)"
+      else
+        File.write(config_file, Psych.dump(hub_cfg))
+        puts "✅ Created #{config_file}"
+      end
 
       # Copy example playbook + skill into the project if missing
       example_src = File.expand_path("../../../config/riggs/workflows/example_triage.yml", __dir__)
@@ -139,9 +147,7 @@ module Riggs
       require_permission! %w[edit_workflow]
       path = "./config/riggs/workflows/#{name}.yml"
       FileUtils.mkdir_p(File.dirname(path))
-      if File.exist?(path)
-        abort "❌ Already exists: #{path}"
-      end
+      abort "❌ Already exists: #{path}" if File.exist?(path)
 
       File.write(path, <<~YAML)
         name: #{name}
@@ -197,7 +203,7 @@ module Riggs
 
       input = { ticket: "Sample ticket about login ERROR" }
       outputs = {}
-      steps_by_id = workflow[:steps].each_with_object({}) { |s, h| h[s.id] = s }
+      steps_by_id = workflow[:steps].to_h { |s| [s.id, s] }
       current = workflow[:steps].first
       visited = []
 
@@ -251,16 +257,17 @@ module Riggs
       input[:ticket] = options[:ticket] if options[:ticket]
 
       gate_handler = if options[:auto_approve]
-                       ->(step, io) {
+                       lambda { |step, io|
                          io.puts "⏸ Auto-approving gate on '#{step.id}'"
                          :approved
                        }
                      end
 
       skill_registry = SkillRegistry.new
-      mcp = begin
-        MCP::Client.from_config(cfg[:mcp_servers])
-      rescue StandardError
+      mcp_manager = begin
+        MCP::Manager.from_config(cfg[:mcp_servers])
+      rescue StandardError => e
+        warn "⚠️  MCP disabled for this run — mcp_servers config error: #{e.message}"
         nil
       end
 
@@ -271,7 +278,7 @@ module Riggs
         hub_config: cfg,
         gate_handler: gate_handler,
         skill_registry: skill_registry,
-        mcp_client: mcp
+        mcp_manager: mcp_manager
       )
       engine.execute($stdout, input: input)
 
@@ -304,6 +311,7 @@ module Riggs
 
     desc "memory:recall QUERY", "Search long-term memory for current user."
     def memory_recall(query)
+      require_permission! %w[configure_memory run_workflow]
       identity = current_identity
       cfg = load_config
       db_path = cfg[:sqlite_path] || "./db/riggs.sqlite3"
@@ -347,7 +355,68 @@ module Riggs
       require_permission! %w[manage_skills read_workflow]
       registry = SkillRegistry.new
       list = registry.list
-      puts list.empty? ? "No skills found in config/riggs/skills" : list.map { |s| "• #{s}" }.join("\n")
+      if list.empty?
+        puts "No skills found in config/riggs/skills"
+      else
+        list.each { |s| puts "• #{s[:name]} (latest #{s[:latest]}; versions: #{s[:versions].join(', ')})" }
+      end
+    end
+
+    desc "skills:show NAME", "Show skill system prompt, version, and tools (NAME or NAME@ver)."
+    def skills_show(name)
+      require_permission! %w[manage_skills read_workflow]
+      skill = SkillRegistry.new.load(name)
+      abort "❌ Skill not found: #{name}" unless skill
+
+      print_header("Skill #{skill[:name]}@#{skill[:version]}")
+      puts skill[:system_prompt]
+      puts "\nMCP servers: #{skill[:mcp_servers].empty? ? '(none)' : skill[:mcp_servers].join(', ')}"
+      puts "Tools:"
+      if skill[:tools].empty?
+        puts "  (none)"
+      else
+        skill[:tools].each do |t|
+          mcp = t[:mcp_server] ? " [mcp:#{t[:mcp_server]}]" : ""
+          puts "  • #{t[:name]}#{mcp} — #{t[:description]}"
+        end
+      end
+    end
+
+    desc "mcp:list", "List configured MCP servers and their tools."
+    def mcp_list
+      require_permission! %w[manage_mcp run_workflow]
+      cfg = load_config
+      mgr = MCP::Manager.from_config(cfg[:mcp_servers])
+      if mgr.server_names.empty?
+        puts "No mcp_servers configured in .agent_hubrc"
+        return
+      end
+      print_header("MCP Servers")
+      mgr.server_names.each do |s|
+        puts "• #{s}"
+        mgr.list_tools(servers: [s]).each do |t|
+          puts "    - #{t[:name]}: #{t[:description][0, 80]}"
+        end
+      end
+      mgr.close
+    end
+
+    desc "mcp:ping [SERVER]", "Ping MCP server(s) and report tool counts."
+    def mcp_ping(server = nil)
+      require_permission! %w[manage_mcp run_workflow]
+      cfg = load_config
+      mgr = MCP::Manager.from_config(cfg[:mcp_servers])
+      abort "No mcp_servers configured" if mgr.server_names.empty?
+
+      print_header("MCP Ping")
+      mgr.ping(server).each do |r|
+        if r[:ok]
+          puts "✅ #{r[:server]} — #{r[:tool_count]} tools"
+        else
+          puts "❌ #{r[:server]} — #{r[:error]}"
+        end
+      end
+      mgr.close
     end
 
     desc "providers:ping NAME", "One-shot complete() against a named provider (smoke test)."
@@ -387,7 +456,7 @@ module Riggs
       def require_permission!(permissions)
         identity = current_identity
         needed = Array(permissions).map(&:to_s)
-        return if needed.any? { |p| identity[:permissions].include?(p) }
+        return if needed.intersect?(identity[:permissions])
 
         abort "⛔ Access denied. '#{identity[:role]}' lacks required permission(s): #{needed.join(' or ')}"
       end
@@ -395,9 +464,7 @@ module Riggs
       def load_workflow(name)
         path = "./config/riggs/workflows/#{name}.yml"
         # Also try gem-bundled examples
-        unless File.exist?(path)
-          path = File.expand_path("../../../config/riggs/workflows/#{name}.yml", __dir__)
-        end
+        path = File.expand_path("../../../config/riggs/workflows/#{name}.yml", __dir__) unless File.exist?(path)
         abort "❌ Workflow not found: #{name}.yml" unless File.exist?(path)
 
         Workflow::Loader.load(path: path)
