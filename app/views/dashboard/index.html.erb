@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Riggs</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 2rem; background: #0f1419; color: #e7ecf3; }
+      a { color: #7dd3fc; }
+      h1 { font-size: 1.75rem; }
+      ul { line-height: 1.8; }
+      .meta { color: #94a3b8; }
+    </style>
+  </head>
+  <body>
+    <h1>Riggs Playbooks</h1>
+    <p class="meta">Signed in as <%= riggs_identity[:id] %> (<%= riggs_identity[:role] %>)</p>
+    <ul>
+      <% @workflows.each do |name| %>
+        <li>
+          <a href="<%= workflow_path(name) %>"><%= name %></a>
+          —
+          <form action="<%= run_workflow_path(name) %>" method="post" style="display:inline">
+            <input type="hidden" name="authenticity_token" value="<%= form_authenticity_token %>">
+            <input type="hidden" name="input[ticket]" value="User cannot login ERROR timeout">
+            <button type="submit">Run</button>
+          </form>
+        </li>
+      <% end %>
+    </ul>
+    <p class="meta">Mount with: <code>mount Riggs::Engine =&gt; "/riggs"</code></p>
+  </body>
+</html>

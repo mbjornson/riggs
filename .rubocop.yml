@@ -1,0 +1,26 @@
+AllCops:
+  NewCops: enable
+  TargetRubyVersion: 3.2
+  SuggestExtensions: false
+
+# Relaxed for CLI/Thor args & YAML parsing, strict elsewhere
+Layout/LineLength:
+  Max: 120
+
+Style/StringLiterals:
+  EnforcedStyle: single_quotes
+
+Style/FrozenStringLiteralComment: true
+
+Lint/AmbiguousBlockAssociation:
+  Enabled: false # Thor/CLI arg blocks intentionally ambiguous
+
+Security/Open:
+  Enabled: true
+
+Performance:
+  Enabled: true
+
+# Workflow YAML config files → allow relaxed style
+InheritFrom:
+  - rubocop-rails (optional later when you mount the engine)

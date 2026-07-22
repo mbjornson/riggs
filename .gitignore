@@ -1,0 +1,15 @@
+/.bundle/
+/.yardoc
+/_yardoc/
+/coverage/
+/doc/
+/pkg/
+/spec/reports/
+/tmp/
+.DS_Store
+.agent_hubrc
+*.sqlite3
+*.db
+/db/audit/
+/db/*.db
+!/db/init_riggs_schema.sql

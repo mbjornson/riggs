@@ -1,0 +1,50 @@
+name: example_triage
+display_name: Example Triage
+description: Classify a ticket, optionally escalate through HITL, then summarize.
+triggers:
+  - type: manual
+  - type: keyword
+    keywords: ["triage", "ticket"]
+context_window: medium
+max_llm_calls: 20
+timeout_seconds: 300
+memory_scope:
+  isolation: namespaced
+providers:
+  default:
+    # Prefer Cursor CLI, then Claude Code CLI, then offline mock
+    relay_chain: [mock]
+    # relay_chain: [cursor, claude_cli, mock]
+
+audit_log: true
+steps:
+  - id: classify
+    label: Classify Ticket
+    agent: triage_bot
+    skill: triage_v1
+    # provider: cursor   # optional per-step override
+    input: "Classify this support ticket. Reply with classification=ERROR if it is a hard failure, otherwise classification=OK. Ticket: {{workflow.input.ticket}}"
+    output_var: classification
+    next: "if contains ERROR: debug; else: summarize"
+
+  - id: debug
+    label: Debug Escalation
+    agent: debug_bot
+    skill: triage_v1
+    gates: [approval]
+    input: "Investigate ERROR from classification: {{workflow.classify.classification}}. Propose a fix plan."
+    output_var: debug_plan
+    next: "if gate.approved: summarize; if gate.rejected: abort_note"
+
+  - id: summarize
+    label: Summarize Outcome
+    agent: triage_bot
+    skill: triage_v1
+    input: "Write a short resolution summary. Classification={{workflow.classify.classification}} Debug={{workflow.debug.debug_plan}}"
+    output_var: final_summary
+
+  - id: abort_note
+    label: Abort Note
+    agent: triage_bot
+    input: "Record that the HITL gate rejected escalation for: {{workflow.input.ticket}}"
+    output_var: abort_summary

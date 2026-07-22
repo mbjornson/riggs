@@ -1,0 +1,62 @@
+# .agent_hubrc sample (copied by `riggs setup` to project root as .agent_hubrc)
+
+default_user: pm_alice
+
+users:
+  pm_alice:
+    id: pm_alice
+    name: "Alice PM"
+    role: pm
+    github_username: "@alicepm"
+    memory_namespace: team_shared
+
+  eng_bob:
+    id: eng_bob
+    name: "Bob Eng"
+    role: engineer
+    github_username: "@bobbuilder"
+    memory_namespace: eng_bob_private
+
+  view_cara:
+    id: view_cara
+    name: "Cara Viewer"
+    role: viewer
+    memory_namespace: readonly
+
+roles:
+  pm: [edit_workflow, manage_skills, configure_memory, publish, read_workflow, inspect_run]
+  engineer: [run_workflow, approve_gates, read_workflow, inspect_run]
+  viewer: [read_workflow, inspect_run]
+
+sqlite_path: "./db/riggs.sqlite3"
+
+sqlite_memory:
+  vector_path: # set via RIGGS_VECTOR_EXT
+  memory_path: # set via RIGGS_MEMORY_EXT
+  embed_model: # set via RIGGS_EMBED_MODEL
+
+providers:
+  mock:
+    type: mock
+  claude:
+    type: anthropic
+  openai:
+    type: openai
+  ollama:
+    type: ollama
+    base_url: "http://127.0.0.1:11434/v1"
+    model: llama3
+  # CLI transports (require binaries on PATH + API keys)
+  cursor:
+    type: cursor
+  claude_cli:
+    type: claude_cli
+  codex:
+    type: codex
+  cursor_cloud:
+    type: cursor_cloud
+    model: composer-2.5
+    repos: [] # e.g. [{ url: "https://github.com/org/repo", startingRef: main }]
+    poll_interval_seconds: 5
+
+mcp_servers: {}
