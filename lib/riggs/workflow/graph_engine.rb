@@ -6,16 +6,19 @@ require "time"
 require_relative "../storage"
 require_relative "../providers/router"
 require_relative "../memory/service"
+require_relative "../mcp/manager"
 require_relative "loader"
+require_relative "tool_loop"
 
 module Riggs
   module Workflow
     class GraphEngine
       CONTEXT_LIMITS = { short: 2, medium: 6, full: 50 }.freeze
 
-      attr_reader :workflow, :user_identity, :session_id, :audit_log, :outputs, :status
+      attr_reader :workflow, :user_identity, :session_id, :audit_log, :outputs, :status, :llm_calls
 
-      def initialize(workflow:, user_identity:, storage: nil, db_path: nil, hub_config: {}, gate_handler: nil, provider_router: nil, skill_registry: nil, mcp_client: nil)
+      def initialize(workflow:, user_identity:, storage: nil, db_path: nil, hub_config: {}, gate_handler: nil,
+                     provider_router: nil, skill_registry: nil, mcp_manager: nil, mcp_client: nil)
         @workflow = workflow
         @user_identity = user_identity
         @hub_config = hub_config || {}
@@ -23,7 +26,7 @@ module Riggs
         @storage = storage || Storage.new(db_path: @db_path)
         @gate_handler = gate_handler || method(:default_gate_handler)
         @skill_registry = skill_registry
-        @mcp_client = mcp_client
+        @mcp_manager = mcp_manager || (mcp_client ? MCP::Manager.wrap_client(mcp_client) : nil)
         @router = provider_router || Providers::Router.new(
           workflow_providers: workflow[:providers],
           hub_providers: @hub_config[:providers] || {},
@@ -55,7 +58,7 @@ module Riggs
         log_event("workflow_start", { workflow: @workflow[:name], user: @user_identity[:id] })
         io.puts "▶ Session #{@session_id}"
 
-        steps_by_id = @workflow[:steps].each_with_object({}) { |s, h| h[s.id] = s }
+        steps_by_id = @workflow[:steps].to_h { |s| [s.id, s] }
         current = @workflow[:steps].first
         @status = :running
 
@@ -94,40 +97,39 @@ module Riggs
           resolved_input = Loader.resolve_context(current.input, workflow_context)
           system_prompt = build_system_prompt(current)
           messages = build_messages(resolved_input)
-
-          # Optional MCP tool discovery for skills that declare tools
-          tools_note = ""
-          if @mcp_client
-            begin
-              tools = @mcp_client.list_tools
-              tools_note = "\nAvailable MCP tools: #{tools.map { |t| t[:name] || t['name'] }.join(', ')}" unless tools.empty?
-            rescue StandardError => e
-              log_event("mcp_error", { error: e.message })
-            end
-          end
-
           chain = @router.chain_for(step: current, workflow: @workflow)
-          result = @router.call(
-            chain: chain,
-            messages: messages,
-            system: system_prompt + tools_note,
-            timeout: @workflow[:timeout_seconds],
+
+          loop_runner = ToolLoop.new(
+            router: @router,
+            mcp_manager: @mcp_manager,
+            skill_registry: @skill_registry,
+            audit: method(:audit_bridge),
+            llm_calls: @llm_calls,
+            max_llm_calls: @workflow[:max_llm_calls],
+            timeout_seconds: @workflow[:timeout_seconds],
+            started_at: @started_at,
             session_id: @session_id
           )
-          @llm_calls += 1
 
-          # Simple tool-call loop: if mock/provider returns TOOL:name|args JSON, invoke MCP
-          content = maybe_run_tools(result[:content], io)
+          outcome = loop_runner.run(
+            step: current,
+            chain: chain,
+            messages: messages,
+            system_prompt: system_prompt,
+            io: io
+          )
+          @llm_calls = loop_runner.llm_calls
+          content = outcome[:content].to_s
 
           @outputs[current.output_var.to_sym] = content
           @outputs[current.id.to_sym] = { current.output_var.to_sym => content }
           @storage.update_step(step_row_id, status: "completed")
           log_event("step_executed", {
-            step: current.id,
-            provider: result[:provider],
-            output_var: current.output_var,
-            preview: content[0, 200]
-          })
+                      step: current.id,
+                      provider: outcome[:provider],
+                      output_var: current.output_var,
+                      preview: content[0, 200]
+                    })
           io.puts "✓ Output (#{current.output_var}): #{content[0, 160]}#{'…' if content.length > 160}"
 
           persist_memory(current, content)
@@ -146,23 +148,27 @@ module Riggs
         @storage.update_session(@session_id, status: "failed", ended: true) if @session_id
         log_event("workflow_failed", { error: e.message }) if @session_id
         raise
+      ensure
+        @mcp_manager&.close
       end
 
       private
+
+      def audit_bridge(session_id:, event_type:, payload: {})
+        log_event(event_type, payload)
+      end
 
       def workflow_context
         ctx = { input: @outputs[:input] || {} }
         @outputs.each do |k, v|
           next if k == :input
 
-          if v.is_a?(Hash)
-            ctx[k] = v
-          else
-            ctx[k] = { value: v }
-            # Also expose output_var style: step outputs already keyed by output_var
-          end
+          ctx[k] = if v.is_a?(Hash)
+                     v
+                   else
+                     { value: v }
+                   end
         end
-        # Flatten for {{workflow.step.var}} — store each output_var at top under step id
         @workflow[:steps].each do |s|
           val = @outputs[s.output_var.to_sym]
           ctx[s.id.to_sym] ||= {}
@@ -189,29 +195,11 @@ module Riggs
 
       def build_messages(resolved_input)
         window = CONTEXT_LIMITS.fetch(@workflow[:context_window], 6)
-        history = []
         recent = @workflow[:steps].map(&:output_var).map(&:to_sym).select { |k| @outputs.key?(k) }.last(window)
-        recent.each do |var|
-          history << { role: "assistant", content: @outputs[var].to_s }
+        history = recent.map do |var|
+          { role: "assistant", content: @outputs[var].to_s }
         end
         history + [{ role: "user", content: resolved_input }]
-      end
-
-      def maybe_run_tools(content, io)
-        return content unless @mcp_client
-        return content unless content.to_s.start_with?("TOOL:")
-
-        # Format: TOOL:tool_name|{"arg":"val"}
-        line = content.to_s.sub(/\ATOOL:/, "")
-        name, raw_args = line.split("|", 2)
-        args = raw_args && !raw_args.empty? ? JSON.parse(raw_args) : {}
-        result = @mcp_client.call_tool(name.strip, args)
-        log_event("mcp_tool_call", { tool: name.strip, args: args })
-        io.puts "  🔧 MCP #{name.strip} → #{result.to_s[0, 100]}"
-        result.to_s
-      rescue StandardError => e
-        log_event("mcp_tool_error", { error: e.message })
-        "TOOL_ERROR: #{e.message}"
       end
 
       def persist_memory(step, content)

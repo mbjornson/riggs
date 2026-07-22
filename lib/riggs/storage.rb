@@ -33,11 +33,11 @@ module Riggs
           depth += stripped.scan(/\bBEGIN\b/i).size
           depth -= stripped.scan(/\bEND\b/i).size
           buffer << line
-          if depth <= 0 && stripped.end_with?(";")
-            @db.execute(buffer.strip)
-            buffer = +""
-            depth = 0
-          end
+          next unless depth <= 0 && stripped.end_with?(";")
+
+          @db.execute(buffer.strip)
+          buffer = +""
+          depth = 0
         end
         @db.execute(buffer.strip) unless buffer.strip.empty?
       end
@@ -46,7 +46,8 @@ module Riggs
     def create_session(workflow_name:, user_id:, memory_namespace:, config_snapshot: {})
       id = SecureRandom.uuid
       @db.execute(
-        "INSERT INTO riggs_sessions (id, workflow_name, user_id, status, memory_namespace, config_snapshot) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO riggs_sessions (id, workflow_name, user_id, status, memory_namespace, config_snapshot) " \
+        "VALUES (?, ?, ?, ?, ?, ?)",
         [id, workflow_name, user_id, "running", memory_namespace, JSON.generate(config_snapshot)]
       )
       id
@@ -66,7 +67,8 @@ module Riggs
     def create_step(session_id:, step_key:, label:, status: "pending", input_preview: nil, output_var_name: nil)
       id = SecureRandom.uuid
       @db.execute(
-        "INSERT INTO riggs_steps (id, session_id, step_key, label, status, input_preview, output_var_name) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO riggs_steps (id, session_id, step_key, label, status, input_preview, output_var_name) " \
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         [id, session_id, step_key, label, status, input_preview, output_var_name]
       )
       id

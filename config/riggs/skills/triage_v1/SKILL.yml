@@ -4,4 +4,24 @@ system_prompt: |
   You are a careful support triage agent. Classify tickets clearly.
   If the ticket indicates a hard failure, include the token ERROR in your response.
   Keep answers concise and actionable.
-tools: []
+  When you need external context and tools are available, call them before finalizing.
+mcp_servers: []
+tools:
+  - name: lookup_runbook
+    description: Look up an internal runbook snippet by topic keyword.
+    input_schema:
+      type: object
+      properties:
+        topic:
+          type: string
+          description: Topic to search (e.g. oauth, database, timeout)
+      required: [topic]
+  - name: search_issues
+    description: Search known issues (MCP-backed when a github server is configured).
+    mcp_server: github
+    input_schema:
+      type: object
+      properties:
+        query:
+          type: string
+      required: [query]

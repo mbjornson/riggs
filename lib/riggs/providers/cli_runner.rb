@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "open3"
-require "timeout"
 require_relative "base"
 
 module Riggs
@@ -20,20 +19,37 @@ module Riggs
         full_env = ENV.to_h.merge(env.transform_keys(&:to_s))
         argv = [binary, *Array(args).map(&:to_s)]
 
-        stdout = stderr = ""
-        status = nil
-
+        stdin, stdout, stderr, wait_thr = Open3.popen3(full_env, *argv)
         begin
-          Timeout.timeout(timeout.to_f) do
-            stdout, stderr, status = Open3.capture3(full_env, *argv, stdin_data: stdin_data.to_s)
+          begin
+            stdin.write(stdin_data.to_s)
+            stdin.close
+          rescue Errno::EPIPE
+            nil # child exited without reading stdin
           end
-        rescue Timeout::Error
-          raise TimeoutError, "CLI timed out after #{timeout}s: #{argv.join(' ')}"
-        end
+          out_reader = Thread.new { stdout.read }
+          err_reader = Thread.new { stderr.read }
 
-        result = Result.new(stdout: stdout.to_s, stderr: stderr.to_s, status: status)
-        raise_for_failure!(result, argv)
-        result
+          if wait_thr.join(timeout.to_f).nil?
+            begin
+              Process.kill("KILL", wait_thr.pid)
+            rescue Errno::ESRCH
+              nil
+            end
+            wait_thr.value # reap
+            raise TimeoutError, "CLI timed out after #{timeout}s: #{argv.join(' ')}"
+          end
+
+          result = Result.new(stdout: out_reader.value.to_s, stderr: err_reader.value.to_s, status: wait_thr.value)
+          raise_for_failure!(result, argv)
+          result
+        ensure
+          [stdin, stdout, stderr].each do |io|
+            io.close unless io.closed?
+          rescue StandardError
+            nil
+          end
+        end
       end
 
       def which(command)

@@ -9,7 +9,8 @@ class TestSkillsAndTriggers < Minitest::Test
       skill = reg.load("triage_v1")
       refute_nil skill
       assert_match(/triage/i, skill[:system_prompt])
-      assert_includes reg.list, "triage_v1"
+      assert_includes reg.list_names, "triage_v1"
+      assert skill[:tools].any?
     end
   end
 

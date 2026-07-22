@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 require "psych"
-require "set"
 
 module Riggs
   module Workflow
@@ -30,7 +29,7 @@ module Riggs
           providers: cfg[:providers] || { default: { relay_chain: ["mock"] } },
           steps: steps,
           memory_policy: cfg[:memory_scope] || { isolation: "namespaced" },
-          audit_log: cfg[:audit_log] == false ? false : true
+          audit_log: cfg[:audit_log] != false
         }
       end
 
@@ -39,15 +38,11 @@ module Riggs
         steps = workflow[:steps]
         step_keys = steps.map(&:id)
 
-        if step_keys.uniq.size != step_keys.size
-          errors << "Duplicate step ids found"
-        end
+        errors << "Duplicate step ids found" if step_keys.uniq.size != step_keys.size
 
         steps.each do |step|
           resolve_next_targets(step.next).each do |target|
-            unless step_keys.include?(target)
-              errors << "Step '#{step.id}' references undefined step: #{target}"
-            end
+            errors << "Step '#{step.id}' references undefined step: #{target}" unless step_keys.include?(target)
           end
         end
 
@@ -173,7 +168,7 @@ module Riggs
 
         clauses.each do |clause|
           case clause[:type]
-          when :plain
+          when :plain, :else
             return clause[:target]
           when :contains
             return clause[:target] if text.include?(clause[:needle])
@@ -181,13 +176,11 @@ module Riggs
             return clause[:target] if gate_decision == :approved
           when :gate_rejected
             return clause[:target] if gate_decision == :rejected
-          when :else
-            return clause[:target]
           end
         end
 
-        # Fall through: first plain-like target if any
-        clauses.find { |c| c[:type] == :else }&.dig(:target) || clauses.last&.dig(:target)
+        # No clause matched and no else: the workflow ends here
+        nil
       end
 
       def self.parse_clauses(next_val)
@@ -198,15 +191,17 @@ module Riggs
       end
 
       def self.parse_one(part)
-        if part =~ /\Aif\s+contains\s+(.+?):\s*(\w+)\z/i
-          { type: :contains, needle: Regexp.last_match(1).strip.delete_prefix('"').delete_suffix('"'), target: Regexp.last_match(2) }
-        elsif part =~ /\Aif\s+gate\.approved:\s*(\w+)\z/i
+        case part
+        when /\Aif\s+contains\s+(.+?):\s*(\w+)\z/i
+          { type: :contains, needle: Regexp.last_match(1).strip.delete_prefix('"').delete_suffix('"'),
+            target: Regexp.last_match(2) }
+        when /\Aif\s+gate\.approved:\s*(\w+)\z/i
           { type: :gate_approved, target: Regexp.last_match(1) }
-        elsif part =~ /\Aif\s+gate\.rejected:\s*(\w+)\z/i
+        when /\Aif\s+gate\.rejected:\s*(\w+)\z/i
           { type: :gate_rejected, target: Regexp.last_match(1) }
-        elsif part =~ /\Aelse:\s*(\w+)\z/i
+        when /\Aelse:\s*(\w+)\z/i
           { type: :else, target: Regexp.last_match(1) }
-        elsif part =~ /\A(\w+)\z/
+        when /\A(\w+)\z/
           { type: :plain, target: Regexp.last_match(1) }
         else
           # "if gate.approved: target" already handled; try loose "target"

@@ -7,7 +7,7 @@ module Riggs
   module Providers
     # Base for providers that shell out to a local agent CLI.
     class Cli < Base
-      def complete(messages:, system: nil, timeout: 60)
+      def complete(messages:, system: nil, timeout: 60, tools: nil)
         ensure_auth!
         prompt = build_prompt(messages: messages, system: system)
         command = options[:command] || default_command
@@ -21,9 +21,11 @@ module Riggs
           timeout: timeout
         )
         content = parse_stdout(result.stdout)
+        tool_calls = parse_tool_line(content)
         {
           provider: name,
           content: content,
+          tool_calls: tool_calls,
           usage: {},
           raw: { stdout: result.stdout, stderr: result.stderr }
         }
@@ -67,7 +69,7 @@ module Riggs
       end
 
       def require_env!(*keys)
-        present = keys.find { |k| ENV[k] && !ENV[k].empty? }
+        present = keys.find { |k| ENV.fetch(k, nil) && !ENV[k].empty? }
         return present if present
 
         raise Error, "#{name} requires one of: #{keys.join(', ')}"

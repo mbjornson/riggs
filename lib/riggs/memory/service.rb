@@ -25,14 +25,13 @@ module Riggs
       when :sqlite_memory
         scope = "#{context}_by_#{@namespace}"
         @conn.execute("SELECT memory_add_text(?, ?)", [text.to_s, scope])
-        true
       else
         @conn.execute(
           "INSERT INTO riggs_memories (namespace, content, context) VALUES (?, ?, ?)",
           [@namespace, text.to_s, context.to_s]
         )
-        true
       end
+      true
     end
 
     def recall(query, min_score: 0.7, limit: 5)
@@ -62,7 +61,7 @@ module Riggs
       @conn.load_extension(vector_path)
       @conn.load_extension(memory_path)
 
-      model = @config[:embed_model] || ENV["RIGGS_EMBED_MODEL"]
+      model = @config[:embed_model] || ENV.fetch("RIGGS_EMBED_MODEL", nil)
       if model && File.exist?(model)
         @conn.execute("SELECT memory_set_model('local', ?)", [model])
       elsif ENV["VECTORS_SPACE_API_KEY"]
@@ -77,7 +76,7 @@ module Riggs
 
     def ext_path(key, env_key)
       from_cfg = @config[key] || @config[key.to_s]
-      from_cfg || ENV[env_key]
+      from_cfg || ENV.fetch(env_key, nil)
     end
 
     def ensure_fallback_schema!
@@ -110,8 +109,16 @@ module Riggs
     end
 
     def recall_sqlite_memory(query, min_score:, limit:)
-      @conn.execute("SELECT memory_set_option('min_score', ?)", [min_score]) rescue nil
-      @conn.execute("SELECT memory_set_option('max_results', ?)", [limit]) rescue nil
+      begin
+        @conn.execute("SELECT memory_set_option('min_score', ?)", [min_score])
+      rescue StandardError
+        nil
+      end
+      begin
+        @conn.execute("SELECT memory_set_option('max_results', ?)", [limit])
+      rescue StandardError
+        nil
+      end
 
       rows = @conn.execute(<<~SQL, [query.to_s])
         SELECT path, snippet, ranking
@@ -119,8 +126,8 @@ module Riggs
         WHERE query = ?
       SQL
 
-      scoped = rows.select { |r| r["path"].to_s.include?(@namespace) || r["path"].to_s.end_with?(@namespace) }
-      scoped = rows if scoped.empty?
+      # persist() writes scope "#{context}_by_#{namespace}" — match that suffix exactly
+      scoped = rows.select { |r| r["path"].to_s.end_with?("_by_#{@namespace}") }
       scoped.first(limit).map { |r| r["snippet"].to_s }
     end
 
