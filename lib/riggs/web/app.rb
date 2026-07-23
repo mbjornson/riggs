@@ -92,8 +92,8 @@ module Riggs
         m = req.request_method
         p = @path
 
-        return html(:dashboard, title: "Dashboard") if m == "GET" && (p == "/" || p == "/dashboard")
-        return html(:login, title: "Switch user", users: (@config[:users] || {})) if m == "GET" && p == "/login"
+        return html(:dashboard, title: "Dashboard") if m == "GET" && ["/", "/dashboard"].include?(p)
+        return html(:login, title: "Switch user", users: @config[:users] || {}) if m == "GET" && p == "/login"
         return post_login(req) if m == "POST" && p == "/login"
 
         if m == "GET" && p == "/config"
@@ -149,9 +149,8 @@ module Riggs
           Auth.require!(@identity, "read_workflow", "edit_workflow", "configure_memory")
           return json_ok(@store.public_view)
         end
-        if (m == "PATCH" || m == "POST") && p == "/api/config"
-          return api_patch_config(req)
-        end
+        return api_patch_config(req) if %w[PATCH POST].include?(m) && p == "/api/config"
+
         if m == "GET" && p == "/api/workflows"
           Auth.require!(@identity, "read_workflow")
           return json_ok(list_workflows)
@@ -171,6 +170,7 @@ module Riggs
         if m == "POST" && (sm = p.match(%r{\A/api/sessions/([^/]+)/(approve|reject)\z}))
           return api_session_decision(sm[1], sm[2] == "approve" ? "approved" : "rejected")
         end
+
         if m == "GET" && p == "/api/memory/search"
           Auth.require!(@identity, "inspect_run", "configure_memory", "read_workflow")
           return json_ok(memory_search(req.params["q"].to_s))

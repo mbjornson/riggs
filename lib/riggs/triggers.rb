@@ -8,9 +8,7 @@ module Riggs
       triggers = Array(workflow[:triggers])
       return true if triggers.empty?
 
-      if text.nil? || text.to_s.strip.empty?
-        return triggers.any? { |t| t[:type].to_s == "manual" }
-      end
+      return triggers.any? { |t| t[:type].to_s == "manual" } if text.nil? || text.to_s.strip.empty?
 
       triggers.any? do |t|
         case t[:type].to_s
@@ -33,7 +31,7 @@ module Riggs
     end
 
     def self.list_declared(dir: "./config/riggs/workflows")
-      Dir.glob(File.join(dir, "*.yml")).filter_map do |path|
+      declared = Dir.glob(File.join(dir, "*.yml")).filter_map do |path|
         workflow = Workflow::Loader.load(path: path)
         {
           name: workflow[:name],
@@ -43,7 +41,8 @@ module Riggs
         }
       rescue WorkflowError
         nil
-      end.sort_by { |w| w[:name].to_s }
+      end
+      declared.sort_by { |w| w[:name].to_s }
     end
 
     def self.summarize_trigger(t)

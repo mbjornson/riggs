@@ -162,9 +162,7 @@ module Riggs
       require "rackup"
       require_relative "../web/app"
 
-      unless Identity.config_path
-        abort "❌ Missing .agent_hubrc in #{Dir.pwd}. Run 'riggs setup' first."
-      end
+      abort "❌ Missing .agent_hubrc in #{Dir.pwd}. Run 'riggs setup' first." unless Identity.config_path
 
       port = options[:port]
       bind = options[:bind]
@@ -620,7 +618,11 @@ module Riggs
         steps = []
         count.times do |i|
           puts "\n— Step #{i + 1} of #{count} —"
-          default_id = i.zero? ? "start" : (i == count - 1 ? "finish" : "step_#{i + 1}")
+          default_id = if i.zero?
+                         "start"
+                       else
+                         (i == count - 1 ? "finish" : "step_#{i + 1}")
+                       end
           id = ask("id", default: default_id)
           label = ask("label", default: id.tr("_", " ").split.map(&:capitalize).join(" "))
           agent = ask("agent label", default: "default")

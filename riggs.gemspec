@@ -49,6 +49,4 @@ Gem::Specification.new do |spec|
   spec.add_dependency "sqlite3", ">= 1.6"
   spec.add_dependency "thor", "~> 1.3"
   spec.add_dependency "webrick", ">= 1.8"
-
-  spec.add_development_dependency "rack-test", ">= 2.0"
 end
