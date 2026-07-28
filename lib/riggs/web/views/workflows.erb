@@ -1,0 +1,20 @@
+<h1>Playbooks</h1>
+<p class="lead">YAML workflows in <code>config/riggs/workflows/</code>.</p>
+
+<div class="panel">
+  <% if workflows.empty? %>
+    <p class="muted">No playbooks found.</p>
+  <% else %>
+    <table>
+      <thead><tr><th>Name</th><th></th></tr></thead>
+      <tbody>
+        <% workflows.each do |name| %>
+          <tr>
+            <td><a href="<%= h(url("/workflows/#{name}")) %>"><%= h(name) %></a></td>
+            <td><a href="<%= h(url("/workflows/#{name}")) %>">Open</a></td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  <% end %>
+</div>

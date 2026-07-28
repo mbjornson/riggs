@@ -1,0 +1,105 @@
+<h1>Configuration</h1>
+<p class="lead">Safe merge into <code>.agent_hubrc</code> (backup on write; secrets masked).</p>
+
+<div class="panel">
+  <p class="muted" style="margin:0">Path: <code><%= h(@store.path) %></code></p>
+</div>
+
+<h2>Users &amp; roles</h2>
+<form method="post" action="<%= h(url('/config')) %>" class="panel">
+  <input type="hidden" name="section" value="users">
+  <label>Default user
+    <input name="default_user" value="<%= h(view['default_user'].to_s) %>">
+  </label>
+  <table>
+    <thead><tr><th>Key</th><th>ID</th><th>Name</th><th>Role</th><th>Namespace</th></tr></thead>
+    <tbody>
+      <% (view['users'] || {}).each do |key, u| %>
+        <tr>
+          <td><input name="user_key[]" value="<%= h(key) %>"></td>
+          <td><input name="user_id[]" value="<%= h(u['id'].to_s) %>"></td>
+          <td><input name="user_name[]" value="<%= h(u['name'].to_s) %>"></td>
+          <td><input name="user_role[]" value="<%= h(u['role'].to_s) %>"></td>
+          <td><input name="user_ns[]" value="<%= h(u['memory_namespace'].to_s) %>"></td>
+        </tr>
+      <% end %>
+      <tr>
+        <td><input name="user_key[]" placeholder="new_key"></td>
+        <td><input name="user_id[]" placeholder="id"></td>
+        <td><input name="user_name[]" placeholder="name"></td>
+        <td><input name="user_role[]" placeholder="pm"></td>
+        <td><input name="user_ns[]" placeholder="ns"></td>
+      </tr>
+    </tbody>
+  </table>
+  <p><button type="submit">Save users</button></p>
+</form>
+
+<h2>Providers</h2>
+<form method="post" action="<%= h(url('/config')) %>" class="panel">
+  <input type="hidden" name="section" value="providers">
+  <table>
+    <thead><tr><th>Name</th><th>Type</th><th>Model</th><th>Base URL</th></tr></thead>
+    <tbody>
+      <% (view['providers'] || {}).each do |name, p| %>
+        <tr>
+          <td><input name="prov_name[]" value="<%= h(name) %>"></td>
+          <td><input name="prov_type[]" value="<%= h(p['type'].to_s) %>"></td>
+          <td><input name="prov_model[]" value="<%= h(p['model'].to_s) %>"></td>
+          <td><input name="prov_base[]" value="<%= h(p['base_url'].to_s) %>"></td>
+        </tr>
+      <% end %>
+      <tr>
+        <td><input name="prov_name[]" placeholder="name"></td>
+        <td><input name="prov_type[]" placeholder="mock"></td>
+        <td><input name="prov_model[]"></td>
+        <td><input name="prov_base[]"></td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted">API keys stay in env or YAML; masked values are not written back via API.</p>
+  <p><button type="submit">Save providers</button></p>
+</form>
+
+<h2>MCP servers</h2>
+<form method="post" action="<%= h(url('/config')) %>" class="panel">
+  <input type="hidden" name="section" value="mcp">
+  <table>
+    <thead><tr><th>Name</th><th>Command</th><th>Args</th></tr></thead>
+    <tbody>
+      <% (view['mcp_servers'] || {}).each do |name, s| %>
+        <tr>
+          <td><input name="mcp_name[]" value="<%= h(name) %>"></td>
+          <td><input name="mcp_command[]" value="<%= h(s['command'].to_s) %>"></td>
+          <td><input name="mcp_args[]" value="<%= h(Array(s['args']).join(' ')) %>"></td>
+        </tr>
+      <% end %>
+      <tr>
+        <td><input name="mcp_name[]" placeholder="github"></td>
+        <td><input name="mcp_command[]" placeholder="npx"></td>
+        <td><input name="mcp_args[]" placeholder="-y @modelcontextprotocol/server-github"></td>
+      </tr>
+    </tbody>
+  </table>
+  <p><button type="submit">Save MCP servers</button></p>
+</form>
+
+<h2>Memory / SQLite paths</h2>
+<form method="post" action="<%= h(url('/config')) %>" class="panel">
+  <input type="hidden" name="section" value="memory">
+  <div class="row">
+    <label>sqlite_path<input name="sqlite_path" value="<%= h(view['sqlite_path'].to_s) %>" size="40"></label>
+    <label>vector_path<input name="vector_path" value="<%= h((view.dig('sqlite_memory', 'vector_path') || '').to_s) %>" size="30"></label>
+    <label>memory_path<input name="memory_path" value="<%= h((view.dig('sqlite_memory', 'memory_path') || '').to_s) %>" size="30"></label>
+    <label>embed_model<input name="embed_model" value="<%= h((view.dig('sqlite_memory', 'embed_model') || '').to_s) %>" size="30"></label>
+  </div>
+  <p><button type="submit">Save memory config</button></p>
+</form>
+
+<h2>Raw YAML (advanced)</h2>
+<form method="post" action="<%= h(url('/config')) %>" class="panel">
+  <input type="hidden" name="section" value="yaml">
+  <textarea name="yaml"><%= h(Psych.dump(view)) %></textarea>
+  <p class="muted">Full replace with backup. Prefer section forms above.</p>
+  <p><button type="submit" class="danger">Write YAML</button></p>
+</form>

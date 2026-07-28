@@ -1,0 +1,21 @@
+<h1>Skills</h1>
+<p class="lead">Bundles under <code>config/riggs/skills/</code>.</p>
+
+<div class="panel">
+  <% if skills.empty? %>
+    <p class="muted">No skills found.</p>
+  <% else %>
+    <table>
+      <thead><tr><th>Name</th><th>Versions</th><th>Latest</th></tr></thead>
+      <tbody>
+        <% skills.each do |sk| %>
+          <tr>
+            <td><%= h((sk[:name] || sk['name']).to_s) %></td>
+            <td><%= h(Array(sk[:versions] || sk['versions']).join(', ')) %></td>
+            <td><%= h((sk[:latest] || sk['latest']).to_s) %></td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  <% end %>
+</div>

@@ -1,0 +1,52 @@
+<h1>Triggers</h1>
+<p class="lead">Match keyword triggers against incoming text, or inspect declared playbook triggers.</p>
+
+<form method="get" action="<%= h(url('/triggers')) %>" class="panel">
+  <div class="row">
+    <label>Query<input name="q" value="<%= h(query) %>" size="40" placeholder="please triage this"></label>
+    <button type="submit">Match</button>
+  </div>
+</form>
+
+<% unless query.empty? %>
+  <h2>Matches for <code><%= h(query) %></code></h2>
+  <div class="panel">
+    <% if matches.empty? %>
+      <p class="muted">No playbooks matched.</p>
+    <% else %>
+      <ul>
+        <% matches.each do |m| %>
+          <li>
+            <a href="<%= h(url("/workflows/#{m['name'] || m[:name]}")) %>">
+              <%= h((m['name'] || m[:name]).to_s) %>
+            </a>
+            — <%= h((m['display_name'] || m[:display_name]).to_s) %>
+          </li>
+        <% end %>
+      </ul>
+    <% end %>
+  </div>
+<% end %>
+
+<h2>Declared triggers</h2>
+<div class="panel">
+  <% if declared.empty? %>
+    <p class="muted">No playbooks found.</p>
+  <% else %>
+    <table>
+      <thead><tr><th>Playbook</th><th>Triggers</th></tr></thead>
+      <tbody>
+        <% declared.each do |row| %>
+          <tr>
+            <td><a href="<%= h(url("/workflows/#{row[:name]}")) %>"><%= h(row[:name].to_s) %></a></td>
+            <td class="mono">
+              <% Array(row[:triggers]).each do |t| %>
+                <%= h(t[:type].to_s) %><% if t[:keywords] %>(<%= h(Array(t[:keywords]).join(', ')) %>)<% end %>
+              <% end %>
+            </td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  <% end %>
+</div>

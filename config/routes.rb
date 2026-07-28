@@ -1,21 +1,10 @@
 # frozen_string_literal: true
 
+# Thin mount: all HTML + JSON API is served by Riggs::Web::App (same as `riggs serve`).
+# Host apps:
+#   mount Riggs::Engine => "/riggs"
+# Optional identity mapping:
+#   Riggs.identity_mapper = ->(req) { current_user&.riggs_user_id }
 Riggs::Engine.routes.draw do
-  root to: "dashboard#index"
-
-  resources :workflows, only: %i[index show] do
-    member do
-      post :run
-    end
-  end
-
-  resources :sessions, only: %i[show] do
-    member do
-      post :approve
-      post :reject
-      get :audit
-    end
-  end
-
-  get "memory/search", to: "memory#search"
+  mount Riggs::Web::App => "/"
 end

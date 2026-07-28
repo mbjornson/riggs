@@ -1,0 +1,17 @@
+<h1>Switch user</h1>
+<p class="lead">Local serve identity picker (also set <code>X-Riggs-User</code>).</p>
+
+<form method="post" action="<%= h(url('/login')) %>" class="panel">
+  <label>
+    User
+    <select name="user">
+      <% users.each do |key, cfg| %>
+        <% k = key.to_s %>
+        <option value="<%= h(k) %>" <%= 'selected' if k == @identity[:id] %>>
+          <%= h(k) %> — <%= h((cfg[:name] || cfg['name'] || k).to_s) %> (<%= h((cfg[:role] || cfg['role']).to_s) %>)
+        </option>
+      <% end %>
+    </select>
+  </label>
+  <p style="margin-top:1rem"><button type="submit">Use this user</button></p>
+</form>

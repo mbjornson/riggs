@@ -13,6 +13,7 @@ require_relative "../skills/registry"
 require_relative "../mcp/client"
 require_relative "../mcp/manager"
 require_relative "../providers/router"
+require_relative "../triggers"
 
 module Riggs
   class CLI < Thor
@@ -23,6 +24,7 @@ module Riggs
     class_option :user, type: :string, desc: "Override default user from .agent_hubrc"
 
     map "identity:show" => :identity_show
+    map "config:show" => :config_show
     map "workflow:new" => :workflow_new
     map "workflow:validate" => :workflow_validate
     map "workflow:simulate" => :workflow_simulate
@@ -35,6 +37,8 @@ module Riggs
     map "providers:ping" => :providers_ping
     map "mcp:list" => :mcp_list
     map "mcp:ping" => :mcp_ping
+    map "triggers:match" => :triggers_match
+    map "triggers:list" => :triggers_list
 
     desc "setup", "Create .agent_hubrc, db/, config/riggs/workflows/, and SQLite database."
     def setup
@@ -142,40 +146,105 @@ module Riggs
       puts "🔑 Permissions: #{identity[:permissions].join(', ')}"
     end
 
-    desc "workflow:new NAME", "Create a new workflow YAML from a template."
+    desc "config:show", "Show .agent_hubrc with secrets masked."
+    def config_show
+      require_permission! %w[read_workflow edit_workflow configure_memory]
+      store = ConfigStore.new
+      print_header("Config (#{store.path})")
+      puts Psych.dump(store.public_view)
+    end
+
+    desc "serve", "Start the Riggs web UI / JSON API (Rack) against the current project."
+    method_option :port, type: :numeric, default: 4567, aliases: "-p"
+    method_option :bind, type: :string, default: "127.0.0.1", aliases: "-b"
+    def serve
+      require "rack"
+      require "rackup"
+      require_relative "../web/app"
+
+      abort "❌ Missing .agent_hubrc in #{Dir.pwd}. Run 'riggs setup' first." unless Identity.config_path
+
+      port = options[:port]
+      bind = options[:bind]
+      puts "🌐 Riggs web UI on http://#{bind}:#{port} (cwd=#{Dir.pwd})"
+      puts "   Auth: cookie user picker, X-Riggs-User header, or ?user="
+      Rackup::Server.start(
+        app: Riggs::Web::App,
+        Host: bind,
+        Port: port
+      )
+    end
+
+    desc "triggers:match TEXT", "List playbooks whose keyword triggers match TEXT."
+    def triggers_match(text)
+      require_permission! %w[read_workflow]
+      matches = Triggers.find_workflows(text: text)
+      print_header("Trigger Match")
+      if matches.empty?
+        puts "No playbooks matched #{text.inspect}."
+      else
+        matches.each do |wf|
+          puts "• #{wf[:name]} — #{wf[:display_name] || wf[:name]}"
+        end
+      end
+    end
+
+    desc "triggers:list", "Show declared triggers for each playbook."
+    def triggers_list
+      require_permission! %w[read_workflow]
+      rows = Triggers.list_declared
+      print_header("Playbook Triggers")
+      if rows.empty?
+        puts "No playbooks found in config/riggs/workflows/."
+        return
+      end
+      rows.each do |row|
+        summary = row[:triggers].map do |t|
+          if t[:type] == "keyword"
+            "keyword(#{Array(t[:keywords]).join(', ')})"
+          else
+            t[:type]
+          end
+        end.join(", ")
+        summary = "(none)" if summary.empty?
+        puts "• #{row[:name]} — #{summary}"
+      end
+    end
+
+    desc "workflow:new NAME", "Create a new workflow YAML (interactive composer, or --non-interactive)."
+    method_option :non_interactive, type: :boolean, default: false, aliases: "-n",
+                                    desc: "Skip prompts; write a default 2-step template"
+    method_option :display_name, type: :string, desc: "Display name"
+    method_option :trigger, type: :string, default: "manual", enum: %w[manual keyword],
+                            desc: "Trigger type for non-interactive / default"
+    method_option :keywords, type: :string, desc: "Comma-separated keywords when trigger=keyword"
+    method_option :steps, type: :numeric, default: 2, desc: "Step count for non-interactive template (min 2)"
+    method_option :relay_chain, type: :string, default: "mock", desc: "Comma-separated relay_chain"
+    method_option :validate, type: :boolean, default: true, desc: "Validate after write"
     def workflow_new(name)
       require_permission! %w[edit_workflow]
       path = "./config/riggs/workflows/#{name}.yml"
       FileUtils.mkdir_p(File.dirname(path))
       abort "❌ Already exists: #{path}" if File.exist?(path)
 
-      File.write(path, <<~YAML)
-        name: #{name}
-        display_name: #{name.tr('_', ' ').split.map(&:capitalize).join(' ')}
-        triggers:
-          - type: manual
-        context_window: medium
-        max_llm_calls: 20
-        timeout_seconds: 300
-        memory_scope:
-          isolation: namespaced
-        providers:
-          default:
-            relay_chain: [mock]
-        steps:
-          - id: start
-            label: Start
-            agent: default
-            input: "Begin playbook for {{workflow.input.topic}}"
-            output_var: start_result
-            next: finish
-          - id: finish
-            label: Finish
-            agent: default
-            input: "Summarize: {{workflow.start.start_result}}"
-            output_var: final_summary
-      YAML
+      spec =
+        if options[:non_interactive] || !$stdin.tty?
+          compose_non_interactive(name)
+        else
+          compose_interactive(name)
+        end
+
+      File.write(path, Psych.dump(spec))
       puts "✅ Created #{path}"
+
+      return unless options[:validate]
+
+      report = Workflow::Loader.validate(Workflow::Loader.load(path: path))
+      if report[:valid]
+        puts "✅ Valid (#{report[:step_count]} steps)"
+      else
+        puts "⚠️  Validation issues: #{report[:errors].join('; ')}"
+      end
     end
 
     desc "workflow:validate NAME", "Validate the DAG for cycles and missing references."
@@ -473,6 +542,122 @@ module Riggs
       def print_header(title)
         puts "\n== #{title.upcase} =="
         puts "─" * 40
+      end
+
+      def compose_non_interactive(name)
+        display = options[:display_name].to_s
+        display = name.tr("_", " ").split.map(&:capitalize).join(" ") if display.empty?
+        trigger = options[:trigger].to_s
+        triggers =
+          if trigger == "keyword"
+            kws = options[:keywords].to_s.split(",").map(&:strip).reject(&:empty?)
+            kws = [name] if kws.empty?
+            [{ "type" => "keyword", "keywords" => kws }]
+          else
+            [{ "type" => "manual" }]
+          end
+        chain = options[:relay_chain].to_s.split(",").map(&:strip).reject(&:empty?)
+        chain = ["mock"] if chain.empty?
+        n = [options[:steps].to_i, 2].max
+        steps = n.times.map do |i|
+          id =
+            if i.zero?
+              "start"
+            elsif i == n - 1
+              "finish"
+            else
+              "step_#{i + 1}"
+            end
+          {
+            "id" => id,
+            "label" => id.tr("_", " ").split.map(&:capitalize).join(" "),
+            "agent" => "default",
+            "input" => (i.zero? ? "Begin playbook for {{workflow.input.topic}}" : "Continue from prior step"),
+            "output_var" => "#{id}_result"
+          }
+        end
+        steps.each_with_index do |step, i|
+          step["next"] = steps[i + 1]["id"] if i < steps.length - 1
+        end
+        if steps.length >= 2
+          prev = steps[-2]
+          steps.last["input"] = "Summarize: {{workflow.#{prev['id']}.#{prev['output_var']}}}"
+        end
+
+        {
+          "name" => name,
+          "display_name" => display,
+          "triggers" => triggers,
+          "context_window" => "medium",
+          "max_llm_calls" => 20,
+          "timeout_seconds" => 300,
+          "memory_scope" => { "isolation" => "namespaced" },
+          "providers" => { "default" => { "relay_chain" => chain } },
+          "steps" => steps
+        }
+      end
+
+      def compose_interactive(name)
+        print_header("Compose Playbook: #{name}")
+        display = ask("Display name", default: name.tr("_", " ").split.map(&:capitalize).join(" "))
+        trigger = ask("Trigger type (manual/keyword)", default: options[:trigger] || "manual")
+        triggers =
+          if trigger.to_s.downcase.start_with?("key")
+            raw = ask("Keywords (comma-separated)", default: name)
+            kws = raw.split(",").map(&:strip).reject(&:empty?)
+            [{ "type" => "keyword", "keywords" => kws }]
+          else
+            [{ "type" => "manual" }]
+          end
+        chain_raw = ask("relay_chain (comma-separated)", default: options[:relay_chain] || "mock")
+        chain = chain_raw.split(",").map(&:strip).reject(&:empty?)
+        chain = ["mock"] if chain.empty?
+
+        count = ask("Number of steps", default: "2").to_i
+        count = 2 if count < 2
+        steps = []
+        count.times do |i|
+          puts "\n— Step #{i + 1} of #{count} —"
+          default_id = if i.zero?
+                         "start"
+                       else
+                         (i == count - 1 ? "finish" : "step_#{i + 1}")
+                       end
+          id = ask("id", default: default_id)
+          label = ask("label", default: id.tr("_", " ").split.map(&:capitalize).join(" "))
+          agent = ask("agent label", default: "default")
+          skill = ask("skill (optional)", default: "")
+          input = ask("input", default: (i.zero? ? "Begin for {{workflow.input.topic}}" : "Continue from prior step"))
+          gate = ask("gates (none/approval)", default: "none")
+          step = {
+            "id" => id,
+            "label" => label,
+            "agent" => agent,
+            "input" => input,
+            "output_var" => "#{id}_result"
+          }
+          step["skill"] = skill unless skill.strip.empty?
+          step["gates"] = ["approval"] if gate.to_s.downcase.include?("approv")
+          steps << step
+        end
+        steps.each_with_index do |step, i|
+          if i < steps.length - 1
+            hint = ask("next for #{step['id']} (default: #{steps[i + 1]['id']})", default: steps[i + 1]["id"])
+            step["next"] = hint
+          end
+        end
+
+        {
+          "name" => name,
+          "display_name" => display,
+          "triggers" => triggers,
+          "context_window" => "medium",
+          "max_llm_calls" => 20,
+          "timeout_seconds" => 300,
+          "memory_scope" => { "isolation" => "namespaced" },
+          "providers" => { "default" => { "relay_chain" => chain } },
+          "steps" => steps
+        }
       end
     end
   end

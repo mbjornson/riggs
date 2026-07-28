@@ -2,6 +2,7 @@
 
 module Riggs
   # Soft-load Rails engine only when Rails is available.
+  # Mounts the shared Rack app — no duplicated business logic.
   if defined?(::Rails::Engine)
     class Engine < ::Rails::Engine
       isolate_namespace Riggs
@@ -12,7 +13,6 @@ module Riggs
       end
 
       config.after_initialize do
-        # Ensure SQLite schema exists for host app
         path = begin
           Identity.load_config[:sqlite_path]
         rescue StandardError
