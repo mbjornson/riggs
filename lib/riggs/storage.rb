@@ -16,6 +16,14 @@ module Riggs
       @db.results_as_hash = true
       @db.execute("PRAGMA foreign_keys = ON")
       ensure_schema!
+      ensure_columns!
+    end
+
+    # CREATE TABLE IF NOT EXISTS never alters a table that already exists, so
+    # columns added after a database is in the field need an explicit backfill.
+    def ensure_columns!
+      cols = @db.execute("PRAGMA table_info(riggs_sessions)").map { |r| r["name"] }
+      @db.execute("ALTER TABLE riggs_sessions ADD COLUMN resume_state TEXT") unless cols.include?("resume_state")
     end
 
     def ensure_schema!
@@ -90,6 +98,78 @@ module Riggs
       end
     end
 
+    # Persists one conversation turn. When seq is omitted it is allocated inside
+    # the insert itself, so concurrent writers cannot collide on the same value.
+    def append_message(session_id:, step_key:, role:, content: nil, seq: nil,
+                       tool_call_id: nil, tool_name: nil, tool_calls: nil, provider: nil)
+      sid = utf8(session_id)
+      @db.execute(
+        "INSERT INTO riggs_messages " \
+        "(session_id, step_key, seq, role, content, tool_call_id, tool_name, tool_calls, provider) " \
+        "VALUES (?, ?, COALESCE(?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM riggs_messages WHERE session_id = ?)), " \
+        "?, ?, ?, ?, ?, ?)",
+        [sid, step_key.to_s, seq, sid, role.to_s, content&.to_s, tool_call_id&.to_s, tool_name&.to_s,
+         tool_calls.nil? ? nil : JSON.generate(tool_calls), provider&.to_s]
+      )
+      @db.last_insert_row_id
+    end
+
+    def list_messages(session_id, step_key: nil)
+      if step_key
+        @db.execute(
+          "SELECT * FROM riggs_messages WHERE session_id = ? AND step_key = ? ORDER BY seq ASC",
+          [utf8(session_id), step_key.to_s]
+        )
+      else
+        @db.execute("SELECT * FROM riggs_messages WHERE session_id = ? ORDER BY seq ASC", [utf8(session_id)])
+      end
+    end
+
+    def next_message_seq(session_id)
+      row = @db.get_first_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM riggs_messages WHERE session_id = ?",
+        [utf8(session_id)]
+      )
+      row ? row["next"].to_i : 1
+    end
+
+    # Atomically claims a paused run for resumption. The status check and the
+    # write are one statement, so two concurrent resumers cannot both win and
+    # execute the gated step twice. Returns true only for the winner.
+    def claim_paused_session(session_id)
+      @db.execute(
+        "UPDATE riggs_sessions SET status = 'running' WHERE id = ? AND status = 'paused'",
+        [utf8(session_id)]
+      )
+      @db.changes.positive?
+    end
+
+    # state: Hash to store, or nil to clear once a run is no longer resumable.
+    def save_resume_state(session_id, state)
+      @db.execute(
+        "UPDATE riggs_sessions SET resume_state = ? WHERE id = ?",
+        [state.nil? ? nil : JSON.generate(state), utf8(session_id)]
+      )
+    end
+
+    def load_resume_state(session_id)
+      row = @db.get_first_row("SELECT resume_state FROM riggs_sessions WHERE id = ?", [utf8(session_id)])
+      raw = row && row["resume_state"]
+      return nil if raw.nil? || raw.to_s.empty?
+
+      deep_symbolize(JSON.parse(raw))
+    rescue JSON::ParserError
+      nil
+    end
+
+    def list_audit_after(session_id, after_id, limit: 500)
+      @db.execute(
+        "SELECT id, session_id, event_type, payload, created_at FROM riggs_audit " \
+        "WHERE session_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
+        [utf8(session_id), after_id.to_i, limit.to_i]
+      )
+    end
+
     def audit(session_id:, event_type:, payload: {})
       @db.execute(
         "INSERT INTO riggs_audit (session_id, event_type, payload) VALUES (?, ?, ?)",
@@ -126,6 +206,16 @@ module Riggs
 
     private
 
+    # Local copy rather than Riggs::Identity.deep_symbolize so Storage stays
+    # loadable on its own.
+    def deep_symbolize(value)
+      case value
+      when Hash then value.each_with_object({}) { |(k, v), h| h[k.to_sym] = deep_symbolize(v) }
+      when Array then value.map { |v| deep_symbolize(v) }
+      else value
+      end
+    end
+
     def schema_sql
       path = File.expand_path("../../db/init_riggs_schema.sql", __dir__)
       if File.exist?(path)
@@ -155,6 +245,21 @@ module Riggs
             executed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             gate_decided_at DATETIME
           );
+          CREATE TABLE IF NOT EXISTS riggs_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL REFERENCES riggs_sessions(id),
+            step_key TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT,
+            tool_call_id TEXT,
+            tool_name TEXT,
+            tool_calls TEXT,
+            provider TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+          DROP INDEX IF EXISTS idx_riggs_messages_session;
+          CREATE UNIQUE INDEX IF NOT EXISTS idx_riggs_messages_session_seq ON riggs_messages(session_id, seq);
           CREATE TABLE IF NOT EXISTS riggs_audit (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT REFERENCES riggs_sessions(id),

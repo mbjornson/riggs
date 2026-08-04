@@ -8,11 +8,13 @@ module Riggs
     # Multi-turn provider ↔ MCP tool execution until final text or guardrails.
     class ToolLoop
       def initialize(router:, mcp_manager:, skill_registry:, audit:, llm_calls:, max_llm_calls:, timeout_seconds:, started_at:,
-                     session_id:)
+                     session_id:, persist: nil)
         @router = router
         @mcp_manager = mcp_manager
         @skill_registry = skill_registry
         @audit = audit
+        # Optional: a nil persist keeps the loop usable without any storage.
+        @persist = persist
         @llm_calls = llm_calls
         @max_llm_calls = max_llm_calls.to_i
         @timeout_seconds = timeout_seconds
@@ -46,7 +48,10 @@ module Riggs
           tool_calls = Array(result[:tool_calls])
           tool_calls = parse_tool_line(result[:content]) if tool_calls.empty? && result[:content].to_s.start_with?("TOOL:")
 
-          return { content: result[:content].to_s, provider: result[:provider], llm_calls: @llm_calls } if tool_calls.empty?
+          if tool_calls.empty?
+            persist_turn(role: "assistant", content: result[:content].to_s, step_key: step.id, provider: result[:provider])
+            return { content: result[:content].to_s, provider: result[:provider], llm_calls: @llm_calls }
+          end
 
           # Append assistant turn with tool_calls for provider follow-up
           messages << {
@@ -54,6 +59,8 @@ module Riggs
             content: result[:content].to_s,
             tool_calls: tool_calls
           }
+          persist_turn(role: "assistant", content: result[:content].to_s, step_key: step.id,
+                       tool_calls: tool_calls, provider: result[:provider])
 
           tool_calls.each do |tc|
             @audit.call(session_id: @session_id, event_type: "tool_call",
@@ -70,11 +77,18 @@ module Riggs
               id: tc[:id],
               content: out.to_s
             }
+            persist_turn(role: "tool", content: out.to_s, step_key: step.id,
+                         tool_call_id: tc[:id], tool_name: tc[:name])
           end
         end
       end
 
       private
+
+      def persist_turn(role:, content:, step_key:, tool_call_id: nil, tool_name: nil, tool_calls: nil, provider: nil)
+        @persist&.call(role: role, content: content, step_key: step_key, tool_call_id: tool_call_id,
+                       tool_name: tool_name, tool_calls: tool_calls, provider: provider)
+      end
 
       def load_skill(step)
         return nil unless @skill_registry

@@ -32,10 +32,13 @@ Lint/UnusedMethodArgument:
 Naming/MethodParameterName:
   MinNameLength: 1
 
-# MemoryService#persist returns a success boolean but is not a predicate
+# These return a success boolean but are commands, not predicates:
+# MemoryService#persist, and Storage#claim_paused_session which mutates the
+# row it reports on (renaming it to `?` would imply a pure query).
 Naming/PredicateMethod:
   AllowedMethods:
     - persist
+    - claim_paused_session
 
 # Entrypoint defines Riggs::Error before requiring files that subclass it;
 # test_helper reopens Minitest::Test to mix in helpers

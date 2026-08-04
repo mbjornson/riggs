@@ -29,6 +29,7 @@ module Riggs
     map "workflow:validate" => :workflow_validate
     map "workflow:simulate" => :workflow_simulate
     map "workflow:run" => :workflow_run
+    map "workflow:resume" => :workflow_resume
     map "workflow:inspect" => :workflow_inspect
     map "memory:recall" => :memory_recall
     map "memory:persist" => :memory_persist
@@ -357,6 +358,48 @@ module Riggs
         JSON.pretty_generate(engine.audit_log)
       )
       puts "📁 Audit log saved to ./db/audit/ (also in riggs_audit table)"
+    end
+
+    desc "workflow:resume SESSION_ID", "Resume a workflow session paused at a HITL gate."
+    def workflow_resume(session_id)
+      require_permission! %w[run_workflow]
+      cfg = load_config
+      db_path = cfg[:sqlite_path] || "./db/riggs.sqlite3"
+
+      storage = Storage.new(db_path: db_path)
+      session = storage.find_session(session_id)
+      storage.close
+      abort "❌ Session not found: #{session_id}" unless session
+
+      workflow = load_workflow(session["workflow_name"])
+      identity = current_identity
+
+      print_header("Resuming Workflow: #{workflow[:display_name] || session['workflow_name']}")
+      puts "👤 User: #{identity[:id]} (#{identity[:role]})"
+      puts "🧠 Memory Scope: #{identity[:memory_namespace]}"
+      puts "🔁 Session: #{session_id} (status=#{session['status']})"
+
+      mcp_manager = begin
+        MCP::Manager.from_config(cfg[:mcp_servers])
+      rescue StandardError => e
+        warn "⚠️  MCP disabled for this run — mcp_servers config error: #{e.message}"
+        nil
+      end
+
+      begin
+        Workflow::GraphEngine.resume(
+          session_id: session_id,
+          user_identity: identity,
+          workflow: workflow,
+          db_path: db_path,
+          hub_config: cfg,
+          skill_registry: SkillRegistry.new,
+          mcp_manager: mcp_manager,
+          io: $stdout
+        )
+      rescue WorkflowError => e
+        abort "❌ Cannot resume #{session_id}: #{e.message}"
+      end
     end
 
     desc "workflow:inspect SESSION_ID", "Show session status and audit events (viewer+)."

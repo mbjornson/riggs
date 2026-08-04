@@ -39,6 +39,22 @@ module Riggs
         @started_at = nil
       end
 
+      # Restarts a paused run from its stored resume_state. The gate that paused
+      # the run is treated as already approved, so it does not prompt again.
+      def self.resume(session_id:, user_identity:, workflow:, db_path:, hub_config: {}, gate_handler: nil,
+                      skill_registry: nil, mcp_manager: nil, storage: nil, io: $stdout)
+        new(
+          workflow: workflow,
+          user_identity: user_identity,
+          storage: storage,
+          db_path: db_path,
+          hub_config: hub_config,
+          gate_handler: gate_handler,
+          skill_registry: skill_registry,
+          mcp_manager: mcp_manager
+        ).resume_session(session_id, io: io)
+      end
+
       def execute(io = $stdout, input: {})
         @started_at = Time.now
         @outputs[:input] = stringify_keys(input)
@@ -58,8 +74,67 @@ module Riggs
         log_event("workflow_start", { workflow: @workflow[:name], user: @user_identity[:id] })
         io.puts "▶ Session #{@session_id}"
 
+        run_steps(@workflow[:steps].first, io)
+      rescue StandardError => e
+        @status = :failed
+        # Audit before the status flips, for the same reason as the success path.
+        log_event("workflow_failed", { error: e.message }) if @session_id
+        @storage.update_session(@session_id, status: "failed", ended: true) if @session_id
+        raise
+      ensure
+        @mcp_manager&.close
+      end
+
+      def resume_session(session_id, io: $stdout)
+        session = @storage.find_session(session_id)
+        raise WorkflowError, "Session not found: #{session_id}" unless session
+
+        status = session["status"].to_s
+        raise WorkflowError, "Session #{session_id} is not paused (status=#{status})" unless status == "paused"
+
+        state = @storage.load_resume_state(session_id)
+        raise WorkflowError, "Session #{session_id} has no resume state" unless state
+
         steps_by_id = @workflow[:steps].to_h { |s| [s.id, s] }
-        current = @workflow[:steps].first
+        current = steps_by_id[state[:current_step_id].to_s]
+        raise WorkflowError, "Resume step '#{state[:current_step_id]}' is not in workflow '#{@workflow[:name]}'" unless current
+
+        @session_id = session_id
+        # timeout_seconds restarts from the resume instant; max_llm_calls does not.
+        @started_at = Time.now
+        @outputs = state[:outputs].is_a?(Hash) ? state[:outputs] : {}
+        @outputs[:input] ||= state[:input] || {}
+        @llm_calls = state[:llm_calls].to_i
+
+        # Atomic paused->running claim. The checks above give good error
+        # messages, but only this decides who actually runs: a second resumer
+        # that passed those same checks concurrently loses here rather than
+        # executing the gated step a second time.
+        unless @storage.claim_paused_session(session_id)
+          raise WorkflowError, "Session #{session_id} was already claimed by another resumer"
+        end
+
+        @storage.save_resume_state(session_id, nil)
+        log_event("workflow_resume", { step: current.id, llm_calls: @llm_calls })
+        io.puts "▶ Resuming session #{session_id} at step '#{current.id}'"
+
+        run_steps(current, io, gate_pre_approved: true)
+      rescue StandardError => e
+        @status = :failed
+        # Audit before the status flips, for the same reason as the success path.
+        log_event("workflow_failed", { error: e.message }) if @session_id
+        @storage.update_session(@session_id, status: "failed", ended: true) if @session_id
+        raise
+      ensure
+        @mcp_manager&.close
+      end
+
+      private
+
+      # Walks the DAG from `current`. `gate_pre_approved` applies only to the
+      # first step, so a resumed run does not re-prompt the gate that paused it.
+      def run_steps(current, io, gate_pre_approved: false)
+        steps_by_id = @workflow[:steps].to_h { |s| [s.id, s] }
         @status = :running
 
         while current
@@ -77,12 +152,27 @@ module Riggs
           io.puts "\n── Step: #{current.label} (#{current.id}) ──"
 
           gate_decision = nil
-          if current.approval_gate?
+          if current.approval_gate? && gate_pre_approved
+            gate_decision = :approved
+            log_event("gate_decision", { step: current.id, decision: gate_decision, resumed: true })
+            @storage.update_step(step_row_id, status: "approved", gate_decided: true)
+          elsif current.approval_gate?
             @storage.update_session(@session_id, status: "awaiting_approval")
             @storage.update_step(step_row_id, status: "awaiting_approval")
             log_event("gate_pause", { step: current.id })
             gate_decision = @gate_handler.call(current, io)
             log_event("gate_decision", { step: current.id, decision: gate_decision })
+
+            if gate_decision == :paused
+              @storage.update_step(step_row_id, status: "paused")
+              return pause_run!(current, io)
+            end
+
+            # Anything that is neither :paused nor :rejected counts as approval,
+            # so a handler returning an unexpected value still follows the
+            # "if gate.approved:" branch instead of dead-ending the run.
+            gate_decision = :approved unless gate_decision == :rejected
+
             @storage.update_step(step_row_id, status: gate_decision.to_s, gate_decided: true)
 
             if gate_decision == :rejected
@@ -93,17 +183,20 @@ module Riggs
             end
             @storage.update_session(@session_id, status: "running")
           end
+          gate_pre_approved = false
 
           resolved_input = Loader.resolve_context(current.input, workflow_context)
           system_prompt = build_system_prompt(current)
           messages = build_messages(resolved_input)
           chain = @router.chain_for(step: current, workflow: @workflow)
+          persist_bridge(role: "user", content: resolved_input, step_key: current.id)
 
           loop_runner = ToolLoop.new(
             router: @router,
             mcp_manager: @mcp_manager,
             skill_registry: @skill_registry,
             audit: method(:audit_bridge),
+            persist: method(:persist_bridge),
             llm_calls: @llm_calls,
             max_llm_calls: @workflow[:max_llm_calls],
             timeout_seconds: @workflow[:timeout_seconds],
@@ -139,23 +232,48 @@ module Riggs
         end
 
         @status = :completed
-        @storage.update_session(@session_id, status: "completed", ended: true)
+        # Audit first: a poller that sees a terminal status stops reading, so
+        # the final event must already exist when the status flips.
         log_event("workflow_complete", { llm_calls: @llm_calls })
+        @storage.update_session(@session_id, status: "completed", ended: true)
         io.puts "\n✅ Workflow completed (#{@llm_calls} LLM calls)."
         self
-      rescue StandardError => e
-        @status = :failed
-        @storage.update_session(@session_id, status: "failed", ended: true) if @session_id
-        log_event("workflow_failed", { error: e.message }) if @session_id
-        raise
-      ensure
-        @mcp_manager&.close
       end
 
-      private
+      # A gate pause stops the run before the gated step resolves its input, so
+      # the saved state is enough to restart cleanly at the top of that step.
+      def pause_run!(step, io)
+        @storage.save_resume_state(@session_id, {
+                                     current_step_id: step.id,
+                                     outputs: @outputs,
+                                     llm_calls: @llm_calls,
+                                     input: @outputs[:input] || {}
+                                   })
+        log_event("gate_pause", { step: step.id, resumable: true })
+        @storage.update_session(@session_id, status: "paused")
+        @status = :paused
+        io.puts "⏸ Gate paused on '#{step.id}' — resume with: riggs workflow:resume #{@session_id}"
+        self
+      end
 
       def audit_bridge(session_id:, event_type:, payload: {})
         log_event(event_type, payload)
+      end
+
+      # Writes one conversation turn as it happens; seq is allocated by Storage.
+      def persist_bridge(role:, content:, step_key:, tool_call_id: nil, tool_name: nil, tool_calls: nil, provider: nil)
+        return unless @session_id
+
+        @storage.append_message(
+          session_id: @session_id,
+          step_key: step_key,
+          role: role,
+          content: content,
+          tool_call_id: tool_call_id,
+          tool_name: tool_name,
+          tool_calls: tool_calls,
+          provider: provider
+        )
       end
 
       def workflow_context

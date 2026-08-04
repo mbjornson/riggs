@@ -197,10 +197,10 @@ Pass identity with `X-Riggs-User`, the web User picker, or `Riggs.identity_mappe
 1. `riggs setup` (or open Config in the web UI).
 2. As a PM user, edit users/roles, providers, MCP servers, and memory paths under **Config** (or `PATCH /api/config`).
 3. Add playbooks under `config/riggs/workflows/` (CLI `workflow:new` or hand-edit YAML).
-4. Engineers run playbooks from **Playbooks** or `riggs workflow:run`; approve HITL via **Runs** (`POST /api/sessions/:id/approve|reject`) — decision is audited; interactive resume still works best from CLI until full pause/resume storage lands.
+4. Engineers run playbooks from **Playbooks** or `riggs workflow:run`; approve HITL via **Runs** (`POST /api/sessions/:id/approve|reject`) — the decision is audited, and approving a run that paused at a gate resumes it from that step. Resume from the CLI with `riggs workflow:resume <session_id>`.
 5. Inspect memory under **Memory** (`GET /api/memory/search?q=`).
 
-Stable JSON API (same app): `GET/PATCH /api/config`, `GET /api/workflows`, `POST /api/workflows/:name/run`, `GET /api/sessions/:id`, `GET /api/sessions/:id/audit`, `POST .../approve|reject`, `GET /api/memory/search`, `GET /api/skills`, `GET /api/mcp/servers`, `GET /api/triggers`, `GET /api/triggers/match?q=`.
+Stable JSON API (same app): `GET/PATCH /api/config`, `GET /api/workflows`, `POST /api/workflows/:name/run`, `GET /api/sessions/:id`, `GET /api/sessions/:id/audit`, `GET /api/sessions/:id/events?after=`, `GET /api/sessions/:id/stream` (SSE), `POST .../approve|reject`, `GET /api/memory/search`, `GET /api/skills`, `GET /api/mcp/servers`, `GET /api/triggers`, `GET /api/triggers/match?q=`.
 
 ## Development
 
