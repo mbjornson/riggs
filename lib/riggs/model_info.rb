@@ -92,6 +92,7 @@ module Riggs
 
       rates = lookup(model, overrides: overrides)
       return nil if rates.nil?
+      return nil if RATE_FIELDS.values.all? { |k| rates[k].nil? }
 
       total = RATE_FIELDS.sum do |usage_key, rate_key|
         tokens = usage[usage_key]

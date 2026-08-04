@@ -78,6 +78,14 @@ class TestModelInfo < Minitest::Test
     assert_nil Riggs::ModelInfo.cost(model: "unpriced", usage: usage, overrides: FIXTURE)
   end
 
+  def test_cost_is_nil_for_an_override_with_no_price_fields
+    usage = { input_tokens: 1_000, output_tokens: 500, cache_read_tokens: nil,
+              cache_write_tokens: nil, measured: true }
+    overrides = { "context-only-model" => { context_window: 50_000 } }
+
+    assert_nil Riggs::ModelInfo.cost(model: "context-only-model", usage: usage, overrides: overrides)
+  end
+
   def test_cost_is_nil_when_model_is_nil
     usage = { input_tokens: 100, output_tokens: 100, cache_read_tokens: nil,
               cache_write_tokens: nil, measured: true }
