@@ -11,6 +11,7 @@ require "stringio"
 require_relative "../config_store"
 require_relative "../identity"
 require_relative "../storage"
+require_relative "../events"
 require_relative "../memory/service"
 require_relative "../workflow/loader"
 require_relative "../workflow/graph_engine"
@@ -56,8 +57,34 @@ module Riggs
     class App
       VIEWS = File.expand_path("views", __dir__)
 
+      # A stream is bounded so a client reconnects with after=<last_id> rather
+      # than holding a connection (and a Storage handle) open forever.
+      DEFAULT_STREAM_TIMEOUT_SECONDS = 30
+      # Rows fetched per stream poll. A full page means more are waiting, so the
+      # stream drains again immediately instead of sleeping or signalling done.
+      STREAM_PAGE_SIZE = 500
+      DEFAULT_STREAM_POLL_SECONDS = 1.0
+
+      class << self
+        # Overridable so tests do not have to wait out the production cap.
+        attr_writer :stream_timeout_seconds, :stream_poll_seconds
+
+        def stream_timeout_seconds
+          @stream_timeout_seconds || DEFAULT_STREAM_TIMEOUT_SECONDS
+        end
+
+        def stream_poll_seconds
+          @stream_poll_seconds || DEFAULT_STREAM_POLL_SECONDS
+        end
+      end
+
       def self.call(env)
         new.call(env)
+      end
+
+      def initialize(stream_timeout_seconds: nil, stream_poll_seconds: nil)
+        @stream_timeout_seconds = (stream_timeout_seconds || self.class.stream_timeout_seconds).to_f
+        @stream_poll_seconds = (stream_poll_seconds || self.class.stream_poll_seconds).to_f
       end
 
       def call(env)
@@ -163,6 +190,13 @@ module Riggs
         end
         if m == "GET" && (sm = p.match(%r{\A/api/sessions/([^/]+)/audit\z}))
           return api_session_audit(sm[1])
+        end
+        # Registered before the bare /api/sessions/:id route so it cannot be swallowed.
+        if m == "GET" && (sm = p.match(%r{\A/api/sessions/([^/]+)/events\z}))
+          return api_session_events(req, sm[1])
+        end
+        if m == "GET" && (sm = p.match(%r{\A/api/sessions/([^/]+)/stream\z}))
+          return api_session_stream(req, sm[1])
         end
         if m == "GET" && (sm = p.match(%r{\A/api/sessions/([^/]+)\z}))
           return api_show_session(sm[1])
@@ -321,10 +355,104 @@ module Riggs
         json_ok(rows)
       end
 
+      # Cursor-paged event poll. `last_id` echoes `after` on an empty page so a
+      # client can poll forever without losing its place.
+      def api_session_events(req, id)
+        Auth.require!(@identity, "inspect_run")
+        sid = Storage.utf8(id)
+        after = req.params["after"].to_i
+        limit = Events.clamp_limit(req.params["limit"])
+
+        storage = open_storage
+        begin
+          session = storage.find_session(sid)
+          return json_error(404, "not found") unless session
+
+          rows = storage.list_audit_after(sid, after, limit: limit)
+        ensure
+          storage.close
+        end
+
+        events = rows.map { |row| Events.normalize(row, session_id: sid) }
+        status = session["status"].to_s
+        json_ok(
+          events: events,
+          last_id: events.empty? ? after : events.last[:id],
+          status: status,
+          done: Events.terminal?(status)
+        )
+      end
+
+      # Server-sent events tail of the audit log.
+      def api_session_stream(req, id)
+        Auth.require!(@identity, "inspect_run")
+        sid = Storage.utf8(id)
+
+        storage = open_storage
+        begin
+          return json_error(404, "not found") unless storage.find_session(sid)
+        ensure
+          storage.close
+        end
+
+        headers = {
+          "content-type" => "text/event-stream",
+          "cache-control" => "no-cache",
+          "x-accel-buffering" => "no"
+        }
+        [200, headers, stream_body(sid, req.params["after"].to_i)]
+      end
+
+      # Lazy Rack streaming body: nothing runs until the server calls #each.
+      # Every poll opens and closes its own Storage handle inside an ensure, so
+      # a client that disconnects mid-stream cannot leak a connection.
+      def stream_body(sid, after)
+        Enumerator.new do |out|
+          cursor = after
+          deadline = monotonic + @stream_timeout_seconds
+          loop do
+            status, rows = poll_events(sid, cursor, limit: STREAM_PAGE_SIZE)
+            rows.each do |row|
+              event = Events.normalize(row, session_id: sid)
+              cursor = event[:id]
+              out << "id: #{event[:id]}\ndata: #{JSON.generate(event)}\n\n"
+            end
+
+            # A full page means more rows are already waiting. Keep draining
+            # without sleeping, and never signal done mid-backlog — a client
+            # that sees done stops reading and would lose the remainder.
+            next if rows.length >= STREAM_PAGE_SIZE
+
+            if Events.terminal?(status)
+              out << "event: done\ndata: #{JSON.generate(status: status)}\n\n"
+              break
+            end
+            remaining = deadline - monotonic
+            break if remaining <= 0
+
+            sleep([@stream_poll_seconds, remaining].min)
+          end
+        end
+      end
+
+      def poll_events(sid, cursor, limit: STREAM_PAGE_SIZE)
+        storage = open_storage
+        begin
+          session = storage.find_session(sid)
+          [session ? session["status"].to_s : "", storage.list_audit_after(sid, cursor, limit: limit)]
+        ensure
+          storage.close
+        end
+      end
+
+      def monotonic
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
+
       def api_session_decision(id, decision)
         Auth.require!(@identity, "approve_gates")
-        apply_session_decision(id, decision)
-        json_ok(ok: true, decision: decision)
+        status = apply_session_decision(id, decision)
+        json_ok(ok: true, decision: decision, status: status)
       end
 
       def execute_workflow(name, input:, auto_approve:)
@@ -353,23 +481,56 @@ module Riggs
         }
       end
 
+      # Returns the session status after the decision is applied. Approving a
+      # run that paused with durable resume state now finishes it in-process;
+      # approving anything else only records the decision, as before.
       def apply_session_decision(id, decision)
         storage = open_storage
-        session = storage.find_session(id)
-        raise Error, "Session not found" unless session
+        workflow_name = nil
+        begin
+          session = storage.find_session(id)
+          raise Error, "Session not found" unless session
 
-        storage.audit(
-          session_id: id,
-          event_type: "gate_decision",
-          payload: { decision: decision, via: "web", user: @identity[:id] }
-        )
-        if decision == "rejected"
-          storage.update_session(id, status: "rejected", ended: true)
-        else
-          # Full pause/resume may need CLI; web records the decision for audit.
-          storage.update_session(id, status: "approved_pending_resume")
+          storage.audit(
+            session_id: id,
+            event_type: "gate_decision",
+            payload: { decision: decision, via: "web", user: @identity[:id] }
+          )
+          if decision == "rejected"
+            storage.update_session(id, status: "rejected", ended: true)
+            return "rejected"
+          end
+
+          unless session["status"] == "paused" && storage.load_resume_state(id)
+            storage.update_session(id, status: "approved_pending_resume")
+            return "approved_pending_resume"
+          end
+
+          workflow_name = session["workflow_name"]
+        ensure
+          storage.close
         end
-        storage.close
+
+        resume_session_run(id, workflow_name)
+      end
+
+      def resume_session_run(id, workflow_name)
+        path = workflow_path(workflow_name)
+        raise Error, "Workflow not found: #{workflow_name}" unless path
+
+        engine = Workflow::GraphEngine.resume(
+          session_id: id,
+          user_identity: @identity,
+          workflow: Workflow::Loader.load(path: path),
+          db_path: sqlite_path,
+          hub_config: @config,
+          # Later gates in the resumed run auto-approve, matching how the web
+          # runner already handles gates in execute_workflow.
+          gate_handler: ->(_step, _io) { :approved },
+          skill_registry: SkillRegistry.new,
+          io: StringIO.new
+        )
+        engine.status.to_s
       end
 
       def list_workflows

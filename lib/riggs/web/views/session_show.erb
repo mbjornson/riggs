@@ -12,9 +12,13 @@
   </table>
 </div>
 
-<% if session['status'].to_s == 'awaiting_approval' || session['status'].to_s == 'approved_pending_resume' %>
+<% if %w[awaiting_approval approved_pending_resume paused].include?(session['status'].to_s) %>
   <div class="panel">
-    <p>HITL: record approve/reject. Full step resume from a paused GraphEngine may require CLI re-run with <code>--auto-approve</code> until pause/resume storage lands.</p>
+    <% if session['status'].to_s == 'paused' %>
+      <p>HITL: this run paused at a gate with saved state. Approving resumes it from that step; rejecting ends it. Or resume from the CLI with <code>riggs workflow:resume <%= h(session['id']) %></code>.</p>
+    <% else %>
+      <p>HITL: record approve/reject. This run has no saved resume state, so approving records the decision only.</p>
+    <% end %>
     <form method="post" action="<%= h(url("/sessions/#{session['id']}/approve")) %>" style="display:inline">
       <button type="submit">Approve</button>
     </form>
@@ -39,3 +43,67 @@
     </tbody>
   </table>
 </div>
+
+<%
+  # The live log picks up where the server-rendered audit table stops, so the
+  # two never show the same event twice.
+  last_audit_id = audit.map { |r| r['id'].to_i }.max || 0
+%>
+<h2>Live events</h2>
+<div class="panel">
+  <p class="muted" id="riggs-live-note">Listening for new events&hellip;</p>
+  <table>
+    <thead><tr><th>#</th><th>When</th><th>Event</th><th>Payload</th></tr></thead>
+    <tbody id="riggs-live-events"
+           data-url="<%= h(url("/api/sessions/#{session['id']}/events")) %>"
+           data-last-id="<%= h(last_audit_id) %>"></tbody>
+  </table>
+</div>
+
+<script>
+  (function () {
+    var log = document.getElementById("riggs-live-events");
+    var note = document.getElementById("riggs-live-note");
+    if (!log || !window.fetch) { return; }
+
+    var url = log.getAttribute("data-url");
+    var lastId = parseInt(log.getAttribute("data-last-id"), 10) || 0;
+
+    function cell(row, text, cls) {
+      var td = document.createElement("td");
+      if (cls) { td.className = cls; }
+      td.textContent = text;
+      row.appendChild(td);
+    }
+
+    function append(event) {
+      var tr = document.createElement("tr");
+      cell(tr, String(event.id), "muted");
+      cell(tr, event.at || "", "muted");
+      cell(tr, event.type || "");
+      cell(tr, JSON.stringify(event.payload || {}).slice(0, 200), "mono");
+      log.appendChild(tr);
+    }
+
+    function poll() {
+      fetch(url + "?after=" + lastId, {
+        credentials: "same-origin",
+        headers: { "Accept": "application/json" }
+      }).then(function (res) {
+        if (!res.ok) { throw new Error(res.status); }
+        return res.json();
+      }).then(function (data) {
+        (data.events || []).forEach(append);
+        lastId = data.last_id || lastId;
+        note.textContent = data.done
+          ? "Status: " + data.status + " · stream closed"
+          : "Status: " + data.status + " · listening…";
+        if (!data.done) { setTimeout(poll, 2000); }
+      }).catch(function () {
+        note.textContent = "Event stream unavailable.";
+      });
+    }
+
+    poll();
+  })();
+</script>
