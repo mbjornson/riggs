@@ -4,10 +4,25 @@ require "sqlite3"
 require "json"
 require "securerandom"
 require "fileutils"
+require_relative "usage"
 
 module Riggs
   class Storage
     attr_reader :db_path, :db
+
+    # SUM ignores NULLs, so unmeasured calls fall out of the token totals and
+    # unpriced calls fall out of the cost total without any special casing.
+    USAGE_SELECT = <<~SQL
+      SELECT COUNT(*) AS calls,
+             SUM(measured) AS measured_calls,
+             SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS priced_calls,
+             SUM(input_tokens) AS input_tokens,
+             SUM(output_tokens) AS output_tokens,
+             SUM(cache_read_tokens) AS cache_read_tokens,
+             SUM(cache_write_tokens) AS cache_write_tokens,
+             SUM(cost_usd) AS cost_usd
+      FROM riggs_provider_calls
+    SQL
 
     def initialize(db_path:)
       @db_path = db_path
@@ -184,6 +199,39 @@ module Riggs
       )
     end
 
+    def record_provider_call(session_id:, step_key:, provider:, model:, relay_attempt:, usage:, cost_usd:)
+      u = usage || Usage::EMPTY
+      @db.execute(
+        "INSERT INTO riggs_provider_calls " \
+        "(session_id, step_key, provider, model, relay_attempt, measured,  " \
+        "input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd) " \
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [utf8(session_id), step_key.to_s, provider.to_s, model&.to_s, relay_attempt.to_i,
+         u[:measured] ? 1 : 0, u[:input_tokens], u[:output_tokens],
+         u[:cache_read_tokens], u[:cache_write_tokens], cost_usd]
+      )
+      @db.last_insert_row_id
+    end
+
+    def session_usage(session_id)
+      row = @db.get_first_row("#{USAGE_SELECT} WHERE session_id = ?", [utf8(session_id)])
+      usage_row(row)
+    end
+
+    def step_usage(session_id)
+      # USAGE_SELECT already ends in "FROM riggs_provider_calls", so the
+      # per-step columns are spliced in just before that clause rather than
+      # appended after it (appending after would land them in the FROM list).
+      select = USAGE_SELECT.sub(
+        "FROM riggs_provider_calls", ", step_key, MIN(id) AS first_id FROM riggs_provider_calls"
+      )
+      rows = @db.execute(
+        "#{select} WHERE session_id = ? GROUP BY step_key ORDER BY first_id ASC",
+        [utf8(session_id)]
+      )
+      rows.map { |r| usage_row(r).merge(step_key: r["step_key"]) }
+    end
+
     def find_session(session_id)
       @db.get_first_row("SELECT * FROM riggs_sessions WHERE id = ?", [utf8(session_id)])
     end
@@ -214,6 +262,26 @@ module Riggs
       when Array then value.map { |v| deep_symbolize(v) }
       else value
       end
+    end
+
+    def usage_row(row)
+      return empty_usage_row if row.nil?
+
+      tokens = %i[input_tokens output_tokens cache_read_tokens cache_write_tokens]
+               .to_h { |k| [k, row[k.to_s]] }
+      total = tokens.values.compact
+      tokens.merge(
+        total_tokens: total.empty? ? nil : total.sum,
+        cost_usd: row["cost_usd"],
+        calls: row["calls"].to_i,
+        measured_calls: row["measured_calls"].to_i,
+        priced_calls: row["priced_calls"].to_i
+      )
+    end
+
+    def empty_usage_row
+      { input_tokens: nil, output_tokens: nil, cache_read_tokens: nil, cache_write_tokens: nil,
+        total_tokens: nil, cost_usd: nil, calls: 0, measured_calls: 0, priced_calls: 0 }
     end
 
     def schema_sql
@@ -267,6 +335,22 @@ module Riggs
             payload TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
           );
+          CREATE TABLE IF NOT EXISTS riggs_provider_calls (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id         TEXT NOT NULL REFERENCES riggs_sessions(id),
+            step_key           TEXT NOT NULL,
+            provider           TEXT NOT NULL,
+            model              TEXT,
+            relay_attempt      INTEGER NOT NULL DEFAULT 1,
+            measured           INTEGER NOT NULL DEFAULT 0,
+            input_tokens       INTEGER,
+            output_tokens      INTEGER,
+            cache_read_tokens  INTEGER,
+            cache_write_tokens INTEGER,
+            cost_usd           REAL,
+            created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE INDEX IF NOT EXISTS idx_riggs_provider_calls_session ON riggs_provider_calls(session_id, step_key);
           CREATE TABLE IF NOT EXISTS riggs_memories (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             namespace TEXT NOT NULL,
