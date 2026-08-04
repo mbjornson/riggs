@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#
+# Riggs commit-time quality gate: RuboCop, then the test suite.
+# Activate with:  git config core.hooksPath .githooks   (bin/setup does this)
+# Bypass with:    git commit --no-verify
+#
+# NOTE ON SCOPE: this checks the WORKING TREE, not the index. Stashing
+# unstaged changes to isolate what is staged would mean an interrupted or
+# crashed hook can strand a developer's uncommitted work in a stash. Losing
+# work is far worse than a gate that is slightly wider than the commit, so we
+# do not stash. If you are committing a subset of a dirty tree, the gate may
+# fail on changes you are not committing yet -- that is intentional.
+
+set -uo pipefail
+
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  printf 'pre-commit: not inside a git work tree\n' >&2
+  exit 1
+}
+cd "$repo_root" || exit 1
+
+if ! command -v bundle >/dev/null 2>&1; then
+  printf 'pre-commit: `bundle` is not on PATH. Run bin/setup, or bypass with `git commit --no-verify`.\n' >&2
+  exit 1
+fi
+
+fail() {
+  local gate=$1
+  local fix=$2
+  printf '\n' >&2
+  printf -- '---------------------------------------------------------------\n' >&2
+  printf 'COMMIT BLOCKED -- %s failed\n\n' "$gate" >&2
+  printf '  fix:    %s\n' "$fix" >&2
+  printf '  bypass: git commit --no-verify   (skips every commit-time gate)\n' >&2
+  printf -- '---------------------------------------------------------------\n' >&2
+  exit 1
+}
+
+printf 'pre-commit: rubocop\n'
+bundle exec rubocop || fail "RuboCop" "bundle exec rubocop -a  (then re-stage)"
+
+printf 'pre-commit: rake test\n'
+bundle exec rake test || fail "the test suite" "bundle exec rake test"
+
+printf 'pre-commit: all gates passed\n'

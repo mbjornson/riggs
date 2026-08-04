@@ -6,6 +6,17 @@ on:
       - main
   pull_request:
 
+# Pull requests group by head branch, so pushing again to a PR cancels the run
+# it superseded. Pushes to main have no head_ref, so they fall back to the
+# unique run_id: every main run gets its own group and can never be cancelled
+# by a later merge landing mid-flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -28,3 +39,27 @@ jobs:
         run: bundle exec rake test
       - name: Run RuboCop
         run: bundle exec rubocop
+
+      - name: Build gem
+        run: gem build riggs.gemspec
+
+      # riggs.gemspec derives spec.files from `git ls-files`, so a source file
+      # that was never `git add`ed disappears from the package while every test
+      # still passes locally. Compare the packaged payload against what is
+      # actually on disk under lib/ and exe/ (minus gitignored paths) instead of
+      # maintaining a hardcoded manifest.
+      - name: Verify packaged gem contents
+        run: |
+          ruby -rrubygems/package -e '
+            gem_file = Dir["riggs-*.gem"].max_by { |f| File.mtime(f) } or abort("no riggs-*.gem was built")
+            packaged = Gem::Package.new(gem_file).contents
+            on_disk = Dir.glob("{lib,exe}/**/*").select { |f| File.file?(f) }
+            ignored = IO.popen(["git", "check-ignore", "--stdin"], "r+") { |io| io.puts(on_disk); io.close_write; io.read }.split("\n")
+            expected = on_disk - ignored
+            missing = expected - packaged
+            abort("#{gem_file} is missing #{missing.size} source file(s) -- git add them:\n  " + missing.join("\n  ")) unless missing.empty?
+            %w[lib/riggs.rb lib/riggs/events.rb lib/riggs/web/app.rb db/init_riggs_schema.sql].each do |f|
+              abort("#{gem_file} does not contain #{f}") unless packaged.include?(f)
+            end
+            puts "#{gem_file}: #{packaged.size} files packaged, all #{expected.size} lib/exe sources present"
+          '
