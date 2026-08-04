@@ -347,4 +347,68 @@ class TestProviders < Minitest::Test
 
     assert_equal "claude-configured", parsed[:model]
   end
+
+  def test_router_normalizes_usage_on_the_result
+    router = Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } })
+
+    result = router.call(chain: ["mock"], messages: [{ role: "user", content: "hello" }])
+
+    assert result[:usage][:measured]
+    assert_kind_of Integer, result[:usage][:total_tokens]
+  end
+
+  def test_router_prices_a_call_using_hubrc_overrides
+    router = Riggs::Providers::Router.new(
+      hub_providers: {
+        mock: { type: "mock", model: "priced-model",
+                pricing: { "priced-model" => { input: 1000.0, output: 1000.0 } } }
+      }
+    )
+
+    result = router.call(chain: ["mock"], messages: [{ role: "user", content: "hello" }])
+
+    refute_nil result[:cost_usd]
+    assert result[:cost_usd].positive?
+  end
+
+  def test_router_cost_is_nil_for_an_unpriced_model
+    router = Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock", model: "unpriced-xyz" } })
+
+    result = router.call(chain: ["mock"], messages: [{ role: "user", content: "hello" }])
+
+    assert result[:usage][:measured], "tokens still record even when the model has no price"
+    assert_nil result[:cost_usd]
+  end
+
+  def test_router_replaces_vendor_usage_but_preserves_it_under_raw
+    router = Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } })
+
+    result = router.call(chain: ["mock"], messages: [{ role: "user", content: "hello" }])
+
+    # The normalized shape uses canonical names...
+    assert_includes result[:usage].keys, :input_tokens
+    refute_includes result[:usage].keys, :prompt_tokens
+    # ...while raw keeps the vendor's own.
+    assert_includes result[:raw][:usage].keys, :prompt_tokens
+    assert_equal 5, result[:raw][:usage][:prompt_tokens], "mock counts the user text length"
+  end
+
+  # R2.7: usage belongs to the provider that answered, not the first one tried.
+  def test_router_attributes_usage_to_the_provider_that_answered
+    failing = Class.new(Riggs::Providers::Base) do
+      def complete(**)
+        raise Riggs::Providers::RateLimitError, "429"
+      end
+    end
+    router = Riggs::Providers::Router.new(
+      hub_providers: { flaky: { type: "flaky" }, mock: { type: "mock" } },
+      registry: { "flaky" => failing, "mock" => Riggs::Providers::Mock }
+    )
+
+    result = router.call(chain: %w[flaky mock], messages: [{ role: "user", content: "hello" }])
+
+    assert_equal "mock", result[:provider]
+    assert_equal 2, result[:relay_attempt]
+    assert result[:usage][:measured], "the answering provider's usage is what gets recorded"
+  end
 end

@@ -8,6 +8,8 @@ require_relative "cursor_cli"
 require_relative "claude_cli"
 require_relative "codex_cli"
 require_relative "cursor_cloud"
+require_relative "../usage"
+require_relative "../model_info"
 
 module Riggs
   module Providers
@@ -44,12 +46,14 @@ module Riggs
           provider = build(name)
           result = provider.complete(messages: messages, system: system, timeout: timeout, tools: tools)
           result[:tool_calls] ||= []
+          metered = meter(result, name)
           @audit&.call(
             session_id: session_id,
             event_type: "provider_success",
-            payload: { provider: name, attempt: idx + 1 }
+            payload: { provider: name, attempt: idx + 1,
+                       tokens: metered[:usage][:total_tokens], cost_usd: metered[:cost_usd] }
           )
-          return result.merge(relay_attempt: idx + 1)
+          return metered.merge(relay_attempt: idx + 1)
         rescue RateLimitError, TimeoutError, Error => e
           last_error = e
           @audit&.call(
@@ -109,6 +113,18 @@ module Riggs
         hub = {} unless hub.is_a?(Hash)
         wf = {} unless wf.is_a?(Hash)
         Identity.deep_symbolize(hub).merge(Identity.deep_symbolize(wf))
+      end
+
+      # Normalizes vendor usage and prices it. Only Router resolves provider
+      # config, so the per-model pricing override is only reachable here.
+      def meter(result, name)
+        opts = provider_config(name)
+        usage = Usage.normalize(result[:usage])
+        overrides = opts[:pricing] || {}
+        result.merge(
+          usage: usage,
+          cost_usd: ModelInfo.cost(model: result[:model], usage: usage, overrides: overrides)
+        )
       end
     end
   end

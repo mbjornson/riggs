@@ -66,12 +66,14 @@ module Riggs
                end
 
         tool_calls = parse_tool_line(body)
+        usage = { prompt_tokens: user_text.length, completion_tokens: body.length }
         {
           provider: name,
           model: options[:model],
           content: tool_calls.empty? ? body : "",
           tool_calls: tool_calls,
-          usage: { prompt_tokens: user_text.length, completion_tokens: body.length }
+          usage: usage,
+          raw: { usage: usage }
         }
       end
     end
