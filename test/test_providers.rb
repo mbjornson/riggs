@@ -322,7 +322,10 @@ class TestProviders < Minitest::Test
   def test_mock_provider_model_is_nil_when_unconfigured
     provider = Riggs::Providers::Mock.new(name: "mock", options: {})
 
-    assert_nil provider.complete(messages: [{ role: "user", content: "hi" }])[:model]
+    result = provider.complete(messages: [{ role: "user", content: "hi" }])
+
+    assert result.key?(:model), "the result must carry a :model key even when unconfigured"
+    assert_nil result[:model]
   end
 
   def test_anthropic_prefers_the_model_echoed_by_the_response
