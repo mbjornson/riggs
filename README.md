@@ -211,10 +211,27 @@ bundle exec rubocop
 
 Default CI is Rails-free (Ruby 4.0 + Rack::Test). sqlite-memory extensions are optional locally via `RIGGS_VECTOR_EXT` / `RIGGS_MEMORY_EXT` / `RIGGS_EMBED_MODEL` — CI uses the FTS fallback.
 
+### Commit-time gate
+
+`bin/setup` points git at the tracked hooks directory. On a fresh clone, run it (or the one-liner) once:
+
+```bash
+bin/setup                              # bundle install + hook wiring
+git config core.hooksPath .githooks    # equivalent, if you only want the hook
+```
+
+[`.githooks/pre-commit`](.githooks/pre-commit) then runs `bundle exec rubocop` followed by `bundle exec rake test` (~3s total) and blocks the commit on the first failure, naming the gate that failed.
+
+```bash
+git commit --no-verify   # skip every commit-time gate for one commit
+```
+
+It checks the **working tree, not the index**, and deliberately does not stash: an interrupted hook must never be able to strand uncommitted work in a stash. If you are committing part of a dirty tree, the gate can fail on changes you have not staged yet.
+
 ### Cutting a release
 
 1. Bump [`lib/riggs/version.rb`](lib/riggs/version.rb) and update [`CHANGELOG.md`](CHANGELOG.md).
-2. Ensure Phase 4+ sources are tracked (`lib/riggs/web/**`, `config_store.rb`) so `gem build` includes them (`git ls-files` drives the gemspec).
+2. Ensure Phase 4+ sources are tracked (`lib/riggs/web/**`, `config_store.rb`) so `gem build` includes them (`git ls-files` drives the gemspec). CI enforces this: it builds the gem and fails if any file on disk under `lib/` or `exe/` is absent from the package.
 3. `bundle exec rake test && bundle exec rubocop`
 4. `gem build riggs.gemspec` then publish when ready (`gem push` — not automated here).
 
