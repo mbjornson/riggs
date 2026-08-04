@@ -1,6 +1,7 @@
 # test/test_model_info.rb
 # frozen_string_literal: true
 
+require "date"
 require_relative "test_helper"
 
 class TestModelInfo < Minitest::Test
@@ -8,6 +9,18 @@ class TestModelInfo < Minitest::Test
     "test-model" => { input: 10.0, output: 30.0, cache_read: 1.0, cache_write: 12.0,
                       context_window: 200_000 }
   }.freeze
+
+  # Promotional-overlay tests exercise the real TABLE rather than a fixture, because
+  # `promotional:` blocks are (by design) a property of shipped entries. To avoid
+  # asserting shipped price values, every value used below is read back out of the
+  # table itself rather than hardcoded, and dates are derived from the promo's own
+  # `until` rather than from Date.today.
+  def promotional_model_and_entry
+    model, entry = Riggs::ModelInfo::TABLE.find { |_, info| info[:promotional] }
+    raise "No shipped TABLE entry has a promotional: block to test against" if model.nil?
+
+    [model, entry]
+  end
 
   def test_as_of_is_an_iso_date
     assert_match(/\A\d{4}-\d{2}-\d{2}\z/, Riggs::ModelInfo::AS_OF)
@@ -96,5 +109,94 @@ class TestModelInfo < Minitest::Test
   def test_context_window_reads_through_overrides
     assert_equal 200_000, Riggs::ModelInfo.context_window("test-model", overrides: FIXTURE)
     assert_nil Riggs::ModelInfo.context_window("unknown")
+  end
+
+  def test_promo_applies_before_its_until_date
+    model, entry = promotional_model_and_entry
+    until_date = Date.parse(entry[:promotional][:until])
+
+    resolved = Riggs::ModelInfo.lookup(model, at: until_date - 1)
+
+    assert_equal entry[:promotional][:input], resolved[:input]
+  end
+
+  def test_promo_applies_on_its_until_date_inclusive
+    model, entry = promotional_model_and_entry
+    until_date = Date.parse(entry[:promotional][:until])
+
+    resolved = Riggs::ModelInfo.lookup(model, at: until_date)
+
+    assert_equal entry[:promotional][:input], resolved[:input]
+  end
+
+  def test_promo_does_not_apply_after_its_until_date
+    model, entry = promotional_model_and_entry
+    until_date = Date.parse(entry[:promotional][:until])
+
+    resolved = Riggs::ModelInfo.lookup(model, at: until_date + 1)
+
+    assert_equal entry[:input], resolved[:input]
+  end
+
+  def test_entry_without_promotional_block_resolves_to_base_rates_at_any_date
+    resolved = Riggs::ModelInfo.lookup("test-model", overrides: FIXTURE, at: Date.new(2099, 1, 1))
+
+    assert_equal 10.0, resolved[:input]
+  end
+
+  def test_resolved_hash_never_contains_a_until_key
+    model, entry = promotional_model_and_entry
+    until_date = Date.parse(entry[:promotional][:until])
+
+    during_promo = Riggs::ModelInfo.lookup(model, at: until_date)
+    after_promo = Riggs::ModelInfo.lookup(model, at: until_date + 1)
+
+    refute during_promo.key?(:until)
+    refute after_promo.key?(:until)
+  end
+
+  def test_override_beats_a_live_promo
+    model, entry = promotional_model_and_entry
+    until_date = Date.parse(entry[:promotional][:until])
+    overrides = { model => { input: 12_345.0 } }
+
+    resolved = Riggs::ModelInfo.lookup(model, overrides: overrides, at: until_date)
+
+    assert_equal 12_345.0, resolved[:input]
+  end
+
+  def test_cost_uses_promotional_rate_during_promo_and_standard_rate_after
+    model, entry = promotional_model_and_entry
+    until_date = Date.parse(entry[:promotional][:until])
+    usage = { input_tokens: 1_000_000, output_tokens: 1_000_000, cache_read_tokens: 1_000_000,
+              cache_write_tokens: 1_000_000, measured: true }
+
+    promo_cost = Riggs::ModelInfo.cost(model: model, usage: usage, at: until_date)
+    standard_cost = Riggs::ModelInfo.cost(model: model, usage: usage, at: until_date + 1)
+
+    refute_equal promo_cost, standard_cost
+    assert_operator standard_cost, :>, promo_cost
+  end
+
+  def test_at_accepts_an_iso_date_string
+    model, entry = promotional_model_and_entry
+    until_str = entry[:promotional][:until]
+
+    by_string = Riggs::ModelInfo.lookup(model, at: until_str)
+    by_date = Riggs::ModelInfo.lookup(model, at: Date.parse(until_str))
+
+    assert_equal by_date, by_string
+  end
+
+  def test_at_defaults_to_today_when_omitted
+    resolved = Riggs::ModelInfo.lookup("test-model", overrides: FIXTURE)
+
+    assert_kind_of Hash, resolved
+  end
+
+  def test_shipped_promotional_entries_have_base_input_greater_than_promotional_input
+    _, entry = promotional_model_and_entry
+
+    assert_operator entry[:input], :>, entry[:promotional][:input]
   end
 end

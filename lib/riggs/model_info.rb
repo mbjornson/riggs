@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "date"
+
 module Riggs
   # Per-model prices and context windows.
   #
@@ -17,6 +19,16 @@ module Riggs
   # concept of a cache write charge (OpenAI's caching is automatic and free
   # to write), cache_write is nil rather than 0 — 0 would claim a price that
   # was actually observed and confirmed free.
+  #
+  # An entry may carry a `promotional:` block — a time-boxed overlay of the
+  # form `{ input:, output:, cache_read:, cache_write:, until: "YYYY-MM-DD" }`
+  # (see task-2b-report.md for provenance). `until` is inclusive. `lookup`
+  # resolves it against `at:` (a Date, an ISO date String, or nil for
+  # Date.today) in this order: shipped base, then the promotional rates if
+  # still live at `at`, then caller `overrides` last — overrides always win,
+  # so a negotiated rate is never silently clobbered by a vendor promo. This
+  # shape self-heals: once `at` passes `until`, the base rate takes over with
+  # no table edit required.
   module ModelInfo
     AS_OF = "2026-08-04"
 
@@ -41,9 +53,12 @@ module Riggs
                                       context_window: 200_000 },
       "claude-opus-4-20250514" => { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75,
                                     context_window: 200_000 },
-      # Introductory pricing, active through 2026-08-31; standard $3/$15 begins 2026-09-01.
-      "claude-sonnet-5" => { input: 2.0, output: 10.0, cache_read: 0.2, cache_write: 2.5,
-                             context_window: 1_000_000 },
+      # Standard pricing. Introductory pricing ($2/$10) is active through 2026-08-31
+      # via the `promotional:` overlay below; standard $3/$15 begins 2026-09-01.
+      "claude-sonnet-5" => { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75,
+                             context_window: 1_000_000,
+                             promotional: { input: 2.0, output: 10.0, cache_read: 0.2,
+                                            cache_write: 2.5, until: "2026-08-31" } },
       "claude-sonnet-4-6" => { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75,
                                context_window: 1_000_000 },
       "claude-sonnet-4-5-20250929" => { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75,
@@ -70,27 +85,27 @@ module Riggs
       cache_write_tokens: :cache_write
     }.freeze
 
-    def self.lookup(model, overrides: {})
+    def self.lookup(model, overrides: {}, at: nil)
       return nil if model.nil? || model.to_s.empty?
 
       key = model.to_s
-      shipped = TABLE[key]
+      shipped = resolve_promotional(TABLE[key], at)
       override = normalize_overrides(overrides)[key]
       return nil if shipped.nil? && override.nil?
 
       (shipped || {}).merge(override || {})
     end
 
-    def self.context_window(model, overrides: {})
-      lookup(model, overrides: overrides)&.fetch(:context_window, nil)
+    def self.context_window(model, overrides: {}, at: nil)
+      lookup(model, overrides: overrides, at: at)&.fetch(:context_window, nil)
     end
 
     # Returns nil — never 0 — when the call was unmeasured or the model has no
     # price entry. A zero would be indistinguishable from a genuinely free call.
-    def self.cost(model:, usage:, overrides: {})
+    def self.cost(model:, usage:, overrides: {}, at: nil)
       return nil unless usage.is_a?(Hash) && usage[:measured]
 
-      rates = lookup(model, overrides: overrides)
+      rates = lookup(model, overrides: overrides, at: at)
       return nil if rates.nil?
       return nil if RATE_FIELDS.values.all? { |k| rates[k].nil? }
 
@@ -100,6 +115,27 @@ module Riggs
         tokens.nil? || rate.nil? ? 0.0 : (tokens / PER_MILLION) * rate
       end
       total.to_f
+    end
+
+    # Resolves a shipped TABLE entry's `promotional:` overlay against `at`, and
+    # always strips the `promotional:` key from the result — the returned hash
+    # is a flat rate hash, never a nested one. Entries without a `promotional:`
+    # block, and nil entries (unknown model), pass through unchanged.
+    def self.resolve_promotional(entry, at)
+      return nil if entry.nil?
+
+      promo = entry[:promotional]
+      base = entry.except(:promotional)
+      return base if promo.nil?
+
+      resolve_at(at) <= Date.parse(promo[:until].to_s) ? base.merge(promo.except(:until)) : base
+    end
+
+    def self.resolve_at(at)
+      return Date.today if at.nil?
+      return at if at.is_a?(Date)
+
+      Date.parse(at.to_s)
     end
 
     def self.normalize_overrides(overrides)
@@ -112,6 +148,6 @@ module Riggs
       end
     end
 
-    private_class_method :normalize_overrides
+    private_class_method :resolve_promotional, :resolve_at, :normalize_overrides
   end
 end
