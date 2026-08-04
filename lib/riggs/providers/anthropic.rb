@@ -116,6 +116,7 @@ module Riggs
         end
         {
           provider: name,
+          model: data["model"] || options[:model],
           content: text,
           tool_calls: tool_calls,
           usage: data["usage"] || {},

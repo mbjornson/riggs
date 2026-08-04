@@ -310,4 +310,38 @@ class TestProviders < Minitest::Test
     assert captured[:tools]
     assert_equal "lookup_runbook", captured[:tools].first[:name]
   end
+
+  def test_mock_provider_reports_its_model
+    provider = Riggs::Providers::Mock.new(name: "mock", options: { model: "mock-1" })
+
+    result = provider.complete(messages: [{ role: "user", content: "hi" }])
+
+    assert_equal "mock-1", result[:model]
+  end
+
+  def test_mock_provider_model_is_nil_when_unconfigured
+    provider = Riggs::Providers::Mock.new(name: "mock", options: {})
+
+    assert_nil provider.complete(messages: [{ role: "user", content: "hi" }])[:model]
+  end
+
+  def test_anthropic_prefers_the_model_echoed_by_the_response
+    parsed = Riggs::Providers::Anthropic
+             .new(name: "anthropic", options: { model: "claude-alias-latest" })
+             .send(:parse_anthropic_content,
+                   { "content" => [{ "type" => "text", "text" => "ok" }],
+                     "model" => "claude-resolved-20260101", "usage" => {} })
+
+    assert_equal "claude-resolved-20260101", parsed[:model],
+                 "the echoed model resolves aliases and must win over the configured value"
+  end
+
+  def test_anthropic_falls_back_to_the_configured_model
+    parsed = Riggs::Providers::Anthropic
+             .new(name: "anthropic", options: { model: "claude-configured" })
+             .send(:parse_anthropic_content,
+                   { "content" => [{ "type" => "text", "text" => "ok" }], "usage" => {} })
+
+    assert_equal "claude-configured", parsed[:model]
+  end
 end

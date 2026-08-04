@@ -24,6 +24,7 @@ module Riggs
         tool_calls = parse_tool_line(content)
         {
           provider: name,
+          model: options[:model],
           content: content,
           tool_calls: tool_calls,
           usage: {},

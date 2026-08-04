@@ -17,7 +17,7 @@ module Riggs
         @options = options || {}
       end
 
-      # Returns { provider:, content:, tool_calls: [], usage:, raw: }
+      # Returns { provider:, model:, content:, tool_calls: [], usage:, raw: }
       def complete(messages:, system: nil, timeout: 60, tools: nil)
         raise NotImplementedError, "#{self.class}#complete must be implemented"
       end
