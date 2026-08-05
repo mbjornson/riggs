@@ -199,4 +199,17 @@ class TestModelInfo < Minitest::Test
 
     assert_operator entry[:input], :>, entry[:promotional][:input]
   end
+
+  # A provider default the table does not know reports no cost and no context
+  # window on every call that does not override the model -- which is the
+  # majority of calls. This cannot catch a model the VENDOR has retired (the
+  # table has no retirement dates and the test makes no network call); it
+  # catches a default drifting away from the priced set.
+  def test_every_provider_default_model_is_priced_by_the_table
+    [Riggs::Providers::Anthropic::DEFAULT_MODEL,
+     Riggs::Providers::OpenAICompatible::DEFAULT_MODEL].each do |model|
+      assert_includes Riggs::ModelInfo::TABLE.keys, model,
+                      "#{model} is a shipped provider default and must carry a price and context window"
+    end
+  end
 end

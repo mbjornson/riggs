@@ -8,7 +8,11 @@ require_relative "base"
 module Riggs
   module Providers
     class Anthropic < Base
-      DEFAULT_MODEL = "claude-sonnet-4-20250514"
+      # Must stay a model Anthropic still serves AND one ModelInfo::TABLE
+      # prices -- see test_every_provider_default_model_is_priced_by_the_table.
+      # claude-sonnet-4-20250514 was the default until it was retired on
+      # 2026-06-15, at which point every un-overridden call started failing.
+      DEFAULT_MODEL = "claude-sonnet-5"
       API_URL = "https://api.anthropic.com/v1/messages"
 
       def complete(messages:, system: nil, timeout: 60, tools: nil)
