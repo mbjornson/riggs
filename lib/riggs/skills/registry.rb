@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "psych"
+require_relative "frontmatter"
 
 module Riggs
   class SkillRegistry
