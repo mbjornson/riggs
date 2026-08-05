@@ -157,6 +157,29 @@ class TestToolLoop < Minitest::Test
     assert_operator compaction[:payload][:after], :<, compaction[:payload][:before]
   end
 
+  # Riggs::Usage normalizes input_tokens to UNCACHED input -- correct for
+  # pricing, wrong for sizing. OpenAI caches any prompt over 1024 tokens
+  # automatically, so on a long transcript the vendor reports a small
+  # input_tokens for a huge prompt. Anchoring on that number sizes the request
+  # at a fraction of what was really sent and over_budget? never fires, which
+  # is precisely the runaway growth compaction exists to prevent.
+  def test_anchors_on_the_whole_prompt_when_the_vendor_served_it_from_cache
+    events = []
+    compactor = Riggs::Workflow::Compactor.new(
+      router: Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
+      chain: ["mock"], budget: 100_000, reserve: 10_000, keep_recent: 1
+    )
+    loop_runner = build_loop(compactor: compactor, audit: ->(**kw) { events << kw },
+                             router: cached_prompt_router)
+
+    loop_runner.run(step: build_step, chain: ["mock"], messages: [{ role: "user", content: "hi" }],
+                    system_prompt: "sys", io: StringIO.new)
+
+    assert(events.any? { |e| e[:event_type] == "context_compacted" },
+           "a 100k prompt reported as 5k uncached + 95k cached is over a 90k ceiling; " \
+           "anchoring on input_tokens alone hides that entirely")
+  end
+
   def test_no_compaction_without_a_compactor
     loop_runner = build_loop(compactor: nil)
 
@@ -230,13 +253,35 @@ class TestToolLoop < Minitest::Test
     )
   end
 
-  def build_loop(compactor: nil, audit: ->(**) {})
+  def build_loop(compactor: nil, audit: ->(**) {}, router: nil)
     Riggs::Workflow::ToolLoop.new(
-      router: Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
+      router: router || Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
       mcp_manager: nil, skill_registry: nil, audit: audit, compactor: compactor,
       llm_calls: 0, max_llm_calls: 5, timeout_seconds: 60,
       started_at: Time.now, session_id: "sess-1"
     )
+  end
+
+  # A router double reporting the OpenAI cached-prompt shape: a 100,000-token
+  # prompt of which 95,000 came from cache. Emits one tool call so the loop
+  # takes a second turn -- the anchor only exists from the second turn on.
+  def cached_prompt_router
+    Class.new do
+      def initialize
+        @calls = 0
+      end
+
+      def call(**)
+        @calls += 1
+        usage = Riggs::Usage.normalize("prompt_tokens" => 100_000, "completion_tokens" => 500,
+                                       "prompt_tokens_details" => { "cached_tokens" => 95_000 })
+        base = { provider: "fake", model: nil, usage: usage, cost_usd: nil }
+        return base.merge(content: "done") if @calls > 1
+
+        base.merge(content: "",
+                   tool_calls: [{ id: "t1", name: "lookup_runbook", arguments: { topic: "auth" } }])
+      end
+    end.new
   end
 
   # A minimal MCP manager double whose only tool is the "lookup_runbook"

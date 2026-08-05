@@ -96,4 +96,38 @@ class TestUsage < Minitest::Test
     assert_operator Riggs::Usage.estimate([{ role: "user", content: "hi" }], anchor: 500, anchored_count: 5),
                     :>=, 0
   end
+
+  # input_tokens means UNCACHED input here, which is right for pricing and
+  # wrong for sizing: a 100k prompt served 95k from cache normalizes to
+  # input_tokens: 5_000. Anchoring on that sizes the request at a twentieth of
+  # what was actually sent.
+  def test_prompt_tokens_covers_the_whole_prompt_including_cache_reads
+    u = Riggs::Usage.normalize("prompt_tokens" => 100_000, "completion_tokens" => 500,
+                               "prompt_tokens_details" => { "cached_tokens" => 95_000 })
+
+    assert_equal 5_000, u[:input_tokens], "the pricing field stays uncached-only"
+    assert_equal 100_000, Riggs::Usage.prompt_tokens(u),
+                 "the sizing figure must cover every prompt-side token the vendor reported"
+  end
+
+  def test_prompt_tokens_sums_anthropics_additive_cache_fields
+    u = Riggs::Usage.normalize("input_tokens" => 100, "output_tokens" => 50,
+                               "cache_read_input_tokens" => 20, "cache_creation_input_tokens" => 10)
+
+    assert_equal 130, Riggs::Usage.prompt_tokens(u), "output tokens are not part of the prompt"
+  end
+
+  # nil means "no anchor, estimate the whole array". 0 would mean "the prompt
+  # was empty", which is a different and wrong claim.
+  def test_prompt_tokens_is_nil_when_no_prompt_field_was_reported
+    u = Riggs::Usage.normalize("output_tokens" => 7)
+
+    assert u[:measured]
+    assert_nil Riggs::Usage.prompt_tokens(u)
+  end
+
+  def test_prompt_tokens_of_an_unmeasured_usage_is_nil
+    assert_nil Riggs::Usage.prompt_tokens(Riggs::Usage.normalize(nil))
+    assert_nil Riggs::Usage.prompt_tokens(nil)
+  end
 end

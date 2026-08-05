@@ -24,9 +24,10 @@ module Riggs
         @timeout_seconds = timeout_seconds
         @started_at = started_at
         @session_id = session_id
-        # Anchor: input_tokens from the most recent measured response, paired
-        # with how many of the current messages it covered — lets Usage.estimate
-        # avoid re-heuristicating turns a real response already priced exactly.
+        # Anchor: the measured PROMPT size of the most recent response (uncached
+        # input plus cache reads plus cache writes — see Usage.prompt_tokens),
+        # paired with how many of the current messages it covered. Lets
+        # Usage.estimate avoid re-heuristicating turns a real response measured.
         @anchor_tokens = nil
         @anchored_count = 0
         @last_model = nil
@@ -61,8 +62,10 @@ module Riggs
             usage: result[:usage], cost_usd: result[:cost_usd]
           )
           if result[:usage] && result[:usage][:measured]
-            @anchor_tokens = result[:usage][:input_tokens]
-            @anchored_count = messages.length
+            # nil when the vendor reported no prompt-side field at all: that is
+            # "no anchor, estimate everything", not "the prompt was empty".
+            @anchor_tokens = Usage.prompt_tokens(result[:usage])
+            @anchored_count = @anchor_tokens ? messages.length : 0
           end
           @last_model = result[:model]
 

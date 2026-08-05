@@ -263,10 +263,19 @@ would make the resulting transcript impossible to reason about.
 
 `Riggs::Usage.estimate(messages)` returns an estimated token count.
 
-The anchor is `input_tokens` from the most recent measured response in the same
-step, which is an exact measurement of the prompt that produced it. Turns
-appended since that response are estimated at 4 characters per token, and the
-sum is the estimate. With no anchor available — first call of a step, or an
+The anchor is the sum of the prompt-side token fields of the most recent
+measured response in the same step — `input_tokens + cache_read_tokens +
+cache_write_tokens` (`Riggs::Usage.prompt_tokens`). `input_tokens` alone is
+**not** the prompt: the canonical field means *uncached* input, which is the
+right basis for pricing and the wrong one for sizing. OpenAI reports a cached
+prefix as a subset of `prompt_tokens` that normalization subtracts out;
+Anthropic reports it pre-subtracted in a separate field. Either way, anchoring
+on `input_tokens` sizes a mostly-cached 100,000-token prompt at 5,000 tokens
+and compaction never fires. When no prompt-side field was reported at all the
+anchor is `nil` (no anchor), never `0` (an empty prompt).
+
+Turns appended since that response are estimated at 4 characters per token, and
+the sum is the estimate. With no anchor available — first call of a step, or an
 unmeasured provider — the whole array is estimated by the same heuristic.
 
 The heuristic is deliberately crude. The reserve absorbs its error, and R3.4

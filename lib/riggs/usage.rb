@@ -23,12 +23,29 @@ module Riggs
 
     CHARS_PER_TOKEN = 4
 
+    # Every prompt-side token the vendor reported, which is what a request is
+    # SIZED by -- as opposed to input_tokens, which is uncached input and is
+    # what a request is PRICED by. On a cached prompt the two differ by orders
+    # of magnitude, so sizing off input_tokens alone under-measures badly.
+    #
+    # Returns nil, never 0, when no prompt field was reported: nil means "no
+    # anchor, estimate the whole array", while 0 would claim the prompt was
+    # empty.
+    def self.prompt_tokens(usage)
+      return nil unless usage.is_a?(Hash)
+
+      parts = [usage[:input_tokens], usage[:cache_read_tokens], usage[:cache_write_tokens]]
+      return nil if parts.all?(&:nil?)
+
+      parts.compact.sum(&:to_i)
+    end
+
     # Estimates the token size of a message array that has not been sent yet.
     #
-    # `anchor` is input_tokens from the most recent measured response, an exact
-    # count of the prompt that produced it; `anchored_count` is how many of
-    # these messages that prompt contained. Messages beyond that are estimated.
-    # The reserve in the compaction ceiling absorbs the error.
+    # `anchor` is the measured prompt size of the most recent response (see
+    # .prompt_tokens); `anchored_count` is how many of these messages that
+    # prompt contained. Messages beyond that are estimated. The reserve in the
+    # compaction ceiling absorbs the error.
     def self.estimate(messages, anchor: nil, anchored_count: 0)
       list = Array(messages)
       return 0 if list.empty?
