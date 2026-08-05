@@ -106,6 +106,12 @@ module Riggs
         @outputs = state[:outputs].is_a?(Hash) ? state[:outputs] : {}
         @outputs[:input] ||= state[:input] || {}
         @llm_calls = state[:llm_calls].to_i
+        # A resumed run is a fresh GraphEngine instance with a fresh
+        # @compaction_announced ivar, but the event it guards must land at
+        # most once per SESSION, not once per instance -- derived from audit
+        # history rather than threaded through resume_state so it is correct
+        # even for a session paused before this guard existed.
+        @compaction_announced = already_announced_compaction_unavailable?
 
         # Atomic paused->running claim. The checks above give good error
         # messages, but only this decides who actually runs: a second resumer
@@ -387,6 +393,15 @@ module Riggs
 
         @compaction_announced = true
         log_event("compaction_unavailable", { chain: Array(chain).map(&:to_s) })
+      end
+
+      # Storage, not resume_state, is the source of truth for "has this
+      # session already announced" -- resume_state is only written at pause
+      # time (fine for the common case), but a plain audit-history check also
+      # covers a session paused before this guard shipped, and any future
+      # resume path that does not happen to round-trip through pause_run!.
+      def already_announced_compaction_unavailable?
+        @storage.list_audit(@session_id).any? { |row| row["event_type"] == "compaction_unavailable" }
       end
 
       def persist_memory(step, content)

@@ -253,6 +253,66 @@ class TestGraphEngine < Minitest::Test
     assert_equal 1, engine.audit_log.count { |e| e[:event_type] == "compaction_unavailable" }
   end
 
+  # A resumed run is a SECOND GraphEngine instance with its own fresh
+  # @compaction_announced ivar. Asserting against `engine.audit_log` (as the
+  # three tests above do) cannot catch a double-announce across resume,
+  # because the two instances have separate in-memory logs -- that
+  # separation is exactly what hid the bug. Assert against storage instead,
+  # which both instances share.
+  def test_compaction_unavailable_fires_once_across_pause_and_resume
+    dir = Dir.mktmpdir("riggs-graph-engine")
+    (@engine_with_dirs ||= []) << dir
+    storage = Riggs::Storage.new(db_path: File.join(dir, "db", "riggs.sqlite3"))
+    (@engine_with_storages ||= []) << storage
+
+    workflow = {
+      name: "resume_budget_test",
+      context_window: 32_000,
+      reserve_tokens: 16_384,
+      keep_recent_tokens: 20_000,
+      max_llm_calls: 20,
+      providers: { default: { relay_chain: ["claude_cli"] } },
+      steps: [
+        Riggs::Workflow::StepNode.from_hash(id: "first", output_var: "first", next: "second"),
+        Riggs::Workflow::StepNode.from_hash(id: "second", output_var: "second", gates: ["approval"])
+      ]
+    }
+
+    # "claude_cli" is on Providers::Router::UNMETERED by NAME -- that's what
+    # announce_compaction_availability! keys off, independent of which class
+    # actually answers the call. Mapping the name to Mock keeps this test
+    # hermetic (no real CLI binary or API key needed) while still exercising
+    # the real unmetered-chain classification.
+    router = Riggs::Providers::Router.new(
+      workflow_providers: workflow[:providers],
+      registry: Riggs::Providers::Router::BUILTINS.merge("claude_cli" => Riggs::Providers::Mock)
+    )
+    identity = { id: "test_user", memory_namespace: "test" }
+
+    paused = Riggs::Workflow::GraphEngine.new(
+      workflow: workflow, user_identity: identity, storage: storage,
+      db_path: File.join(dir, "db", "riggs.sqlite3"), provider_router: router,
+      gate_handler: ->(*) { :paused }
+    )
+    paused.execute(StringIO.new, input: {})
+    assert_equal :paused, paused.status, "step 'second's gate must pause the run before resume happens"
+
+    # A fresh instance, exactly as GraphEngine.resume constructs internally --
+    # built directly here (rather than via .resume) so a custom provider
+    # registry can be injected for the hermetic chain above.
+    resumer = Riggs::Workflow::GraphEngine.new(
+      workflow: workflow, user_identity: identity, storage: storage,
+      db_path: File.join(dir, "db", "riggs.sqlite3"), provider_router: router,
+      gate_handler: ->(*) { :approved }
+    )
+    resumer.resume_session(paused.session_id, io: StringIO.new)
+    assert_equal :completed, resumer.status
+
+    rows = storage.list_audit(paused.session_id).select { |r| r["event_type"] == "compaction_unavailable" }
+    assert_equal 1, rows.length,
+                 "compaction_unavailable must fire once per SESSION, not once per GraphEngine instance"
+  end
+
   private
 
   # Builds a minimal GraphEngine directly from a workflow hash rather than
