@@ -81,4 +81,45 @@ class TestLoader < Minitest::Test
     step = Riggs::Workflow::StepNode.from_hash(id: "g", next: "if gate.approved: deploy")
     assert_nil Riggs::Workflow::Loader.resolve_next(step, outputs: {}, gate_decision: :rejected)
   end
+
+  def test_context_window_words_resolve_to_token_budgets
+    assert_equal 8_000, load_workflow_with("context_window" => "short")[:context_window]
+    assert_equal 32_000, load_workflow_with("context_window" => "medium")[:context_window]
+    assert_equal 128_000, load_workflow_with("context_window" => "full")[:context_window]
+  end
+
+  def test_context_window_accepts_an_integer_verbatim
+    assert_equal 60_000, load_workflow_with("context_window" => 60_000)[:context_window]
+  end
+
+  def test_context_window_defaults_to_medium
+    assert_equal 32_000, load_workflow_with({})[:context_window]
+  end
+
+  def test_unknown_context_window_word_falls_back_to_medium
+    assert_equal 32_000, load_workflow_with("context_window" => "enormous")[:context_window]
+  end
+
+  def test_reserve_and_keep_recent_have_defaults
+    wf = load_workflow_with({})
+
+    assert_equal 16_384, wf[:reserve_tokens]
+    assert_equal 20_000, wf[:keep_recent_tokens]
+  end
+
+  def test_reserve_and_keep_recent_are_overridable
+    wf = load_workflow_with("reserve_tokens" => 4_000, "keep_recent_tokens" => 5_000)
+
+    assert_equal 4_000, wf[:reserve_tokens]
+    assert_equal 5_000, wf[:keep_recent_tokens]
+  end
+
+  def load_workflow_with(overrides)
+    with_tmp_project do
+      config = { "name" => "budget_test",
+                 "steps" => [{ "id" => "a", "input" => "x", "output_var" => "out" }] }.merge(overrides)
+      File.write("config/riggs/workflows/budget_test.yml", YAML.dump(config))
+      return Riggs::Workflow::Loader.load(path: "config/riggs/workflows/budget_test.yml")
+    end
+  end
 end
