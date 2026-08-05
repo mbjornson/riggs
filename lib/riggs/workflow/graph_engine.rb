@@ -9,6 +9,7 @@ require_relative "../memory/service"
 require_relative "../mcp/manager"
 require_relative "loader"
 require_relative "tool_loop"
+require_relative "compactor"
 
 module Riggs
   module Workflow
