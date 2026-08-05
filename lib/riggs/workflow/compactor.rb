@@ -81,13 +81,24 @@ module Riggs
 
       def summarize(older, step_key:)
         transcript = older.map { |m| "#{m[:role]}: #{m[:content]}" }.join("\n")
-        result = @router.call(
+        result = call_router(transcript)
+        return nil unless result
+
+        # Outside the rescue deliberately: record_call: is caller-supplied
+        # (Task 11/12 wiring), and a bug in it is not a summarization failure.
+        # The LLM call above already succeeded and spent real tokens, so a
+        # raise here must propagate rather than be reported as "truncated" --
+        # that would hide the tokens actually spent.
+        record(result, step_key)
+        result[:content].to_s
+      end
+
+      def call_router(transcript)
+        @router.call(
           chain: @chain,
           messages: [{ role: "user", content: "#{SUMMARY_PROMPT}\n\n#{transcript}" }],
           timeout: 60
         )
-        record(result, step_key)
-        result[:content].to_s
       rescue StandardError
         # Degrading beats failing: the caller drops the old turns instead.
         nil

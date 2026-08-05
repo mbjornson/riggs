@@ -146,4 +146,50 @@ class TestCompactor < Minitest::Test
     assert_equal "triage", recorded.first[:step_key],
                  "compaction cost is attributed to the step that triggered it"
   end
+
+  # summarize's rescue must cover only the router call. record_call: is
+  # caller-supplied (Task 11/12 wiring); a bug in it is not a summarization
+  # failure and must not be disguised as strategy: "truncated" -- the tokens
+  # were genuinely spent on a successful LLM call, and hiding that violates
+  # the "must not hide the tokens it spent" requirement.
+  def test_a_failing_record_call_is_not_disguised_as_a_summarization_failure
+    compactor = Riggs::Workflow::Compactor.new(
+      router: Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
+      chain: ["mock"], budget: 1_000, reserve: 100, keep_recent: 200,
+      record_call: ->(**) { raise "record_call bug" }
+    )
+    messages = 10.times.map { |i| { role: "user", content: "msg#{i} #{'x' * 400}" } }
+
+    error = assert_raises(RuntimeError) do
+      compactor.compact(messages: messages, step_key: "s", model: nil)
+    end
+    assert_equal "record_call bug", error.message
+  end
+
+  # An assistant turn commonly emits more than one tool_calls entry, each
+  # answered by its own tool turn -- so multiple CONSECUTIVE tool turns is
+  # the common real-world shape, not an edge case. safe_boundary must walk
+  # back past all of them, not just one, or the turn in the middle gets
+  # orphaned. keep_recent: 40 is sized (verified by hand-tracing
+  # Usage.heuristic) so the naive split lands index 3 -- squarely between
+  # the two tool turns -- before safe_boundary's correction.
+  def test_compact_never_orphans_tool_results_across_multiple_consecutive_tool_turns
+    messages = [
+      { role: "user", content: "x" * 2_000 },
+      { role: "assistant", content: "",
+        tool_calls: [{ id: "t1", name: "lookup", arguments: {} }, { id: "t2", name: "search", arguments: {} }] },
+      { role: "tool", tool_call_id: "t1", name: "lookup", content: "y" * 100 },
+      { role: "tool", tool_call_id: "t2", name: "search", content: "z" * 100 },
+      { role: "assistant", content: "done" }
+    ]
+
+    kept = build(keep_recent: 40).compact(messages: messages, step_key: "s", model: nil)[:messages]
+    tool_turns = kept.select { |m| m[:role] == "tool" }
+
+    assert_equal 2, tool_turns.length, "test setup should keep both tool turns in the recent set"
+    tool_turns.each do |t|
+      assert(kept.any? { |m| Array(m[:tool_calls]).any? { |tc| tc[:id] == t[:tool_call_id] } },
+             "tool result #{t[:tool_call_id]} was kept without its assistant turn")
+    end
+  end
 end
