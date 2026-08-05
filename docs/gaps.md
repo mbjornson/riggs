@@ -110,6 +110,45 @@ JSONL to stdout for scripting and CI.
 
 ---
 
+## Deferred from Phase 7
+
+Four items surfaced during the Phase 7 build and triaged as non-blocking at
+merge. Ordered by consequence.
+
+**Compaction's reported sizes are unanchored.** `Compactor#compact` computes
+`before`/`after` with `Usage.estimate` and no anchor, while `ToolLoop` decides
+*whether* to compact using the anchored measurement. On a run whose prompt is
+largely served from cache, the decision and the audit payload measure different
+things — a run can correctly judge itself over a 90,000-token ceiling and then
+emit `context_compacted {before: 12, after: 8}`. Only the report is affected;
+the trigger uses the anchored number. But it undercuts the point of making that
+event operator-legible. Thread the anchor into `compact`.
+
+**A clamped configuration is silent.** Phase 7 clamps `reserve_tokens` to
+`budget / 4` and `keep_recent_tokens` to `ceiling / 2`, so a workflow declaring
+`reserve_tokens: 64000` against `context_window: 128000` runs with 32,000 and
+nothing says so. `workflow[:reserve_tokens]` still carries the configured value.
+The clamp is documented in the README and the spec, but a `workflow:validate`
+warning would close the gap between what the file says and what the run does.
+
+**`.agent_hubrc`'s `context_windows:` override is inert.**
+`GraphEngine#compactor_for` never passes `model_overrides:` to `Compactor`, so
+`ModelInfo.context_window` always sees an empty hash. The sibling `pricing:`
+override *does* work, which makes the asymmetry a trap. The two resolve in
+different places: `pricing:` in `Router#meter`, which knows which provider
+answered, and the window in `Compactor#ceiling`, which does not. Returning the
+model's window from `Router` alongside `usage:` and `cost_usd:` would close it
+under the rule `pricing:` already follows, with no new precedence question about
+which provider in a chain wins.
+
+**`Compactor#call_router`'s rescue is still broad.** It now emits a
+`compaction_degraded` audit event carrying the exception class and message, so a
+swallowed failure is no longer invisible. It still catches `StandardError`
+wholesale, so a genuine bug and an expected provider outage remain the same
+event. Narrowing it to the provider error types would separate them.
+
+---
+
 ## Found separately — schema migration only covers one table
 
 Not from the Pi comparison. Surfaced while building the CI gates in PR #4.
