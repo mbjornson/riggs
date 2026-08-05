@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "json"
+
 module Riggs
   # Normalizes the assorted vendor `usage` payloads into one shape.
   #
@@ -18,6 +20,34 @@ module Riggs
       input_tokens: nil, output_tokens: nil, cache_read_tokens: nil,
       cache_write_tokens: nil, total_tokens: nil, measured: false
     }.freeze
+
+    CHARS_PER_TOKEN = 4
+
+    # Estimates the token size of a message array that has not been sent yet.
+    #
+    # `anchor` is input_tokens from the most recent measured response, an exact
+    # count of the prompt that produced it; `anchored_count` is how many of
+    # these messages that prompt contained. Messages beyond that are estimated.
+    # The reserve in the compaction ceiling absorbs the error.
+    def self.estimate(messages, anchor: nil, anchored_count: 0)
+      list = Array(messages)
+      return 0 if list.empty?
+
+      if anchor
+        tail = list.drop(anchored_count)
+        anchor.to_i + heuristic(tail)
+      else
+        heuristic(list)
+      end
+    end
+
+    def self.heuristic(messages)
+      chars = Array(messages).sum do |m|
+        m[:content].to_s.length +
+          (m[:tool_calls] ? JSON.generate(m[:tool_calls]).length : 0)
+      end
+      (chars / CHARS_PER_TOKEN.to_f).ceil
+    end
 
     def self.normalize(raw)
       return EMPTY.dup unless raw.is_a?(Hash) && !raw.empty?
@@ -67,6 +97,6 @@ module Riggs
       value
     end
 
-    private_class_method :anthropic?, :from_anthropic, :from_openai, :build
+    private_class_method :anthropic?, :from_anthropic, :from_openai, :build, :heuristic
   end
 end

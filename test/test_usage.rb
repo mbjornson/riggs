@@ -66,4 +66,34 @@ class TestUsage < Minitest::Test
     assert_nil u[:input_tokens]
     assert_equal 7, u[:total_tokens]
   end
+
+  def test_estimate_without_an_anchor_uses_the_character_heuristic
+    messages = [{ role: "user", content: "a" * 400 }]
+
+    assert_equal 100, Riggs::Usage.estimate(messages)
+  end
+
+  def test_estimate_with_an_anchor_only_estimates_the_delta
+    messages = [{ role: "user", content: "a" * 4_000 }, { role: "assistant", content: "b" * 400 }]
+
+    # The anchor says the first message really measured 50 tokens, not the 1000
+    # the heuristic would guess. Only the second message is estimated.
+    assert_equal 150, Riggs::Usage.estimate(messages, anchor: 50, anchored_count: 1)
+  end
+
+  def test_estimate_counts_tool_call_payloads
+    messages = [{ role: "assistant", content: "", tool_calls: [{ name: "x", arguments: { "k" => "v" * 100 } }] }]
+
+    assert_operator Riggs::Usage.estimate(messages), :>, 20,
+                    "serialized tool_calls consume context and must be counted"
+  end
+
+  def test_estimate_of_an_empty_array_is_zero
+    assert_equal 0, Riggs::Usage.estimate([])
+  end
+
+  def test_anchor_larger_than_the_message_list_does_not_go_negative
+    assert_operator Riggs::Usage.estimate([{ role: "user", content: "hi" }], anchor: 500, anchored_count: 5),
+                    :>=, 0
+  end
 end
