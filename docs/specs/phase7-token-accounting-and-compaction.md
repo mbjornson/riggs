@@ -332,7 +332,11 @@ Rules:
   `Riggs::Events`.
 - If summarization itself fails, the run drops the oldest turns without
   summarizing rather than aborting, and audits `context_compacted` with
-  `strategy: "truncated"`. Degrading beats failing.
+  `strategy: "truncated"`. Degrading beats failing. The rescued exception's
+  class and message are reported too — as a `compaction_degraded` audit event,
+  or on stderr when no `audit:` callable is wired — so an intentional degrade is
+  distinguishable from an unexpected failure. A blanket rescue here has already
+  hidden one real defect.
 - A pass that changes nothing — nothing old enough to collapse, or a single
   message too large to split — audits `strategy: "noop"` with `before == after`
   and `collapsed: 0`. The event is still emitted: an over-budget request that

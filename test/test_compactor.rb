@@ -54,6 +54,12 @@ class TestCompactor < Minitest::Test
                     "or the loop re-enters compaction on every turn and never recovers"
   end
 
+  def failing_router
+    failing = Object.new
+    def failing.call(**) = raise(Riggs::Providers::Error, "boom")
+    failing
+  end
+
   def test_ceiling_is_budget_minus_reserve_when_the_model_is_unknown
     assert_equal 900, build.ceiling(model: "unknown-model")
   end
@@ -175,11 +181,10 @@ class TestCompactor < Minitest::Test
   end
 
   def test_compact_truncates_when_summarization_fails
-    failing = Object.new
-    def failing.call(**) = raise(Riggs::Providers::Error, "boom")
-
+    events = []
     compactor = Riggs::Workflow::Compactor.new(
-      router: failing, chain: ["mock"], budget: 1_000, reserve: 100, keep_recent: 200
+      router: failing_router, chain: ["mock"], budget: 1_000, reserve: 100, keep_recent: 200,
+      audit: ->(**kw) { events << kw }
     )
     messages = 10.times.map { |i| { role: "user", content: "msg#{i} #{'x' * 400}" } }
 
@@ -187,6 +192,40 @@ class TestCompactor < Minitest::Test
 
     assert_equal "truncated", result[:strategy]
     assert_operator result[:messages].length, :<, messages.length
+  end
+
+  # This branch already shipped one bug of exactly this class: the omitted
+  # session_id below caused a foreign-key failure that the blanket rescue
+  # swallowed, degrading every real compaction to truncation with nothing in
+  # the stream to say so. An intentional degrade and an unexpected failure must
+  # not look identical.
+  def test_a_rescued_summarization_failure_names_the_exception
+    events = []
+    compactor = Riggs::Workflow::Compactor.new(
+      router: failing_router, chain: ["mock"], budget: 1_000, reserve: 100, keep_recent: 200,
+      audit: ->(**kw) { events << kw }, session_id: "sess-1"
+    )
+    messages = 10.times.map { |i| { role: "user", content: "msg#{i} #{'x' * 400}" } }
+
+    compactor.compact(messages: messages, step_key: "s", model: nil)
+    degraded = events.find { |e| e[:event_type] == "compaction_degraded" }
+
+    refute_nil degraded, "a swallowed summarization failure must be visible somewhere"
+    assert_equal "sess-1", degraded[:session_id]
+    assert_equal "Riggs::Providers::Error", degraded[:payload][:error]
+    assert_match(/boom/, degraded[:payload][:message])
+  end
+
+  def test_a_rescued_summarization_failure_warns_when_no_audit_is_wired
+    compactor = Riggs::Workflow::Compactor.new(
+      router: failing_router, chain: ["mock"], budget: 1_000, reserve: 100, keep_recent: 200
+    )
+    messages = 10.times.map { |i| { role: "user", content: "msg#{i} #{'x' * 400}" } }
+
+    _out, err = capture_io { compactor.compact(messages: messages, step_key: "s", model: nil) }
+
+    assert_match(/Riggs::Providers::Error/, err)
+    assert_match(/boom/, err)
   end
 
   def test_summarization_call_is_recorded

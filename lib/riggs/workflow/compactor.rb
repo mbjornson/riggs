@@ -22,6 +22,8 @@ module Riggs
         @keep_recent = keep_recent.to_i
         @model_overrides = model_overrides || {}
         @record_call = record_call
+        # Optional: reports a rescued summarization failure (see #report_degrade).
+        # Without it those land on stderr instead.
         @audit = audit
         # Threaded into the summarization call's own @router.call so a
         # real (storage-backed) Router audit callback can find the session
@@ -135,8 +137,27 @@ module Riggs
           timeout: 60,
           session_id: @session_id
         )
+      rescue StandardError => e
+        # Degrading beats failing: the caller drops the old turns instead. But
+        # a silent degrade is indistinguishable from an unexpected one, and
+        # this very rescue already hid a real bug once (the omitted session_id
+        # whose foreign-key failure degraded every real compaction to
+        # truncation, found only by instrumenting the rescue by hand). Always
+        # say why.
+        report_degrade(e)
+        nil
+      end
+
+      # Never raises: this runs inside the rescue that keeps compaction
+      # degrading rather than failing, so a broken audit: callable must not
+      # convert a degrade into a failed run.
+      def report_degrade(error)
+        payload = { error: error.class.name, message: error.message.to_s[0, 200] }
+        return @audit.call(session_id: @session_id, event_type: "compaction_degraded", payload: payload) if @audit
+
+        warn "riggs: compaction summarization failed, truncating instead " \
+             "(#{payload[:error]}: #{payload[:message]})"
       rescue StandardError
-        # Degrading beats failing: the caller drops the old turns instead.
         nil
       end
 

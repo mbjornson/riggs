@@ -380,6 +380,9 @@ module Riggs
           reserve: @workflow[:reserve_tokens],
           keep_recent: @workflow[:keep_recent_tokens],
           record_call: method(:record_provider_call),
+          # So a summarization failure the Compactor rescues lands in this
+          # run's event stream rather than only on stderr.
+          audit: method(:audit_bridge),
           session_id: @session_id
         )
       end
