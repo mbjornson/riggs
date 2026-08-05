@@ -413,9 +413,19 @@ class TestWebApp < Minitest::Test
       assert_equal 200, last_response.status
       body = JSON.parse(last_response.body)
 
-      assert_equal 2, body["session"]["calls"]
+      assert_equal 3, body["session"]["calls"]
       assert_equal 1, body["session"]["measured_calls"]
-      assert_equal 1, body["steps"].length
+      assert_equal 2, body["steps"].length
+
+      # cli_step's calls are all Usage::EMPTY, so the group's SUM(...) over an
+      # all-NULL column must resolve to nil — never 0 — while the call itself
+      # still counts. This is the one invariant the whole feature exists for:
+      # a step can be fully counted and fully unmeasured at the same time.
+      cli_step = body["steps"].find { |s| s["step_key"] == "cli_step" }
+      refute_nil cli_step, "expected a cli_step row"
+      assert_equal 1, cli_step["calls"]
+      assert_nil cli_step["total_tokens"]
+      assert_nil cli_step["cost_usd"]
     end
   end
 
@@ -426,6 +436,21 @@ class TestWebApp < Minitest::Test
       get "/api/sessions/#{session_id}/usage"
 
       assert_equal 200, last_response.status, "viewer holds inspect_run"
+    end
+  end
+
+  def test_session_page_renders_unmeasured_usage_without_zero
+    with_tmp_project do
+      session_id = create_session_with_usage
+      header "X-Riggs-User", "eng_bob"
+      get "/sessions/#{session_id}"
+
+      assert_equal 200, last_response.status, last_response.body
+      # cli_step has no measured calls at all, so its Tokens/Cost cells must
+      # read "unmeasured"/"unpriced" — a nil-to-0 regression would render a
+      # bare "0" here instead, silently claiming a fully-measured zero-token call.
+      assert_includes last_response.body, "<td>unmeasured</td>"
+      refute_includes last_response.body, "<td>0</td>"
     end
   end
 
@@ -440,6 +465,15 @@ class TestWebApp < Minitest::Test
     )
     storage.record_provider_call(
       session_id: id, step_key: "triage", provider: "claude_cli", model: nil, relay_attempt: 1,
+      usage: Riggs::Usage::EMPTY, cost_usd: nil
+    )
+    # A step whose calls are ALL unmeasured, on its own step_key, so the
+    # per-step aggregate genuinely resolves to nil rather than summing
+    # against a sibling measured call on the same step (the original fixture
+    # bug: both calls shared step_key "triage", so total_tokens always
+    # resolved to 15 and the nil path was never exercised).
+    storage.record_provider_call(
+      session_id: id, step_key: "cli_step", provider: "claude_cli", model: nil, relay_attempt: 1,
       usage: Riggs::Usage::EMPTY, cost_usd: nil
     )
     storage.close
