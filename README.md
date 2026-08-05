@@ -144,7 +144,7 @@ riggs providers:ping cursor
 
 Configure credentials via env or `.agent_hubrc` `providers:`.
 
-**Unmetered chains.** `cursor`, `cursor_cli`, `cursor_cloud`, `claude_cli`, `anthropic_cli`, `codex`, and `openai_cli` report no token usage — there is nothing in their response to measure. A relay chain built entirely from those providers can never compact (no measurement means no anchor to compact against); the run proceeds under the pre-Phase-7 behavior and logs one `compaction_unavailable` audit event per run rather than compacting silently or erroring.
+**Unmetered chains.** `cursor`, `cursor_cli`, `cursor_cloud`, `claude_cli`, `anthropic_cli`, `codex`, and `openai_cli` report no token usage — there is nothing in their response to measure. On a relay chain built entirely from those providers there is never an anchor, so every size Riggs computes on that run is a 4-characters-per-token estimate rather than a measurement. Compaction still runs on those estimates, at both the cross-step and tool-loop sites — a run that would otherwise blow its context degrades better by compacting than by growing unbounded — but `reserve_tokens` is absorbing a much larger error than on a metered chain. The run logs one `compaction_unanchored` audit event (`{chain: [...], basis: "character_estimate"}`) per session to say so.
 
 ### Pricing and context windows
 

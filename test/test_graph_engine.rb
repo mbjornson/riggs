@@ -242,29 +242,43 @@ class TestGraphEngine < Minitest::Test
            "not be discarded because the walk stopped early")
   end
 
-  def test_cli_only_chain_audits_compaction_unavailable
+  def test_cli_only_chain_audits_compaction_unanchored
     engine = engine_with(context_window: 32_000, chain: ["claude_cli"])
 
-    engine.send(:announce_compaction_availability!, ["claude_cli"])
+    engine.send(:announce_unanchored_compaction!, ["claude_cli"])
     events = engine.audit_log.map { |e| e[:event_type] }
 
-    assert_includes events, "compaction_unavailable"
+    assert_includes events, "compaction_unanchored"
+  end
+
+  # The event does not mean "compaction cannot run" -- it does run, on
+  # character estimates, because a CLI-only run that would otherwise blow its
+  # context degrades better by compacting than by growing unbounded. It means
+  # "the reserve is absorbing a much larger error than usual on this run".
+  def test_the_unanchored_announcement_names_the_estimation_basis
+    engine = engine_with(context_window: 32_000, chain: ["claude_cli"])
+
+    engine.send(:announce_unanchored_compaction!, ["claude_cli"])
+    event = engine.audit_log.find { |e| e[:event_type] == "compaction_unanchored" }
+
+    assert_equal "character_estimate", event[:payload][:basis]
+    assert_equal ["claude_cli"], event[:payload][:chain]
   end
 
   def test_measurable_chain_does_not_announce
     engine = engine_with(context_window: 32_000, chain: ["mock"])
 
-    engine.send(:announce_compaction_availability!, ["mock"])
+    engine.send(:announce_unanchored_compaction!, ["mock"])
 
-    refute_includes engine.audit_log.map { |e| e[:event_type] }, "compaction_unavailable"
+    refute_includes engine.audit_log.map { |e| e[:event_type] }, "compaction_unanchored"
   end
 
   def test_announcement_happens_only_once
     engine = engine_with(context_window: 32_000, chain: ["claude_cli"])
 
-    3.times { engine.send(:announce_compaction_availability!, ["claude_cli"]) }
+    3.times { engine.send(:announce_unanchored_compaction!, ["claude_cli"]) }
 
-    assert_equal 1, engine.audit_log.count { |e| e[:event_type] == "compaction_unavailable" }
+    assert_equal 1, engine.audit_log.count { |e| e[:event_type] == "compaction_unanchored" }
   end
 
   # A resumed run is a SECOND GraphEngine instance with its own fresh
@@ -273,7 +287,7 @@ class TestGraphEngine < Minitest::Test
   # because the two instances have separate in-memory logs -- that
   # separation is exactly what hid the bug. Assert against storage instead,
   # which both instances share.
-  def test_compaction_unavailable_fires_once_across_pause_and_resume
+  def test_compaction_unanchored_fires_once_across_pause_and_resume
     dir = Dir.mktmpdir("riggs-graph-engine")
     (@engine_with_dirs ||= []) << dir
     storage = Riggs::Storage.new(db_path: File.join(dir, "db", "riggs.sqlite3"))
@@ -293,7 +307,7 @@ class TestGraphEngine < Minitest::Test
     }
 
     # "claude_cli" is on Providers::Router::UNMETERED by NAME -- that's what
-    # announce_compaction_availability! keys off, independent of which class
+    # announce_unanchored_compaction! keys off, independent of which class
     # actually answers the call. Mapping the name to Mock keeps this test
     # hermetic (no real CLI binary or API key needed) while still exercising
     # the real unmetered-chain classification.
@@ -322,9 +336,9 @@ class TestGraphEngine < Minitest::Test
     resumer.resume_session(paused.session_id, io: StringIO.new)
     assert_equal :completed, resumer.status
 
-    rows = storage.list_audit(paused.session_id).select { |r| r["event_type"] == "compaction_unavailable" }
+    rows = storage.list_audit(paused.session_id).select { |r| r["event_type"] == "compaction_unanchored" }
     assert_equal 1, rows.length,
-                 "compaction_unavailable must fire once per SESSION, not once per GraphEngine instance"
+                 "compaction_unanchored must fire once per SESSION, not once per GraphEngine instance"
   end
 
   private

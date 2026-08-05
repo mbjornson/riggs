@@ -111,7 +111,7 @@ module Riggs
         # most once per SESSION, not once per instance -- derived from audit
         # history rather than threaded through resume_state so it is correct
         # even for a session paused before this guard existed.
-        @compaction_announced = already_announced_compaction_unavailable?
+        @compaction_announced = already_announced_unanchored_compaction?
 
         # Atomic paused->running claim. The checks above give good error
         # messages, but only this decides who actually runs: a second resumer
@@ -196,7 +196,7 @@ module Riggs
           system_prompt = build_system_prompt(current)
           messages = build_messages(resolved_input)
           chain = @router.chain_for(step: current, workflow: @workflow)
-          announce_compaction_availability!(chain)
+          announce_unanchored_compaction!(chain)
           persist_bridge(role: "user", content: resolved_input, step_key: current.id)
 
           loop_runner = ToolLoop.new(
@@ -384,15 +384,19 @@ module Riggs
         )
       end
 
-      # No provider on this chain reports usage, so there is no anchor and
-      # compaction can never trigger. Announced once per run: silent
-      # non-compaction looks exactly like compaction that is working.
-      def announce_compaction_availability!(chain)
+      # No provider on this chain reports usage, so there is no anchor: every
+      # size on this run is a 4-characters-per-token estimate rather than a
+      # measurement. Compaction still runs -- a run that would otherwise blow
+      # its context degrades gracefully instead of erroring -- but the reserve
+      # is absorbing a much larger error than on a metered chain, which is
+      # worth one audit event per run.
+      def announce_unanchored_compaction!(chain)
         return if @compaction_announced
         return unless Providers::Router.unmetered_chain?(chain)
 
         @compaction_announced = true
-        log_event("compaction_unavailable", { chain: Array(chain).map(&:to_s) })
+        log_event("compaction_unanchored",
+                  { chain: Array(chain).map(&:to_s), basis: "character_estimate" })
       end
 
       # Storage, not resume_state, is the source of truth for "has this
@@ -400,8 +404,14 @@ module Riggs
       # time (fine for the common case), but a plain audit-history check also
       # covers a session paused before this guard shipped, and any future
       # resume path that does not happen to round-trip through pause_run!.
-      def already_announced_compaction_unavailable?
-        @storage.list_audit(@session_id).any? { |row| row["event_type"] == "compaction_unavailable" }
+      #
+      # This matches the CURRENT event name only. A session paused before the
+      # compaction_unavailable -> compaction_unanchored rename carries only the
+      # old row, so resuming it announces once more under the new name: one
+      # extra event on sessions that straddle the upgrade, which is preferable
+      # to carrying the retired vocabulary forward in the matcher forever.
+      def already_announced_unanchored_compaction?
+        @storage.list_audit(@session_id).any? { |row| row["event_type"] == "compaction_unanchored" }
       end
 
       def persist_memory(step, content)

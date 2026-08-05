@@ -42,13 +42,15 @@ and per-session counts as the prerequisite for #3 — is unaffected.
 
 ## Stated limitations (design consequences, not defects)
 
-1. **CLI-only chains can never compact.** `claude_cli`, `codex`, `cursor_cli`,
-   and `cursor_cloud` report no token usage, so there is no anchor measurement.
-   Runs on those chains keep today's behavior. This must be surfaced, not
-   silently degraded — see R3.5.
-2. **Pre-flight sizes are estimates.** Only the anchor (`input_tokens` from the
-   previous response) is measured. Turns added since then are estimated. The
-   reserve exists to absorb that error.
+1. **CLI-only chains compact blind.** `claude_cli`, `codex`, `cursor_cli`, and
+   `cursor_cloud` report no token usage, so no anchor measurement is ever
+   available and every size on such a run is a character estimate. Compaction
+   still runs — an unmetered run that would otherwise blow its context degrades
+   gracefully rather than erroring — but the reserve is absorbing a much larger
+   error, and the run says so once. See R3.5.
+2. **Pre-flight sizes are estimates.** Only the anchor (the measured prompt size
+   of the previous response) is measured. Turns added since then are estimated.
+   The reserve exists to absorb that error.
 3. **Redefining `context_window` changes runtime behavior.** A workflow declaring
    `context_window: medium` gets a token budget after this lands rather than a
    6-step window. In most workflows this means *more* history is retained, not
@@ -341,12 +343,16 @@ Rules:
   `tool_calls` and its matching `tool` turns are collapsed together, never
   split, so the transcript stays structurally valid for the provider.
 
-### R3.5 Unmeasurable chains are surfaced, not silently skipped
+### R3.5 Unanchored chains are surfaced, not silently degraded
 
-On a chain where no provider reports usage, compaction cannot trigger. The run
-proceeds under today's behavior and emits a one-time
-`compaction_unavailable` audit event naming the chain. Silent non-compaction
-would be indistinguishable from compaction that is working.
+On a chain where no provider reports usage there is no anchor, so every size on
+the run is a 4-characters-per-token estimate rather than a measurement.
+Compaction still runs on those estimates — at both sites — because a run that
+would otherwise blow its context degrades better by compacting than by growing
+unbounded. What changes is the error the reserve has to absorb, so the run emits
+a one-time `compaction_unanchored` audit event naming the chain and the basis
+(`basis: "character_estimate"`). An operator reading the stream can then tell an
+estimate-driven compaction from a measured one.
 
 ### R3.6 Tests
 
@@ -365,7 +371,8 @@ would be indistinguishable from compaction that is working.
 - A failed summarization truncates and audits `strategy: "truncated"`.
 - An assistant turn bearing `tool_calls` is never separated from its `tool`
   results by compaction.
-- A CLI-only chain emits `compaction_unavailable` and completes unchanged.
+- A CLI-only chain emits `compaction_unanchored` naming the chain and the
+  estimation basis, once per session across pause/resume.
 
 ---
 
