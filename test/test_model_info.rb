@@ -240,9 +240,24 @@ class TestModelInfo < Minitest::Test
   end
 
   def test_an_unrelated_model_sharing_a_prefix_is_not_matched
-    # "gpt-4o-mini" must not answer for "gpt-4o-minimax" -- only a dated
-    # variant (base + "-" + suffix) counts, and this one is a different family.
+    # "gpt-4o-mini" must not answer for "gpt-4o-miniature" -- a different family
+    # that merely shares a prefix.
     assert_nil Riggs::ModelInfo.lookup("gpt-4o-miniature")
+  end
+
+  # Accepting base + "-" + ANYTHING was too loose: a differently-priced variant
+  # (`-realtime`, `-audio`, a vendor's next suffix convention) would silently
+  # price at the base model's rate. Only a dated build resolves; anything else
+  # is unpriced, which reports nil rather than a confident wrong number.
+  def test_a_non_dated_variant_does_not_borrow_the_base_price
+    assert_nil Riggs::ModelInfo.lookup("gpt-4o-mini-not-a-date")
+    assert_nil Riggs::ModelInfo.lookup("gpt-4o-mini-realtime")
+  end
+
+  def test_both_shipped_date_suffix_conventions_resolve
+    # OpenAI writes 2024-07-18; Anthropic writes 20250805.
+    refute_nil Riggs::ModelInfo.lookup("gpt-4o-mini-2024-07-18")
+    refute_nil Riggs::ModelInfo.lookup("claude-opus-4-6-20260301")
   end
 
   # The invariant is "unpriced is nil, never 0". A model priced for output but

@@ -117,6 +117,35 @@ class TestToolLoop < Minitest::Test
     end
   end
 
+  # Router only rescues its own error family, so an unexpected exception
+  # propagates without failing over -- correct, but the attempt was still
+  # dispatched and still spent. It has to be ledgered on the way out.
+  def test_an_unexpected_provider_exception_still_records_its_attempt
+    recorded = []
+    exploding = Class.new(Riggs::Providers::Base) do
+      def complete(**)
+        raise "kaboom"
+      end
+    end
+    router = Riggs::Providers::Router.new(
+      hub_providers: { boom: { type: "boom" } }, registry: { "boom" => exploding }
+    )
+    loop_runner = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: nil, skill_registry: nil,
+      audit: ->(**) {}, record_call: ->(**kw) { recorded << kw },
+      llm_calls: 0, max_llm_calls: 5, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+
+    assert_raises(RuntimeError) do
+      loop_runner.run(step: build_step, chain: ["boom"], messages: [{ role: "user", content: "hi" }],
+                      system_prompt: "sys", io: StringIO.new)
+    end
+
+    assert_equal 1, recorded.length, "an unexpected failure is still a dispatched call"
+    refute recorded.first[:usage][:measured]
+  end
+
   # A provider that accepted the request, billed for it, then timed out on the
   # read is spend. Metering only the successful attempt let session coverage
   # report "1 of 1 measured" over a denominator that had already dropped the

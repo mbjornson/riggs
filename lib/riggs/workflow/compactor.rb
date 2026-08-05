@@ -127,7 +127,7 @@ module Riggs
 
       def summarize(older, step_key:, timeout: nil)
         transcript = older.map { |m| "#{m[:role]}: #{m[:content]}" }.join("\n")
-        result = call_router(transcript, timeout)
+        result = call_router(transcript, timeout, step_key)
         return nil unless result
 
         # Outside the rescue deliberately: record_call: is caller-supplied
@@ -143,13 +143,16 @@ module Riggs
       # wall-clock and may have spent tokens on a provider that billed before
       # failing. The caller charges this against max_llm_calls, which is the
       # run's only hard stop on runaway spend.
-      def call_router(transcript, timeout = nil)
+      def call_router(transcript, timeout = nil, step_key = nil)
         @llm_calls = @llm_calls.to_i + 1
         @router.call(
           chain: @chain,
           messages: [{ role: "user", content: "#{SUMMARY_PROMPT}\n\n#{transcript}" }],
           timeout: timeout || DEFAULT_SUMMARY_TIMEOUT,
-          session_id: @session_id
+          session_id: @session_id,
+          # A summarization runs through a relay chain like any other call, so
+          # its failed attempts are spend too and belong in the ledger.
+          on_failed_attempt: ->(provider:, attempt:, **) { record_failed(provider, attempt, step_key) }
         )
       rescue StandardError => e
         # Degrading beats failing: the caller drops the old turns instead. But
@@ -173,6 +176,13 @@ module Riggs
              "(#{payload[:error]}: #{payload[:message]})"
       rescue StandardError
         nil
+      end
+
+      def record_failed(provider, attempt, step_key)
+        @record_call&.call(
+          step_key: step_key, provider: provider, model: nil,
+          relay_attempt: attempt, usage: Usage::EMPTY.dup, cost_usd: nil
+        )
       end
 
       def record(result, step_key)

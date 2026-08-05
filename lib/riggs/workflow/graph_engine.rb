@@ -360,13 +360,24 @@ module Riggs
 
       def compact_history(comp, messages, step)
         outcome = comp.compact(messages: messages, step_key: step.id, model: nil,
-                               timeout: @workflow[:timeout_seconds])
+                               timeout: remaining_timeout)
         @llm_calls += outcome[:llm_calls].to_i
         log_event("context_compacted",
                   { step: step.id, site: "cross_step", strategy: outcome[:strategy],
                     before: outcome[:before], after: outcome[:after],
                     collapsed: outcome[:collapsed] })
         outcome[:messages]
+      end
+
+      # What is left of the run's wall-clock budget, mirroring ToolLoop's own.
+      # Handing a cross-step compaction the FULL timeout_seconds let a
+      # compaction starting a second before the deadline run the whole budget
+      # again on top of it.
+      def remaining_timeout
+        total = @workflow[:timeout_seconds]
+        return total unless @started_at && total
+
+        [total - (Time.now - @started_at), 1].max
       end
 
       # Memoized per chain, not globally: Router#chain_for honors a step's own

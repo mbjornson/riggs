@@ -102,15 +102,24 @@ module Riggs
     # enumerate ahead of time. Exact-match-only lookup therefore left every
     # real OpenAI call unpriced while its undated alias priced fine.
     #
-    # Exact match wins. Otherwise the model must be the longest table key plus
-    # a "-" and a suffix: the trailing hyphen keeps `gpt-4o-mini` from
-    # answering for `gpt-4o-miniature`, and "longest" keeps a dated
-    # `claude-opus-4-6-*` from resolving to some shorter family prefix. A key
-    # is never invented -- an unknown family still returns nil.
+    # Exact match wins. Otherwise the model must be a table key plus a DATE
+    # suffix, in either shipped convention (OpenAI's `-2024-07-18`, Anthropic's
+    # `-20250805`). "Longest key" keeps a dated `claude-opus-4-6-*` from
+    # resolving to a shorter family prefix.
+    #
+    # The date requirement is the point. Accepting key + "-" + anything would
+    # price `gpt-4o-mini-realtime` at `gpt-4o-mini`'s rate -- a differently
+    # priced variant silently borrowing a number it has no claim to. An
+    # unrecognised variant resolves to nil and reports UNPRICED, which is the
+    # honest answer and the one the rest of this module is built around.
+    DATE_SUFFIX = /\A(?:\d{8}|\d{4}-\d{2}-\d{2})\z/
+
     def self.resolve_key(model, table)
       return model if table.key?(model)
 
-      table.keys.select { |k| model.start_with?("#{k}-") }.max_by(&:length)
+      table.keys
+           .select { |k| model.start_with?("#{k}-") && DATE_SUFFIX.match?(model[(k.length + 1)..]) }
+           .max_by(&:length)
     end
 
     def self.context_window(model, overrides: {}, at: nil)

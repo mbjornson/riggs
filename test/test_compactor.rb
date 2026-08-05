@@ -390,4 +390,30 @@ class TestCompactor < Minitest::Test
 
     assert_operator calls.first[:timeout], :>, 0
   end
+
+  # The summarization call runs through a relay chain like any other, so its
+  # failed attempts are spend too. Only ToolLoop's own call reported them.
+  def test_compaction_records_its_own_failed_relay_attempts
+    recorded = []
+    flaky = Class.new(Riggs::Providers::Base) do
+      def complete(**)
+        raise Riggs::Providers::TimeoutError, "read timeout"
+      end
+    end
+    router = Riggs::Providers::Router.new(
+      hub_providers: { flaky: { type: "flaky" }, mock: { type: "mock" } },
+      registry: { "flaky" => flaky, "mock" => Riggs::Providers::Mock }
+    )
+    compactor = Riggs::Workflow::Compactor.new(
+      router: router, chain: %w[flaky mock], budget: 1_000, reserve: 100,
+      keep_recent: 40, record_call: ->(**kw) { recorded << kw }
+    )
+
+    compactor.compact(messages: long_messages, step_key: "step-a", model: nil)
+
+    failed = recorded.find { |r| r[:provider] == "flaky" }
+    refute_nil failed, "a compaction's failed relay attempt is a call that happened"
+    refute failed[:usage][:measured]
+    assert_equal "step-a", failed[:step_key]
+  end
 end

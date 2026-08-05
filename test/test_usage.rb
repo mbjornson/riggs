@@ -164,4 +164,42 @@ class TestUsage < Minitest::Test
 
     assert_empty values.select(&:negative?)
   end
+
+  # Nulling the derived input field is not enough: the negative count the vendor
+  # actually sent was still stored under cache_read_tokens, where storage summed
+  # it and pricing turned it into a negative dollar amount.
+  def test_a_negative_reported_field_is_dropped_not_stored
+    u = Riggs::Usage.normalize({ "prompt_tokens" => 100,
+                                 "prompt_tokens_details" => { "cached_tokens" => -5 } })
+
+    assert_nil u[:cache_read_tokens]
+    refute u[:total_tokens].to_i.negative?
+  end
+
+  def test_a_negative_field_never_reaches_a_cost
+    u = Riggs::Usage.normalize({ "prompt_tokens" => 100,
+                                 "prompt_tokens_details" => { "cached_tokens" => -5 } })
+    cost = Riggs::ModelInfo.cost(model: "gpt-4o-mini", usage: u)
+
+    refute cost.to_f.negative?, "a malformed payload must never produce a credit"
+  end
+
+  # An OpenAI-compatible endpoint that serializes its counts as strings used to
+  # crash normalization outright (Integer vs String comparison), taking the run
+  # down over a bookkeeping field.
+  def test_string_shaped_counts_normalize_instead_of_raising
+    u = Riggs::Usage.normalize({ "prompt_tokens" => "100", "completion_tokens" => "7",
+                                 "prompt_tokens_details" => { "cached_tokens" => "40" } })
+
+    assert_equal 60, u[:input_tokens]
+    assert_equal 7, u[:output_tokens]
+    assert_equal 40, u[:cache_read_tokens]
+  end
+
+  def test_a_non_numeric_count_is_unmeasured_rather_than_fatal
+    u = Riggs::Usage.normalize({ "prompt_tokens" => "lots", "completion_tokens" => 7 })
+
+    assert_nil u[:input_tokens]
+    assert_equal 7, u[:output_tokens]
+  end
 end

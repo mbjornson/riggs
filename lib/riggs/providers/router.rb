@@ -81,6 +81,12 @@ module Riggs
           )
           notify_failed_attempt(on_failed_attempt, name, idx + 1, e)
           next
+        rescue StandardError => e
+          # Not a relay error, so it does NOT fail over -- an unexpected
+          # exception propagates and the run dies. The attempt was still
+          # dispatched and still spent, so it is ledgered on the way out.
+          notify_failed_attempt(on_failed_attempt, name, idx + 1, e)
+          raise
         end
 
         raise Error, "All providers in relay_chain failed: #{last_error&.message}"

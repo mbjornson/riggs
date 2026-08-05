@@ -243,6 +243,28 @@ class TestGraphEngine < Minitest::Test
            "history over budget is summarized, not silently discarded")
   end
 
+  # The intra-step site passes its remaining budget; the cross-step site passed
+  # the whole workflow timeout, so a compaction starting one second before the
+  # deadline could run the full timeout again on top of it.
+  def test_cross_step_compaction_inherits_the_remaining_timeout
+    engine = with_session(engine_with(context_window: 100, reserve_tokens: 0))
+    engine.instance_variable_get(:@workflow)[:timeout_seconds] = 60
+    engine.instance_variable_set(:@started_at, Time.now - 59)
+    engine.instance_variable_set(:@outputs, { first: "a" * 4_000, second: "b" * 4_000 })
+
+    seen = []
+    router = engine.instance_variable_get(:@router)
+    router.define_singleton_method(:call) do |**kwargs|
+      seen << kwargs[:timeout]
+      { provider: "mock", model: nil, content: "s", usage: {}, cost_usd: nil }
+    end
+
+    messages_for(engine, "next input")
+
+    assert_operator seen.first, :<, 60,
+                    "the summarization call must inherit what is left of the run's budget"
+  end
+
   def test_cross_step_compaction_is_audited
     engine = with_session(engine_with(context_window: 100, reserve_tokens: 0))
     engine.instance_variable_set(:@outputs, { first: "a" * 4_000, second: "b" * 4_000 })
