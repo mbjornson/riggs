@@ -180,6 +180,32 @@ class TestToolLoop < Minitest::Test
            "anchoring on input_tokens alone hides that entirely")
   end
 
+  # A transcript that cannot be split (one oversized message) is still over
+  # budget after compaction runs. The event must say so: an operator reading
+  # `strategy: "summarized", before: 1000, after: 1000, collapsed: 0` sees
+  # compaction working while the request is over budget and unchanged.
+  # The event is deliberately still emitted -- suppressing it would recreate
+  # the silent non-compaction R3.5 exists to make visible.
+  def test_audits_a_noop_compaction_as_such
+    events = []
+    compactor = Riggs::Workflow::Compactor.new(
+      router: Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
+      chain: ["mock"], budget: 100, reserve: 0, keep_recent: 1
+    )
+    loop_runner = build_loop(compactor: compactor, audit: ->(**kw) { events << kw })
+
+    loop_runner.run(step: build_step, chain: ["mock"],
+                    messages: [{ role: "user", content: "x" * 4_000 }],
+                    system_prompt: "sys", io: StringIO.new)
+
+    compaction = events.find { |e| e[:event_type] == "context_compacted" }
+
+    refute_nil compaction, "an over-budget turn that could not be reduced must still be visible"
+    assert_equal "noop", compaction[:payload][:strategy]
+    assert_equal compaction[:payload][:before], compaction[:payload][:after]
+    assert_equal 0, compaction[:payload][:collapsed]
+  end
+
   def test_no_compaction_without_a_compactor
     loop_runner = build_loop(compactor: nil)
 

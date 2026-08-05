@@ -331,6 +331,12 @@ Rules:
 - If summarization itself fails, the run drops the oldest turns without
   summarizing rather than aborting, and audits `context_compacted` with
   `strategy: "truncated"`. Degrading beats failing.
+- A pass that changes nothing — nothing old enough to collapse, or a single
+  message too large to split — audits `strategy: "noop"` with `before == after`
+  and `collapsed: 0`. The event is still emitted: an over-budget request that
+  compaction could not reduce is exactly the state an operator must be able to
+  see, and suppressing the event would recreate the silent non-compaction R3.5
+  exists to prevent.
 - Tool-result turns are eligible for summarization; the assistant turn carrying
   `tool_calls` and its matching `tool` turns are collapsed together, never
   split, so the transcript stays structurally valid for the provider.

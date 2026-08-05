@@ -84,8 +84,13 @@ module Riggs
         [@keep_recent, ceiling(model: model) / 2].min
       end
 
+      # A do-nothing pass -- nothing was old enough to collapse, or the
+      # transcript is a single message too big to split. Distinct from
+      # "summarized" on purpose: the caller audits this strategy, and a
+      # do-nothing pass reported as a successful compaction shows an operator
+      # compaction working while the request is over budget and unchanged.
       def no_op(list, before)
-        { messages: list, strategy: "summarized", before: before, after: before, collapsed: 0 }
+        { messages: list, strategy: "noop", before: before, after: before, collapsed: 0 }
       end
 
       # Walks backwards accumulating until keep_recent is reached, then moves

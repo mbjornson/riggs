@@ -157,6 +157,21 @@ class TestCompactor < Minitest::Test
     assert_equal messages, result[:messages]
     assert_equal result[:before], result[:after]
     assert_equal 0, result[:collapsed]
+    assert_equal "noop", result[:strategy],
+                 "a do-nothing pass must not be reported as a successful summarization"
+  end
+
+  # A single oversized message can never be split, so an irreducible transcript
+  # reaches compact and comes back unchanged. Reporting that as "summarized" is
+  # what an operator sees while the request is still over budget.
+  def test_compact_reports_noop_for_an_irreducible_transcript
+    messages = [{ role: "user", content: "x" * 40_000 }]
+
+    result = build(keep_recent: 1).compact(messages: messages, step_key: "s", model: nil)
+
+    assert_equal "noop", result[:strategy]
+    assert_equal 0, result[:collapsed]
+    assert_equal result[:before], result[:after]
   end
 
   def test_compact_truncates_when_summarization_fails
