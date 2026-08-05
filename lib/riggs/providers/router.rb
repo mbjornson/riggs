@@ -8,6 +8,8 @@ require_relative "cursor_cli"
 require_relative "claude_cli"
 require_relative "codex_cli"
 require_relative "cursor_cloud"
+require_relative "../usage"
+require_relative "../model_info"
 
 module Riggs
   module Providers
@@ -28,6 +30,15 @@ module Riggs
         "openai_cli" => CodexCli
       }.freeze
 
+      # Providers that return no token usage, so nothing downstream can measure
+      # or compact a conversation running on them.
+      UNMETERED = %w[cursor cursor_cli cursor_cloud claude_cli anthropic_cli codex openai_cli cli].freeze
+
+      def self.unmetered_chain?(chain)
+        names = Array(chain).map(&:to_s)
+        !names.empty? && names.all? { |n| UNMETERED.include?(n) }
+      end
+
       def initialize(workflow_providers: {}, hub_providers: {}, audit: nil, registry: nil)
         @workflow_providers = Identity.deep_symbolize(workflow_providers || {})
         @hub_providers = Identity.deep_symbolize(hub_providers || {})
@@ -35,7 +46,16 @@ module Riggs
         @registry = registry || BUILTINS
       end
 
-      def call(chain:, messages:, system: nil, timeout: 60, session_id: nil, tools: nil)
+      # `on_failed_attempt` is invoked once per dispatched attempt that raised,
+      # immediately, with the provider name and 1-based attempt number. A
+      # provider that accepted and billed a request before timing out on the
+      # read is real spend; metering only the attempt that RETURNED left that
+      # spend out of the ledger entirely, so session coverage reported a
+      # complete count over a denominator that had already dropped the failure.
+      # Reported as it happens rather than returned, so the case where every
+      # provider fails -- which raises instead of returning -- is covered too.
+      def call(chain:, messages:, system: nil, timeout: 60, session_id: nil, tools: nil,
+               on_failed_attempt: nil)
         names = Array(chain).map(&:to_s)
         names = ["mock"] if names.empty?
         last_error = nil
@@ -44,12 +64,14 @@ module Riggs
           provider = build(name)
           result = provider.complete(messages: messages, system: system, timeout: timeout, tools: tools)
           result[:tool_calls] ||= []
+          metered = meter(result, name)
           @audit&.call(
             session_id: session_id,
             event_type: "provider_success",
-            payload: { provider: name, attempt: idx + 1 }
+            payload: { provider: name, attempt: idx + 1,
+                       tokens: metered[:usage][:total_tokens], cost_usd: metered[:cost_usd] }
           )
-          return result.merge(relay_attempt: idx + 1)
+          return metered.merge(relay_attempt: idx + 1)
         rescue RateLimitError, TimeoutError, Error => e
           last_error = e
           @audit&.call(
@@ -57,7 +79,14 @@ module Riggs
             event_type: "provider_failover",
             payload: { provider: name, attempt: idx + 1, error: e.class.name, message: e.message }
           )
+          notify_failed_attempt(on_failed_attempt, name, idx + 1, e)
           next
+        rescue StandardError => e
+          # Not a relay error, so it does NOT fail over -- an unexpected
+          # exception propagates and the run dies. The attempt was still
+          # dispatched and still spent, so it is ledgered on the way out.
+          notify_failed_attempt(on_failed_attempt, name, idx + 1, e)
+          raise
         end
 
         raise Error, "All providers in relay_chain failed: #{last_error&.message}"
@@ -85,6 +114,15 @@ module Riggs
 
       private
 
+      # Never raises. A broken ledger callback must not convert a recoverable
+      # failover into a failed run -- the next provider in the chain may well
+      # answer, and the whole point of this hook is bookkeeping.
+      def notify_failed_attempt(callback, provider, attempt, error)
+        callback&.call(provider: provider, attempt: attempt, error: error)
+      rescue StandardError
+        nil
+      end
+
       def build(name)
         key = name.to_s
         opts = provider_config(key)
@@ -109,6 +147,18 @@ module Riggs
         hub = {} unless hub.is_a?(Hash)
         wf = {} unless wf.is_a?(Hash)
         Identity.deep_symbolize(hub).merge(Identity.deep_symbolize(wf))
+      end
+
+      # Normalizes vendor usage and prices it. Only Router resolves provider
+      # config, so the per-model pricing override is only reachable here.
+      def meter(result, name)
+        opts = provider_config(name)
+        usage = Usage.normalize(result[:usage])
+        overrides = opts[:pricing] || {}
+        result.merge(
+          usage: usage,
+          cost_usd: ModelInfo.cost(model: result[:model], usage: usage, overrides: overrides)
+        )
       end
     end
   end

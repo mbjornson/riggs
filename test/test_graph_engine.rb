@@ -180,4 +180,266 @@ class TestGraphEngine < Minitest::Test
       refute engine.outputs[:debug_plan]
     end
   end
+
+  # build_messages needs the step it is building for (so a compaction's
+  # summarization call lands on the right ledger row) and the chain to route
+  # that call through. Production supplies both; this mirrors it.
+  def messages_for(engine, input)
+    workflow = engine.instance_variable_get(:@workflow)
+    step = workflow[:steps].last
+    chain = engine.instance_variable_get(:@router).chain_for(step: step, workflow: workflow)
+    engine.send(:build_messages, input, step: step, chain: chain)
+  end
+
+  # Compaction writes an audit row, and riggs_audit has a foreign key to
+  # riggs_sessions. Without a session the write fails, the Compactor's rescue
+  # swallows it, and every compaction silently degrades to truncation -- the
+  # bug that shipped once already. execute() always creates the session first;
+  # a test that pokes build_messages directly has to do the same.
+  def with_session(engine)
+    storage = engine.instance_variable_get(:@storage)
+    engine.instance_variable_set(
+      :@session_id,
+      storage.create_session(workflow_name: "budget_test", user_id: "test_user", memory_namespace: "test")
+    )
+    engine
+  end
+
+  def test_build_messages_keeps_all_outputs_under_budget
+    engine = engine_with(context_window: 128_000)
+    engine.instance_variable_set(:@outputs, { first: "a" * 100, second: "b" * 100 })
+
+    messages = messages_for(engine, "next input")
+
+    assert_equal 3, messages.length, "two history turns plus the new user turn"
+    assert_equal "user", messages.last[:role]
+  end
+
+  # `short` (8,000) paired with the default reserve (16,384) clamped the
+  # ceiling to 0, so `next if used + size > ceiling` skipped every prior step
+  # output: a short workflow silently retained NO cross-step history at all,
+  # with no error and no audit event. It kept 2 steps before Phase 7.
+  def test_short_context_window_still_retains_cross_step_history
+    engine = engine_with(context_window: Riggs::Workflow::Loader::CONTEXT_BUDGETS[:short])
+    engine.instance_variable_set(:@outputs, { first: "a" * 100, second: "b" * 100 })
+
+    messages = messages_for(engine, "next input")
+
+    assert_equal 3, messages.length,
+                 "a short workflow retains history; it does not silently drop all of it"
+  end
+
+  # The cross-step site used to DROP oversized step outputs -- no summary, no
+  # audit event, no error. The immediately preceding step's result could vanish
+  # from the next step's context while an older, smaller one was kept, so a
+  # decision or identifier produced by step N never reached step N+1.
+  def test_build_messages_compacts_history_over_budget_rather_than_dropping_it
+    engine = with_session(engine_with(context_window: 100, reserve_tokens: 0))
+    engine.instance_variable_set(:@outputs, { first: "a" * 4_000, second: "b" * 4_000 })
+
+    messages = messages_for(engine, "next input")
+
+    assert(messages.any? { |m| m[:content].to_s.include?("[compacted summary]") },
+           "history over budget is summarized, not silently discarded")
+  end
+
+  # The intra-step site passes its remaining budget; the cross-step site passed
+  # the whole workflow timeout, so a compaction starting one second before the
+  # deadline could run the full timeout again on top of it.
+  def test_cross_step_compaction_inherits_the_remaining_timeout
+    engine = with_session(engine_with(context_window: 100, reserve_tokens: 0))
+    engine.instance_variable_get(:@workflow)[:timeout_seconds] = 60
+    engine.instance_variable_set(:@started_at, Time.now - 59)
+    engine.instance_variable_set(:@outputs, { first: "a" * 4_000, second: "b" * 4_000 })
+
+    seen = []
+    router = engine.instance_variable_get(:@router)
+    router.define_singleton_method(:call) do |**kwargs|
+      seen << kwargs[:timeout]
+      { provider: "mock", model: nil, content: "s", usage: {}, cost_usd: nil }
+    end
+
+    messages_for(engine, "next input")
+
+    assert_operator seen.first, :<, 60,
+                    "the summarization call must inherit what is left of the run's budget"
+  end
+
+  def test_cross_step_compaction_is_audited
+    engine = with_session(engine_with(context_window: 100, reserve_tokens: 0))
+    engine.instance_variable_set(:@outputs, { first: "a" * 4_000, second: "b" * 4_000 })
+
+    messages_for(engine, "next input")
+    event = engine.audit_log.find { |e| e[:event_type] == "context_compacted" }
+
+    refute_nil event, "an operator cannot see cross-step compaction that emits no event"
+    assert_equal "cross_step", event[:payload][:site]
+  end
+
+  def test_build_messages_returns_history_oldest_first
+    engine = engine_with(context_window: 128_000)
+    engine.instance_variable_set(:@outputs, { first: "OLDEST", second: "NEWEST" })
+
+    contents = messages_for(engine, "input").map { |m| m[:content] }
+
+    assert_operator contents.index("OLDEST"), :<, contents.index("NEWEST"),
+                    "history must stay chronological even though selection walks backwards"
+  end
+
+  # The newest step output is the handoff to the step being built. Under the
+  # old drop-based selection an oversized newest turn was skipped entirely
+  # while an older turn that happened to fit was kept -- the one turn most
+  # likely to matter was the one most likely to be discarded.
+  def test_build_messages_never_discards_the_newest_output_outright
+    engine = with_session(engine_with(context_window: 100, reserve_tokens: 0))
+    engine.instance_variable_set(:@outputs, { first: "x" * 20, second: "y" * 20_000 })
+
+    messages = messages_for(engine, "next input")
+
+    assert(messages.any? { |m| m[:content].to_s.include?("[compacted summary]") },
+           "the newest output must be summarized into the history, never dropped on the floor")
+  end
+
+  def test_cli_only_chain_audits_compaction_unanchored
+    engine = engine_with(context_window: 32_000, chain: ["claude_cli"])
+
+    engine.send(:announce_unanchored_compaction!, ["claude_cli"])
+    events = engine.audit_log.map { |e| e[:event_type] }
+
+    assert_includes events, "compaction_unanchored"
+  end
+
+  # The event does not mean "compaction cannot run" -- it does run, on
+  # character estimates, because a CLI-only run that would otherwise blow its
+  # context degrades better by compacting than by growing unbounded. It means
+  # "the reserve is absorbing a much larger error than usual on this run".
+  def test_the_unanchored_announcement_names_the_estimation_basis
+    engine = engine_with(context_window: 32_000, chain: ["claude_cli"])
+
+    engine.send(:announce_unanchored_compaction!, ["claude_cli"])
+    event = engine.audit_log.find { |e| e[:event_type] == "compaction_unanchored" }
+
+    assert_equal "character_estimate", event[:payload][:basis]
+    assert_equal ["claude_cli"], event[:payload][:chain]
+  end
+
+  def test_measurable_chain_does_not_announce
+    engine = engine_with(context_window: 32_000, chain: ["mock"])
+
+    engine.send(:announce_unanchored_compaction!, ["mock"])
+
+    refute_includes engine.audit_log.map { |e| e[:event_type] }, "compaction_unanchored"
+  end
+
+  def test_announcement_happens_only_once
+    engine = engine_with(context_window: 32_000, chain: ["claude_cli"])
+
+    3.times { engine.send(:announce_unanchored_compaction!, ["claude_cli"]) }
+
+    assert_equal 1, engine.audit_log.count { |e| e[:event_type] == "compaction_unanchored" }
+  end
+
+  # A resumed run is a SECOND GraphEngine instance with its own fresh
+  # @compaction_announced ivar. Asserting against `engine.audit_log` (as the
+  # three tests above do) cannot catch a double-announce across resume,
+  # because the two instances have separate in-memory logs -- that
+  # separation is exactly what hid the bug. Assert against storage instead,
+  # which both instances share.
+  def test_compaction_unanchored_fires_once_across_pause_and_resume
+    dir = Dir.mktmpdir("riggs-graph-engine")
+    (@engine_with_dirs ||= []) << dir
+    storage = Riggs::Storage.new(db_path: File.join(dir, "db", "riggs.sqlite3"))
+    (@engine_with_storages ||= []) << storage
+
+    workflow = {
+      name: "resume_budget_test",
+      context_window: 32_000,
+      reserve_tokens: 16_384,
+      keep_recent_tokens: 20_000,
+      max_llm_calls: 20,
+      providers: { default: { relay_chain: ["claude_cli"] } },
+      steps: [
+        Riggs::Workflow::StepNode.from_hash(id: "first", output_var: "first", next: "second"),
+        Riggs::Workflow::StepNode.from_hash(id: "second", output_var: "second", gates: ["approval"])
+      ]
+    }
+
+    # "claude_cli" is on Providers::Router::UNMETERED by NAME -- that's what
+    # announce_unanchored_compaction! keys off, independent of which class
+    # actually answers the call. Mapping the name to Mock keeps this test
+    # hermetic (no real CLI binary or API key needed) while still exercising
+    # the real unmetered-chain classification.
+    router = Riggs::Providers::Router.new(
+      workflow_providers: workflow[:providers],
+      registry: Riggs::Providers::Router::BUILTINS.merge("claude_cli" => Riggs::Providers::Mock)
+    )
+    identity = { id: "test_user", memory_namespace: "test" }
+
+    paused = Riggs::Workflow::GraphEngine.new(
+      workflow: workflow, user_identity: identity, storage: storage,
+      db_path: File.join(dir, "db", "riggs.sqlite3"), provider_router: router,
+      gate_handler: ->(*) { :paused }
+    )
+    paused.execute(StringIO.new, input: {})
+    assert_equal :paused, paused.status, "step 'second's gate must pause the run before resume happens"
+
+    # A fresh instance, exactly as GraphEngine.resume constructs internally --
+    # built directly here (rather than via .resume) so a custom provider
+    # registry can be injected for the hermetic chain above.
+    resumer = Riggs::Workflow::GraphEngine.new(
+      workflow: workflow, user_identity: identity, storage: storage,
+      db_path: File.join(dir, "db", "riggs.sqlite3"), provider_router: router,
+      gate_handler: ->(*) { :approved }
+    )
+    resumer.resume_session(paused.session_id, io: StringIO.new)
+    assert_equal :completed, resumer.status
+
+    rows = storage.list_audit(paused.session_id).select { |r| r["event_type"] == "compaction_unanchored" }
+    assert_equal 1, rows.length,
+                 "compaction_unanchored must fire once per SESSION, not once per GraphEngine instance"
+  end
+
+  private
+
+  # Builds a minimal GraphEngine directly from a workflow hash rather than
+  # through Loader.load, matching the Dir.mktmpdir + File.join(dir, "db",
+  # "riggs.sqlite3") + explicit storage.close idiom used in
+  # test_storage_audit.rb, and the Riggs::Workflow::StepNode.from_hash idiom
+  # used in test_tool_loop.rb / test_providers.rb. Two steps ("first",
+  # "second") give build_messages a deterministic chronological order to
+  # select and emit history from. Storage is built explicitly (rather than
+  # left for GraphEngine to construct) so teardown can close it before the
+  # tmpdir is removed -- WAL mode leaves -wal/-shm files that a still-open
+  # connection can race with FileUtils.remove_entry.
+  def engine_with(context_window:, reserve_tokens: 16_384, keep_recent_tokens: 20_000, chain: ["mock"])
+    dir = Dir.mktmpdir("riggs-graph-engine")
+    (@engine_with_dirs ||= []) << dir
+    storage = Riggs::Storage.new(db_path: File.join(dir, "db", "riggs.sqlite3"))
+    (@engine_with_storages ||= []) << storage
+
+    workflow = {
+      name: "budget_test",
+      context_window: context_window,
+      reserve_tokens: reserve_tokens,
+      keep_recent_tokens: keep_recent_tokens,
+      max_llm_calls: 20,
+      providers: { default: { relay_chain: chain } },
+      steps: [
+        Riggs::Workflow::StepNode.from_hash(id: "first", output_var: "first"),
+        Riggs::Workflow::StepNode.from_hash(id: "second", output_var: "second")
+      ]
+    }
+
+    Riggs::Workflow::GraphEngine.new(
+      workflow: workflow,
+      user_identity: { id: "test_user", memory_namespace: "test" },
+      storage: storage,
+      db_path: File.join(dir, "db", "riggs.sqlite3")
+    )
+  end
+
+  def teardown
+    Array(@engine_with_storages).each(&:close)
+    Array(@engine_with_dirs).each { |dir| FileUtils.remove_entry(dir) }
+  end
 end

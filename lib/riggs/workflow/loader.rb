@@ -11,6 +11,14 @@ module Riggs
         deep_research: 35
       }.freeze
 
+      # Token budgets, replacing the former step-count window. The words are
+      # kept so existing workflow YAML keeps parsing, but they now mean tokens.
+      CONTEXT_BUDGETS = {
+        short: 8_000,
+        medium: 32_000,
+        full: 128_000
+      }.freeze
+
       def self.load(path:)
         raw = Psych.safe_load(File.read(path), permitted_classes: [Symbol], aliases: true) || {}
         cfg = Riggs::Identity.deep_symbolize(raw)
@@ -23,7 +31,9 @@ module Riggs
           display_name: (cfg[:display_name] || humanize(cfg[:name])).to_s,
           description: (cfg[:description] || "").to_s,
           triggers: Array(cfg[:triggers]),
-          context_window: (cfg[:context_window] || :medium).to_s.to_sym,
+          context_window: normalize_context_window(cfg[:context_window]),
+          reserve_tokens: (cfg[:reserve_tokens] || 16_384).to_i,
+          keep_recent_tokens: (cfg[:keep_recent_tokens] || 20_000).to_i,
           max_llm_calls: normalize_max_turns(cfg[:max_llm_calls] || 20),
           timeout_seconds: (cfg[:timeout_seconds] || 300).to_i,
           providers: cfg[:providers] || { default: { relay_chain: ["mock"] } },
@@ -85,6 +95,13 @@ module Riggs
 
       def self.resolve_next_targets(next_val)
         NextResolver.targets(next_val)
+      end
+
+      def self.normalize_context_window(raw)
+        return raw.to_i if raw.is_a?(Integer)
+        return raw.to_i if raw.to_s.match?(/\A\d+\z/)
+
+        CONTEXT_BUDGETS.fetch((raw || :medium).to_s.to_sym, CONTEXT_BUDGETS[:medium])
       end
 
       def self.normalize_max_turns(val)

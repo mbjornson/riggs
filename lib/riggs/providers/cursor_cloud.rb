@@ -34,6 +34,7 @@ module Riggs
 
         {
           provider: name,
+          model: options[:model],
           content: run["result"].to_s,
           usage: { duration_ms: run["durationMs"] },
           raw: run

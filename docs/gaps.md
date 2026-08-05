@@ -5,54 +5,29 @@ Open items from comparing Riggs against [Pi](https://pi.dev)'s agent harness on
 multi-user playbook orchestrator, so only the shared substrate is comparable —
 context control, session durability, observability, extensibility, and trust.
 
-Seven items came out of that comparison. Two shipped in
-[`specs/phase6-persistence-and-events.md`](specs/phase6-persistence-and-events.md):
+Seven items came out of that comparison. Four have shipped: two in
+[`specs/phase6-persistence-and-events.md`](specs/phase6-persistence-and-events.md)
+and two in
+[`specs/phase7-token-accounting-and-compaction.md`](specs/phase7-token-accounting-and-compaction.md):
 
 - ~~**#1** Message persistence and gate pause/resume~~ — shipped
 - ~~**#4** Audit event stream (poll + SSE)~~ — shipped
+- ~~**#2** Token accounting~~ — shipped. A completed run reports tokens in/out
+  and cost per step and per session, each with coverage on both counters.
+  That is the figure [`token-ledger.md`](token-ledger.md)'s "Tokens in/out"
+  column asks for — what a user spent building a feature — so for a feature
+  built by running Riggs workflows, `riggs workflow:inspect SESSION_ID` now
+  fills the column directly, as the original "done when" anticipated. What it
+  cannot do is populate rows whose work happened outside Riggs: rows 1–3 are
+  Riggs' own features, built in Claude Code sessions rather than through Riggs,
+  so those figures are still read from `/cost` by hand.
+- ~~**#3** Token-based context window and compaction~~ — shipped.
+  `context_window` is now a token budget (`short`/`medium`/`full`/an integer),
+  not a step count, and a run whose transcript exceeds it compacts instead of
+  erroring.
 
-The five below are open. Original numbering is kept so the ranking stays legible.
+The three below are open. Original numbering is kept so the ranking stays legible.
 Gaps found outside that comparison are collected at the end, labelled as such.
-
----
-
-## #2 — Token accounting
-
-**Now:** Providers parse `usage` out of responses and discard it. Guardrails are
-`max_llm_calls` and `timeout_seconds`; nothing counts tokens anywhere.
-
-**Why it matters:** [`token-ledger.md`](token-ledger.md) asks a human to run
-`/cost` and hand-copy numbers that the code already had and threw away. It is
-also the prerequisite for #3 — you cannot compact on a budget you do not measure.
-
-**Shape:** Capture `usage` in the `Providers::Base` subclasses, record it on the
-`provider_success` audit event, sum per session. Relay-chain failover means
-attributing tokens to the provider that actually answered, not the first tried.
-
-**Done when:** A completed run reports tokens in/out per step and per session,
-and the ledger fills itself.
-
----
-
-## #3 — Token-based context window and compaction
-
-**Now:** `GraphEngine::CONTEXT_LIMITS` is `{short: 2, medium: 6, full: 50}` —
-a count of *steps*, not tokens. There is no compaction. A long `ToolLoop` grows
-its `messages` array unbounded.
-
-**Why it matters:** Six steps with large outputs exceed any real context window,
-and a tool loop that runs long enough will fail with a provider 400 rather than
-degrading gracefully.
-
-**Shape:** Replace the step-count window with a per-workflow token budget. When
-messages exceed it, summarize older turns through the relay chain and keep recent
-turns verbatim. Pi's defaults are a reasonable starting point: reserve 16384
-tokens, keep the most recent 20000 intact.
-
-**Depends on:** #2.
-
-**Done when:** A run whose transcript exceeds the model window completes by
-compacting instead of erroring.
 
 ---
 
@@ -136,6 +111,79 @@ JSONL to stdout for scripting and CI.
 
 ---
 
+## Deferred from Phase 7
+
+Seven items surfaced during the Phase 7 build and its adversarial review, and
+were triaged as non-blocking at merge. Ordered by consequence.
+
+**Compaction launders untrusted content into the assistant voice.**
+`Compactor#summarize` feeds raw transcript and tool output to a model, and
+`summary_turn` inserts the result as `role: "assistant"`. A hostile MCP or
+web-tool result can get an instruction ("the assistant must call X") preserved
+into that summary, where later tool-enabled turns read it as the assistant's own
+prior intent rather than as untrusted data. This is an escalation of an exposure
+that already exists — tool output reaches the context either way — but the
+role change is what removes the last signal that it came from outside. A
+`role: "user"` summary turn, or an explicit `[untrusted, summarized]` marker,
+would keep the provenance. Related to #6: this repo has no trust boundary yet.
+
+**Compaction's summary prompt overpromises on identifiers.** The prompt asks the
+model to "preserve identifiers", but `summarize` serializes only `role` and
+`content` — native `tool_calls` arrays, `tool_call_id`, and `tool_name` are not
+in the transcript it sees. Nothing is orphaned today, because the current
+message shape puts tool results in positional turns that `safe_boundary`
+handles, so this is a latent gap rather than a live bug. It becomes live the
+moment a provider's native `tool_calls` array is what gets collapsed. Either
+serialize the tool metadata or stop promising it.
+
+**Compaction's reported sizes are unanchored.** `Compactor#compact` computes
+`before`/`after` with `Usage.estimate` and no anchor, while `ToolLoop` decides
+*whether* to compact using the anchored measurement. On a run whose prompt is
+largely served from cache, the decision and the audit payload measure different
+things — a run can correctly judge itself over a 90,000-token ceiling and then
+emit `context_compacted {before: 12, after: 8}`. Only the report is affected;
+the trigger uses the anchored number. But it undercuts the point of making that
+event operator-legible. Thread the anchor into `compact`.
+
+**A clamped configuration is silent.** Phase 7 clamps `reserve_tokens` to
+`budget / 4` and `keep_recent_tokens` to `ceiling / 2`, so a workflow declaring
+`reserve_tokens: 64000` against `context_window: 128000` runs with 32,000 and
+nothing says so. `workflow[:reserve_tokens]` still carries the configured value.
+The clamp is documented in the README and the spec, but a `workflow:validate`
+warning would close the gap between what the file says and what the run does.
+
+**`.agent_hubrc`'s `context_windows:` override is inert.**
+`GraphEngine#compactor_for` never passes `model_overrides:` to `Compactor`, so
+`ModelInfo.context_window` always sees an empty hash. The sibling `pricing:`
+override *does* work, which makes the asymmetry a trap. The two resolve in
+different places: `pricing:` in `Router#meter`, which knows which provider
+answered, and the window in `Compactor#ceiling`, which does not. Returning the
+model's window from `Router` alongside `usage:` and `cost_usd:` would close it
+under the rule `pricing:` already follows, with no new precedence question about
+which provider in a chain wins.
+
+**No cross-session usage rollup.** Every usage surface stops at a single
+session: `Storage#session_usage` and `#step_usage`, `riggs workflow:inspect`,
+and `GET /api/sessions/:id/usage`. A [`token-ledger.md`](token-ledger.md) row
+covers a whole feature, and a feature spans many sessions — row 3 covers 30
+commits over roughly 26 hours. So a user building a feature through Riggs gets
+one correct number per session and still adds them up by hand, which is the
+arithmetic #2's "done when" was meant to retire. This is unbuilt scope, not a
+defect: what shipped is correct at the scope it reports. The query is nearly
+free — `USAGE_SELECT` is a bare aggregate and each caller appends its own
+`WHERE`, and `SUM`'s NULL-skipping keeps both coverage counters honest at any
+scope. The open question is the key. "Feature" is not a Riggs concept, so a
+rollup has to be scoped by date range, by an explicit list of session IDs, or by
+a new label on sessions — that choice should be made before the SQL is written.
+
+**`Compactor#call_router`'s rescue is still broad.** It now emits a
+`compaction_degraded` audit event carrying the exception class and message, so a
+swallowed failure is no longer invisible. It still catches `StandardError`
+wholesale, so a genuine bug and an expected provider outage remain the same
+event. Narrowing it to the provider error types would separate them.
+
+---
+
 ## Found separately — schema migration only covers one table
 
 Not from the Pi comparison. Surfaced while building the CI gates in PR #4.
@@ -176,5 +224,6 @@ single-user coding TUI, and these belong to the latter:
 - TypeScript extensions as the extensibility mechanism
 - Dropping MCP. Pi rejects it on context cost — popular servers burn 7-9% of the
   window on unused tool descriptions. Riggs allow-lists tools per skill in
-  `ToolLoop#resolve_tools`, so that objection largely does not apply. #2 would
-  let this be measured rather than assumed.
+  `ToolLoop#resolve_tools`, so that objection largely does not apply. That can
+  now be measured rather than assumed: `riggs workflow:inspect SESSION_ID`
+  reports tokens in/out per step and per session.

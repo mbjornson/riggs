@@ -63,6 +63,7 @@ class TestStorageMigration < Minitest::Test
   def test_fixture_really_predates_the_migration
     refute_includes raw_columns("riggs_sessions"), "resume_state"
     refute_includes raw_tables, "riggs_messages"
+    refute_includes raw_tables, "riggs_provider_calls"
   end
 
   def test_opening_a_legacy_database_adds_the_resume_state_column
@@ -87,6 +88,12 @@ class TestStorageMigration < Minitest::Test
 
     assert_includes raw_tables, "riggs_messages"
     assert_equal ["hello"], storage.list_messages(LEGACY_SESSION_ID).map { |r| r["content"] }
+  end
+
+  def test_opening_a_legacy_database_creates_the_provider_calls_table
+    Riggs::Storage.new(db_path: @db_path).close
+
+    assert_includes raw_tables, "riggs_provider_calls"
   end
 
   def test_migration_preserves_existing_rows

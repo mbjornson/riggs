@@ -90,7 +90,370 @@ class TestToolLoop < Minitest::Test
     refute_empty outcome[:content], "a loop without a persist callback still returns its answer"
   end
 
+  def test_records_one_provider_call_per_turn
+    recorded = []
+    router = Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } })
+    loop_runner = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: nil, skill_registry: nil,
+      audit: ->(**) {}, record_call: ->(**kw) { recorded << kw },
+      llm_calls: 0, max_llm_calls: 5, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+
+    loop_runner.run(step: build_step, chain: ["mock"], messages: [{ role: "user", content: "hello" }],
+                    system_prompt: "sys", io: StringIO.new)
+
+    assert_equal 1, recorded.length
+    assert_equal "triage", recorded.first[:step_key]
+    refute_nil recorded.first[:usage]
+    assert_equal 1, recorded.first[:relay_attempt]
+  end
+
+  def flaky_provider
+    Class.new(Riggs::Providers::Base) do
+      def complete(**)
+        raise Riggs::Providers::TimeoutError, "read timeout"
+      end
+    end
+  end
+
+  # Router only rescues its own error family, so an unexpected exception
+  # propagates without failing over -- correct, but the attempt was still
+  # dispatched and still spent. It has to be ledgered on the way out.
+  def test_an_unexpected_provider_exception_still_records_its_attempt
+    recorded = []
+    exploding = Class.new(Riggs::Providers::Base) do
+      def complete(**)
+        raise "kaboom"
+      end
+    end
+    router = Riggs::Providers::Router.new(
+      hub_providers: { boom: { type: "boom" } }, registry: { "boom" => exploding }
+    )
+    loop_runner = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: nil, skill_registry: nil,
+      audit: ->(**) {}, record_call: ->(**kw) { recorded << kw },
+      llm_calls: 0, max_llm_calls: 5, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+
+    assert_raises(RuntimeError) do
+      loop_runner.run(step: build_step, chain: ["boom"], messages: [{ role: "user", content: "hi" }],
+                      system_prompt: "sys", io: StringIO.new)
+    end
+
+    assert_equal 1, recorded.length, "an unexpected failure is still a dispatched call"
+    refute recorded.first[:usage][:measured]
+  end
+
+  # A provider that accepted the request, billed for it, then timed out on the
+  # read is spend. Metering only the successful attempt let session coverage
+  # report "1 of 1 measured" over a denominator that had already dropped the
+  # failure -- the exact overstatement nil-not-zero exists to prevent.
+  def test_a_failed_provider_attempt_is_recorded_as_an_unmeasured_call
+    recorded = []
+    router = Riggs::Providers::Router.new(
+      hub_providers: { flaky: { type: "flaky" }, mock: { type: "mock" } },
+      registry: { "flaky" => flaky_provider, "mock" => Riggs::Providers::Mock }
+    )
+    loop_runner = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: nil, skill_registry: nil,
+      audit: ->(**) {}, record_call: ->(**kw) { recorded << kw },
+      llm_calls: 0, max_llm_calls: 5, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+
+    loop_runner.run(step: build_step, chain: %w[flaky mock], messages: [{ role: "user", content: "hello" }],
+                    system_prompt: "sys", io: StringIO.new)
+
+    assert_equal 2, recorded.length, "both the failed attempt and the answering one are calls"
+    failed = recorded.find { |r| r[:provider] == "flaky" }
+    refute_nil failed, "the failed attempt must reach the ledger"
+    refute failed[:usage][:measured], "a failed attempt reports no tokens, and says so"
+    assert_nil failed[:cost_usd]
+    assert_equal 1, failed[:relay_attempt]
+  end
+
+  def test_a_chain_that_fails_entirely_still_records_its_attempts
+    recorded = []
+    router = Riggs::Providers::Router.new(
+      hub_providers: { flaky: { type: "flaky" } },
+      registry: { "flaky" => flaky_provider }
+    )
+    loop_runner = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: nil, skill_registry: nil,
+      audit: ->(**) {}, record_call: ->(**kw) { recorded << kw },
+      llm_calls: 0, max_llm_calls: 5, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+
+    assert_raises(Riggs::Providers::Error) do
+      loop_runner.run(step: build_step, chain: ["flaky"], messages: [{ role: "user", content: "hello" }],
+                      system_prompt: "sys", io: StringIO.new)
+    end
+
+    assert_equal 1, recorded.length, "a chain that fails entirely still spent the attempt"
+    refute recorded.first[:usage][:measured]
+  end
+
+  def compacting_loop(max_llm_calls:, record_call: ->(**) {})
+    router = Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } })
+    compactor = Riggs::Workflow::Compactor.new(
+      router: router, chain: ["mock"], budget: 1_000, reserve: 100, keep_recent: 40
+    )
+    Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: nil, skill_registry: nil, audit: ->(**) {},
+      record_call: record_call, compactor: compactor, llm_calls: 0,
+      max_llm_calls: max_llm_calls, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+  end
+
+  # max_llm_calls is the run's only hard stop on runaway spend. The
+  # summarization call did not increment the counter, so a limit of 1 bought
+  # two provider calls and the loop reported one.
+  def test_compaction_counts_against_max_llm_calls
+    assert_raises(Riggs::WorkflowError) do
+      compacting_loop(max_llm_calls: 1).run(
+        step: build_step, chain: ["mock"],
+        messages: [{ role: "user", content: "x" * 4_000 },
+                   { role: "user", content: "y" * 4_000 },
+                   { role: "user", content: "z" }],
+        system_prompt: "sys", io: StringIO.new
+      )
+    end
+  end
+
+  def test_a_compacted_turn_reports_both_calls_it_made
+    outcome = compacting_loop(max_llm_calls: 5).run(
+      step: build_step, chain: ["mock"],
+      messages: [{ role: "user", content: "x" * 4_000 },
+                 { role: "user", content: "y" * 4_000 },
+                 { role: "user", content: "z" }],
+      system_prompt: "sys", io: StringIO.new
+    )
+
+    assert_equal 2, outcome[:llm_calls], "one summarization call plus one answering call"
+  end
+
+  def test_runs_without_a_record_call_callable
+    router = Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } })
+    loop_runner = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: nil, skill_registry: nil, audit: ->(**) {},
+      llm_calls: 0, max_llm_calls: 5, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+
+    result = loop_runner.run(step: build_step, chain: ["mock"],
+                             messages: [{ role: "user", content: "hello" }],
+                             system_prompt: "sys", io: StringIO.new)
+
+    refute_nil result[:content]
+  end
+
+  def test_compacts_before_calling_the_provider_when_over_budget
+    compactor = Riggs::Workflow::Compactor.new(
+      router: Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
+      chain: ["mock"], budget: 200, reserve: 0, keep_recent: 50
+    )
+    loop_runner = build_loop(compactor: compactor)
+    messages = 20.times.map { |i| { role: "user", content: "turn#{i} #{'x' * 200}" } }
+
+    result = loop_runner.run(step: build_step, chain: ["mock"], messages: messages,
+                             system_prompt: "sys", io: StringIO.new)
+
+    refute_nil result[:content], "the run completes rather than raising"
+    assert_operator messages.length, :<, 20, "the message array was compacted in place"
+  end
+
+  def test_audits_context_compacted
+    events = []
+    compactor = Riggs::Workflow::Compactor.new(
+      router: Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
+      chain: ["mock"], budget: 200, reserve: 0, keep_recent: 50
+    )
+    loop_runner = build_loop(compactor: compactor, audit: ->(**kw) { events << kw })
+
+    loop_runner.run(step: build_step, chain: ["mock"],
+                    messages: 20.times.map { |i| { role: "user", content: "t#{i} #{'x' * 200}" } },
+                    system_prompt: "sys", io: StringIO.new)
+
+    compaction = events.find { |e| e[:event_type] == "context_compacted" }
+
+    refute_nil compaction
+    assert_operator compaction[:payload][:after], :<, compaction[:payload][:before]
+  end
+
+  # Riggs::Usage normalizes input_tokens to UNCACHED input -- correct for
+  # pricing, wrong for sizing. OpenAI caches any prompt over 1024 tokens
+  # automatically, so on a long transcript the vendor reports a small
+  # input_tokens for a huge prompt. Anchoring on that number sizes the request
+  # at a fraction of what was really sent and over_budget? never fires, which
+  # is precisely the runaway growth compaction exists to prevent.
+  def test_anchors_on_the_whole_prompt_when_the_vendor_served_it_from_cache
+    events = []
+    compactor = Riggs::Workflow::Compactor.new(
+      router: Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
+      chain: ["mock"], budget: 100_000, reserve: 10_000, keep_recent: 1
+    )
+    loop_runner = build_loop(compactor: compactor, audit: ->(**kw) { events << kw },
+                             router: cached_prompt_router)
+
+    loop_runner.run(step: build_step, chain: ["mock"], messages: [{ role: "user", content: "hi" }],
+                    system_prompt: "sys", io: StringIO.new)
+
+    assert(events.any? { |e| e[:event_type] == "context_compacted" },
+           "a 100k prompt reported as 5k uncached + 95k cached is over a 90k ceiling; " \
+           "anchoring on input_tokens alone hides that entirely")
+  end
+
+  # A transcript that cannot be split (one oversized message) is still over
+  # budget after compaction runs. The event must say so: an operator reading
+  # `strategy: "summarized", before: 1000, after: 1000, collapsed: 0` sees
+  # compaction working while the request is over budget and unchanged.
+  # The event is deliberately still emitted -- suppressing it would recreate
+  # the silent non-compaction R3.5 exists to make visible.
+  def test_audits_a_noop_compaction_as_such
+    events = []
+    compactor = Riggs::Workflow::Compactor.new(
+      router: Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
+      chain: ["mock"], budget: 100, reserve: 0, keep_recent: 1
+    )
+    loop_runner = build_loop(compactor: compactor, audit: ->(**kw) { events << kw })
+
+    loop_runner.run(step: build_step, chain: ["mock"],
+                    messages: [{ role: "user", content: "x" * 4_000 }],
+                    system_prompt: "sys", io: StringIO.new)
+
+    compaction = events.find { |e| e[:event_type] == "context_compacted" }
+
+    refute_nil compaction, "an over-budget turn that could not be reduced must still be visible"
+    assert_equal "noop", compaction[:payload][:strategy]
+    assert_equal compaction[:payload][:before], compaction[:payload][:after]
+    assert_equal 0, compaction[:payload][:collapsed]
+  end
+
+  def test_no_compaction_without_a_compactor
+    loop_runner = build_loop(compactor: nil)
+
+    result = loop_runner.run(step: build_step, chain: ["mock"],
+                             messages: [{ role: "user", content: "hi" }],
+                             system_prompt: "sys", io: StringIO.new)
+
+    refute_nil result[:content]
+  end
+
+  def test_step_with_its_own_relay_chain_compacts_through_that_chain_not_the_first_steps
+    Dir.mktmpdir("riggs-chain-test") do |dir|
+      db_path = File.join(dir, "db", "riggs.sqlite3")
+      storage = Riggs::Storage.new(db_path: db_path)
+
+      workflow = {
+        name: "chain_test",
+        context_window: 12,
+        reserve_tokens: 0,
+        keep_recent_tokens: 1,
+        max_llm_calls: 20,
+        timeout_seconds: 60,
+        providers: {
+          default: { relay_chain: ["mock"] },
+          special: { relay_chain: ["special_mock"] },
+          special_mock: { type: "mock" }
+        },
+        steps: [
+          Riggs::Workflow::StepNode.from_hash(id: "first", input: "hello", output_var: "first", next: "second"),
+          Riggs::Workflow::StepNode.from_hash(id: "second", provider: "special",
+                                              input: "please lookup runbook now", output_var: "second")
+        ]
+      }
+
+      engine = Riggs::Workflow::GraphEngine.new(
+        workflow: workflow,
+        user_identity: { id: "test_user", memory_namespace: "test" },
+        storage: storage,
+        db_path: db_path,
+        mcp_manager: lookup_tool_mcp_manager
+      )
+
+      engine.execute(StringIO.new, input: {})
+      assert_equal :completed, engine.status
+
+      compaction = engine.audit_log.find do |e|
+        e[:event_type] == "context_compacted" && e[:payload][:step] == "second"
+      end
+      refute_nil compaction, "compaction must actually trigger for step 'second' -- " \
+                             "otherwise this test proves nothing about which chain it used"
+
+      providers = storage.db.execute(
+        "SELECT provider FROM riggs_provider_calls WHERE session_id = ? AND step_key = ?",
+        [engine.session_id, "second"]
+      ).map { |row| row["provider"] }
+
+      refute_includes providers, "mock",
+                      "step 'second' declares its own relay_chain (special_mock); its compaction " \
+                      "must not summarize through the first step's chain (mock)"
+      assert_includes providers, "special_mock"
+    ensure
+      storage&.close
+    end
+  end
+
   private
+
+  def build_step
+    Riggs::Workflow::StepNode.from_hash(
+      { "id" => "triage", "agent" => "triager", "input" => "x", "output_var" => "out" }
+    )
+  end
+
+  def build_loop(compactor: nil, audit: ->(**) {}, router: nil)
+    Riggs::Workflow::ToolLoop.new(
+      router: router || Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
+      mcp_manager: nil, skill_registry: nil, audit: audit, compactor: compactor,
+      llm_calls: 0, max_llm_calls: 5, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+  end
+
+  # A router double reporting the OpenAI cached-prompt shape: a 100,000-token
+  # prompt of which 95,000 came from cache. Emits one tool call so the loop
+  # takes a second turn -- the anchor only exists from the second turn on.
+  def cached_prompt_router
+    Class.new do
+      def initialize
+        @calls = 0
+      end
+
+      def call(**)
+        @calls += 1
+        usage = Riggs::Usage.normalize("prompt_tokens" => 100_000, "completion_tokens" => 500,
+                                       "prompt_tokens_details" => { "cached_tokens" => 95_000 })
+        base = { provider: "fake", model: nil, usage: usage, cost_usd: nil }
+        return base.merge(content: "done") if @calls > 1
+
+        base.merge(content: "",
+                   tool_calls: [{ id: "t1", name: "lookup_runbook", arguments: { topic: "auth" } }])
+      end
+    end.new
+  end
+
+  # A minimal MCP manager double whose only tool is the "lookup_runbook"
+  # built-in ToolLoop stub -- enough to make Mock emit a tool call so a
+  # step's transcript grows across multiple turns without needing a real
+  # skill/registry fixture.
+  def lookup_tool_mcp_manager
+    Class.new do
+      def list_tools
+        [{ name: "lookup_runbook", description: "Look up a runbook", input_schema: {}, server: "local" }]
+      end
+
+      def call_tool(*, **)
+        "unused -- lookup_runbook is handled by ToolLoop's built-in stub"
+      end
+
+      def close; end
+    end.new
+  end
 
   def tool_calling_engine
     workflow = Riggs::Workflow::Loader.load(path: "config/riggs/workflows/example_triage.yml")

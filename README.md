@@ -51,6 +51,20 @@ riggs workflow:run example_triage --user=eng_bob --auto-approve
 
 Workflows live in `config/riggs/workflows/*.yml`. See `example_triage.yml` for branching (`if contains ERROR`), HITL (`gates: [approval]`), templates (`{{workflow.step.var}}`), and `max_llm_calls` / `timeout_seconds` guardrails.
 
+Three more keys govern the token budget (all optional; defaults shown):
+
+```yaml
+context_window: medium      # short (8,000) | medium (32,000) | full (128,000) | an integer token budget
+reserve_tokens: 16384       # headroom that absorbs pre-flight estimation error (capped at a quarter of the budget)
+keep_recent_tokens: 20000   # most recent turns kept verbatim when compacting (capped at half the ceiling)
+```
+
+The budget in force for a request is the workflow's `context_window`, or the model's own context window when that is lower and the model is known — the intra-step tool loop knows the model it last called, while cross-step history is selected before any model has been chosen and so is budgeted by `context_window` alone. The effective ceiling is that budget less `reserve_tokens`.
+
+Both derived knobs are scaled to the budget in force: `reserve_tokens` is capped at a quarter of it, and `keep_recent_tokens` at half the resulting ceiling. The cap applies to explicitly configured values too. The defaults suit a large budget; taken literally against `context_window: short` a 16,384-token reserve would leave a ceiling of 0, and against `medium` a 20,000-token keep_recent is larger than the ceiling compaction is trying to get under — a value that breaks the ceiling is lowered rather than honoured.
+
+When a transcript — cross-step history or an in-progress tool loop — would exceed the ceiling, Riggs summarizes older turns through the same relay chain and keeps the most recent turns verbatim, rather than growing the request unbounded or erroring. `riggs workflow:inspect SESSION_ID` reports tokens in/out and cost per step and per session, each with explicit coverage (e.g. `12,400 tokens over 6 of 9 calls · $0.0184 over 6 of 9 priced`) — unmeasured or unpriced calls are never shown as zero.
+
 ```bash
 # Interactive composer (TTY): prompts for triggers, relay_chain, steps, gates
 riggs workflow:new my_playbook
@@ -129,6 +143,25 @@ riggs providers:ping cursor
 **CLI vs cloud:** use `cursor` / `claude_cli` / `codex` for short playbook steps. Use `cursor_cloud` when the step should run a full Cursor cloud agent against a git repo (heavier, slower, requires `repos:`).
 
 Configure credentials via env or `.agent_hubrc` `providers:`.
+
+**Unmetered chains.** `cursor`, `cursor_cli`, `cursor_cloud`, `claude_cli`, `anthropic_cli`, `codex`, and `openai_cli` report no token usage — there is nothing in their response to measure. On a relay chain built entirely from those providers there is never an anchor, so every size Riggs computes on that run is a 4-characters-per-token estimate rather than a measurement. Compaction still runs on those estimates, at both the cross-step and tool-loop sites — a run that would otherwise blow its context degrades better by compacting than by growing unbounded — but `reserve_tokens` is absorbing a much larger error than on a metered chain. The run logs one `compaction_unanchored` audit event (`{chain: [...], basis: "character_estimate"}`) per session to say so.
+
+### Pricing and context windows
+
+`Riggs::ModelInfo::TABLE` ships one row per model with both its price (USD per 1,000,000 tokens) and its context window, since the two are keyed identically. `Riggs::ModelInfo::AS_OF` is the date those numbers were last checked against vendor pricing pages — treat a stale `AS_OF` as a reason to re-verify before trusting a cost figure. `.agent_hubrc` `pricing:` overrides the shipped rate for a model by name and take effect immediately on every `cost_usd` reported for that provider:
+
+```yaml
+# .agent_hubrc
+providers:
+  anthropic:
+    pricing:
+      claude-opus-5: { input: 15.0, output: 75.0, cache_read: 1.5, cache_write: 18.75 }
+```
+
+Some shipped table rows also carry a `promotional:` overlay — its own `input`/`output`/`cache_read`/`cache_write` rates plus an `until:` date (inclusive). While the promo is live it is used in place of the base rate automatically; once `until` passes, the base rate applies again with no table edit required. A `.agent_hubrc` override always wins over both the base rate and any live promotional rate.
+
+The spec also defines a same-shaped `context_windows:` override block (`context_windows: { claude-opus-5: 200000 }`) for overriding a model's context window rather than its price, and `Workflow::Compactor` accepts it as a `model_overrides:` constructor argument. As shipped, `GraphEngine` does not read `.agent_hubrc`'s `context_windows:` block into that argument, so declaring one today has no runtime effect — only `pricing:` is wired end to end from `.agent_hubrc`.
+
 ## Memory (sqlite-memory)
 
 ```bash

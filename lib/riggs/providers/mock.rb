@@ -14,6 +14,7 @@ module Riggs
         if last_tool && last_tool[:role].to_s == "tool"
           return {
             provider: name,
+            model: options[:model],
             content: "classification=OK; used_tool=#{last_tool[:name]}; result=#{last_tool[:content].to_s[0, 80]}",
             tool_calls: [],
             usage: {}
@@ -35,6 +36,7 @@ module Riggs
           tname = tool[:name] || tool["name"]
           return {
             provider: name,
+            model: options[:model],
             content: "",
             tool_calls: [{
               id: "mock_#{SecureRandom.hex(4)}",
@@ -48,6 +50,7 @@ module Riggs
         if user_text.start_with?("TOOL:")
           return {
             provider: name,
+            model: options[:model],
             content: user_text,
             tool_calls: parse_tool_line(user_text),
             usage: {}
@@ -63,11 +66,19 @@ module Riggs
                end
 
         tool_calls = parse_tool_line(body)
+        # No usage, deliberately, and the same on every branch above. This
+        # provider has no tokenizer: it once reported STRING LENGTHS as
+        # prompt_tokens/completion_tokens, which the pipeline recorded as
+        # measured tokens roughly 4x too large. A demo run then displayed
+        # character counts wearing a token label, which is worse than
+        # displaying nothing. Unmeasured is the honest answer, and it is
+        # exactly what a CLI-only chain reports.
         {
           provider: name,
+          model: options[:model],
           content: tool_calls.empty? ? body : "",
           tool_calls: tool_calls,
-          usage: { prompt_tokens: user_text.length, completion_tokens: body.length }
+          usage: {}
         }
       end
     end

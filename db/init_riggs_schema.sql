@@ -50,6 +50,25 @@ CREATE TABLE IF NOT EXISTS riggs_audit (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Per provider call metering. Token columns are nullable with no default:
+-- NULL means the provider reported no usage (all CLI providers), which is a
+-- different fact from a genuine zero. DEFAULT 0 would erase that distinction.
+CREATE TABLE IF NOT EXISTS riggs_provider_calls (
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id         TEXT NOT NULL REFERENCES riggs_sessions(id),
+  step_key           TEXT NOT NULL,
+  provider           TEXT NOT NULL,
+  model              TEXT,
+  relay_attempt      INTEGER NOT NULL DEFAULT 1,
+  measured           INTEGER NOT NULL DEFAULT 0,
+  input_tokens       INTEGER,
+  output_tokens      INTEGER,
+  cache_read_tokens  INTEGER,
+  cache_write_tokens INTEGER,
+  cost_usd           REAL,
+  created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 -- FTS fallback when sqlite-memory / sqlite-vector extensions are unavailable
 CREATE TABLE IF NOT EXISTS riggs_memories (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,3 +105,4 @@ DROP INDEX IF EXISTS idx_riggs_messages_session;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_riggs_messages_session_seq ON riggs_messages(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_riggs_audit_session ON riggs_audit(session_id);
 CREATE INDEX IF NOT EXISTS idx_riggs_memories_namespace ON riggs_memories(namespace);
+CREATE INDEX IF NOT EXISTS idx_riggs_provider_calls_session ON riggs_provider_calls(session_id, step_key);

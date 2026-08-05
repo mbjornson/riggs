@@ -8,18 +8,29 @@ module Riggs
     # Multi-turn provider ↔ MCP tool execution until final text or guardrails.
     class ToolLoop
       def initialize(router:, mcp_manager:, skill_registry:, audit:, llm_calls:, max_llm_calls:, timeout_seconds:, started_at:,
-                     session_id:, persist: nil)
+                     session_id:, persist: nil, record_call: nil, compactor: nil)
         @router = router
         @mcp_manager = mcp_manager
         @skill_registry = skill_registry
         @audit = audit
         # Optional: a nil persist keeps the loop usable without any storage.
         @persist = persist
+        # Same contract for metering — a loop with no storage records nothing.
+        @record_call = record_call
+        # Same contract again — a loop with no compactor never trims messages.
+        @compactor = compactor
         @llm_calls = llm_calls
         @max_llm_calls = max_llm_calls.to_i
         @timeout_seconds = timeout_seconds
         @started_at = started_at
         @session_id = session_id
+        # Anchor: the measured PROMPT size of the most recent response (uncached
+        # input plus cache reads plus cache writes — see Usage.prompt_tokens),
+        # paired with how many of the current messages it covered. Lets
+        # Usage.estimate avoid re-heuristicating turns a real response measured.
+        @anchor_tokens = nil
+        @anchored_count = 0
+        @last_model = nil
       end
 
       attr_reader :llm_calls
@@ -35,15 +46,34 @@ module Riggs
 
         loop do
           check_guardrails!
+          compact_if_needed!(messages, step)
+          # Checked twice on purpose: compaction can itself make a provider
+          # call, so the budget it consumed has to be tested before the
+          # answering call is dispatched. Skipping this let max_llm_calls: 1
+          # buy two calls.
+          check_guardrails!
           result = @router.call(
             chain: chain,
             messages: messages,
             system: sys,
             timeout: remaining_timeout,
             session_id: @session_id,
-            tools: tools.empty? ? nil : tools
+            tools: tools.empty? ? nil : tools,
+            on_failed_attempt: ->(provider:, attempt:, **) { record_failed_attempt(step, provider, attempt) }
           )
           @llm_calls += 1
+          @record_call&.call(
+            step_key: step.id, provider: result[:provider], model: result[:model],
+            relay_attempt: result[:relay_attempt] || 1,
+            usage: result[:usage], cost_usd: result[:cost_usd]
+          )
+          if result[:usage] && result[:usage][:measured]
+            # nil when the vendor reported no prompt-side field at all: that is
+            # "no anchor, estimate everything", not "the prompt was empty".
+            @anchor_tokens = Usage.prompt_tokens(result[:usage])
+            @anchored_count = @anchor_tokens ? messages.length : 0
+          end
+          @last_model = result[:model]
 
           tool_calls = Array(result[:tool_calls])
           tool_calls = parse_tool_line(result[:content]) if tool_calls.empty? && result[:content].to_s.start_with?("TOOL:")
@@ -84,6 +114,35 @@ module Riggs
       end
 
       private
+
+      # Mutates `messages` in place so the caller's array — which GraphEngine
+      # also holds a reference to — reflects the compacted transcript.
+      # A dispatched attempt that failed is a call that happened and measured
+      # nothing. Recording it unmeasured keeps the coverage denominator honest;
+      # omitting it made every session look fully accounted for.
+      def record_failed_attempt(step, provider, attempt)
+        @record_call&.call(
+          step_key: step.id, provider: provider, model: nil,
+          relay_attempt: attempt, usage: Usage::EMPTY.dup, cost_usd: nil
+        )
+      end
+
+      def compact_if_needed!(messages, step)
+        return unless @compactor
+        return unless @compactor.over_budget?(messages, model: @last_model,
+                                                        anchor: @anchor_tokens, anchored_count: @anchored_count)
+
+        outcome = @compactor.compact(messages: messages, step_key: step.id, model: @last_model,
+                                     timeout: remaining_timeout)
+        @llm_calls += outcome[:llm_calls].to_i
+        messages.replace(outcome[:messages])
+        @anchor_tokens = nil
+        @anchored_count = 0
+        @audit.call(session_id: @session_id, event_type: "context_compacted",
+                    payload: { step: step.id, strategy: outcome[:strategy],
+                               before: outcome[:before], after: outcome[:after],
+                               collapsed: outcome[:collapsed] })
+      end
 
       def persist_turn(role:, content:, step_key:, tool_call_id: nil, tool_name: nil, tool_calls: nil, provider: nil)
         @persist&.call(role: role, content: content, step_key: step_key, tool_call_id: tool_call_id,
@@ -160,7 +219,7 @@ module Riggs
       end
 
       def cli_only_chain?(chain)
-        Array(chain).all? { |n| %w[cursor cursor_cli claude_cli anthropic_cli codex openai_cli].include?(n.to_s) }
+        Providers::Router.unmetered_chain?(chain)
       end
 
       def parse_tool_line(content)

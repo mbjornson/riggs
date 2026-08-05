@@ -1,6 +1,7 @@
 # Token Ledger
 
-Actuals per feature, recorded at completion. Same format and protocol as
+Actuals per feature, recorded at completion — what building the feature cost
+whoever built it, not what Riggs itself cost to build. Same format and protocol as
 agentcrm's `docs/superpowers/token-ledger.md` — after a few rows, estimating a
 new feature is a lookup (tasks × historical per-task average), not a guess.
 
@@ -15,6 +16,7 @@ new feature is a lookup (tasks × historical per-task average), not a guess.
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 1 | Phase 6 — message persistence + gate resume, audit event stream | 2026-08-04 | `phase-6-persistence-and-events` / #3 | 10 (R1.1–R1.5, R4.1–R4.5) | 1 | 20 | +1837/−32 | 122 | 2 impl (0 failed) + 1 Codex review | single commit | see session note ↓ | 2 agents in parallel on disjoint files over a shared storage layer landed first. Codex review found 4×P1 + 1×P2, all confirmed real, all fixed before merge |
 | 2 | Commit-time and CI quality gates | 2026-08-04 | `ci-commit-gates` / #4 | 3 | 3 | 9 | +457/−2 | 129 | 1 (0 failed) | 9m (14:23→14:32) | see session note ↓ | Pre-commit hook, gem-packaging gate, migration test. `docs/gaps.md` + this file folded in |
+| 3 | Phase 7 — token accounting + token-based compaction (closes `docs/gaps.md` #2, #3) | 2026-08-05 | `phase-7-token-accounting` / not yet opened | 13 (+ Task 2b, inserted mid-flight for promotional pricing; + 1 final review fix wave) | 30 | 35 | +5006/−62 | 234 | ~21 (14 implementers incl. 2b, 0 abandoned; 6 fix rounds — Tasks 2, 3, 7, 10, 11, 12; 1 stalled/resumed — Task 11; 1 final whole-branch review fix wave) | ~25h45m (2026-08-04 15:04→2026-08-05 16:49) | see session note ↓ | Not parallelizable like Phase 6: #3 (compaction) consumes #2's (accounting) measurement layer, so Phase A shipped completely on a green suite before Phase B started. Reviewer found and fixed 6+ plan-authored defects along the way (vacuous tests, wrong SQL, a swallowed-exception bug that would have silently defeated summarization in production) — see `.superpowers/sdd/2026-08-04-phase7-token-accounting/progress.md`. The final whole-branch review found 5 more blocking defects, all of them in what the shipped Loader defaults do when the three budget knobs meet each other, and all invisible to a suite whose every compaction test picked its own numbers — see `final-fix-report.md` in the same directory |
 
 **Session note (rows 1–2).** Both features were built in one Claude Code session,
 so the token and cost figures are session-wide and **cannot be split between the
@@ -27,3 +29,11 @@ number — the first per-feature figure will come from the next single-feature s
 The session reported 2464 lines added / 95 removed against 2294/34 actually
 committed. The difference is exploratory work, mutation testing, and reverted
 probes. Per the protocol above, that is real cost and is deliberately not netted out.
+
+**Session note (row 3).** Tokens in/out are not recorded for this row. Step 1
+of the protocol above ("run `/cost` or read the session usage panel") requires
+a human to read a panel this recording pass has no access to, so the cell is
+left as `see session note` rather than estimated or backed into from any other
+number — per the protocol's own rule, an unmeasured figure is not a zero. Fill
+in from the usage panel when available, following the per-feature (not
+session-wide) convention rows 1–2 were unable to establish.

@@ -198,6 +198,10 @@ module Riggs
         if m == "GET" && (sm = p.match(%r{\A/api/sessions/([^/]+)/stream\z}))
           return api_session_stream(req, sm[1])
         end
+        # Also registered before the bare /api/sessions/:id route so it cannot be swallowed.
+        if m == "GET" && (sm = p.match(%r{\A/api/sessions/([^/]+)/usage\z}))
+          return api_session_usage(sm[1])
+        end
         if m == "GET" && (sm = p.match(%r{\A/api/sessions/([^/]+)\z}))
           return api_show_session(sm[1])
         end
@@ -294,8 +298,9 @@ module Riggs
         raise Error, "Session not found" unless session
 
         audit = storage.list_audit(id)
+        steps_usage = storage.step_usage(id)
         storage.close
-        html(:session_show, title: "Session", session: session, audit: audit)
+        html(:session_show, title: "Session", session: session, audit: audit, steps_usage: steps_usage)
       end
 
       def session_decision(id, decision)
@@ -353,6 +358,15 @@ module Riggs
         rows = storage.list_audit(id)
         storage.close
         json_ok(rows)
+      end
+
+      def api_session_usage(id)
+        Auth.require!(@identity, "inspect_run")
+        sid = Storage.utf8(id)
+        storage = open_storage
+        data = { session: storage.session_usage(sid), steps: storage.step_usage(sid) }
+        storage.close
+        json_ok(data)
       end
 
       # Cursor-paged event poll. `last_id` echoes `after` on an empty page so a

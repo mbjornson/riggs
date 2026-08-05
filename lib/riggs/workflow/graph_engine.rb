@@ -9,12 +9,12 @@ require_relative "../memory/service"
 require_relative "../mcp/manager"
 require_relative "loader"
 require_relative "tool_loop"
+require_relative "compactor"
+require_relative "../usage"
 
 module Riggs
   module Workflow
     class GraphEngine
-      CONTEXT_LIMITS = { short: 2, medium: 6, full: 50 }.freeze
-
       attr_reader :workflow, :user_identity, :session_id, :audit_log, :outputs, :status, :llm_calls
 
       def initialize(workflow:, user_identity:, storage: nil, db_path: nil, hub_config: {}, gate_handler: nil,
@@ -37,6 +37,7 @@ module Riggs
         @status = :pending
         @llm_calls = 0
         @started_at = nil
+        @compaction_announced = false
       end
 
       # Restarts a paused run from its stored resume_state. The gate that paused
@@ -105,6 +106,12 @@ module Riggs
         @outputs = state[:outputs].is_a?(Hash) ? state[:outputs] : {}
         @outputs[:input] ||= state[:input] || {}
         @llm_calls = state[:llm_calls].to_i
+        # A resumed run is a fresh GraphEngine instance with a fresh
+        # @compaction_announced ivar, but the event it guards must land at
+        # most once per SESSION, not once per instance -- derived from audit
+        # history rather than threaded through resume_state so it is correct
+        # even for a session paused before this guard existed.
+        @compaction_announced = already_announced_unanchored_compaction?
 
         # Atomic paused->running claim. The checks above give good error
         # messages, but only this decides who actually runs: a second resumer
@@ -187,8 +194,12 @@ module Riggs
 
           resolved_input = Loader.resolve_context(current.input, workflow_context)
           system_prompt = build_system_prompt(current)
-          messages = build_messages(resolved_input)
+          # Chain first: cross-step compaction routes its summarization call
+          # through this step's own chain, so it has to be resolved before the
+          # history that may need compacting is assembled.
           chain = @router.chain_for(step: current, workflow: @workflow)
+          announce_unanchored_compaction!(chain)
+          messages = build_messages(resolved_input, step: current, chain: chain)
           persist_bridge(role: "user", content: resolved_input, step_key: current.id)
 
           loop_runner = ToolLoop.new(
@@ -197,6 +208,8 @@ module Riggs
             skill_registry: @skill_registry,
             audit: method(:audit_bridge),
             persist: method(:persist_bridge),
+            record_call: method(:record_provider_call),
+            compactor: compactor_for(chain),
             llm_calls: @llm_calls,
             max_llm_calls: @workflow[:max_llm_calls],
             timeout_seconds: @workflow[:timeout_seconds],
@@ -260,6 +273,18 @@ module Riggs
         log_event(event_type, payload)
       end
 
+      # The single writer for riggs_provider_calls. ToolLoop receives this as an
+      # injected callable; cross-step compaction calls it directly. One writer
+      # means the column set cannot drift between the two call sites.
+      def record_provider_call(step_key:, provider:, model:, relay_attempt:, usage:, cost_usd:)
+        return unless @session_id
+
+        @storage.record_provider_call(
+          session_id: @session_id, step_key: step_key, provider: provider, model: model,
+          relay_attempt: relay_attempt, usage: usage, cost_usd: cost_usd
+        )
+      end
+
       # Writes one conversation turn as it happens; seq is allocated by Storage.
       def persist_bridge(role:, content:, step_key:, tool_call_id: nil, tool_name: nil, tool_calls: nil, provider: nil)
         return unless @session_id
@@ -311,13 +336,109 @@ module Riggs
         parts.join("\n\n")
       end
 
-      def build_messages(resolved_input)
-        window = CONTEXT_LIMITS.fetch(@workflow[:context_window], 6)
-        recent = @workflow[:steps].map(&:output_var).map(&:to_sym).select { |k| @outputs.key?(k) }.last(window)
-        history = recent.map do |var|
-          { role: "assistant", content: @outputs[var].to_s }
-        end
-        history + [{ role: "user", content: resolved_input }]
+      # Assembles the prior step outputs, oldest first, and compacts them if
+      # they exceed the token budget.
+      #
+      # This used to SKIP any turn that would push the total over the ceiling.
+      # That silently discarded step outputs -- no summary, no audit event, no
+      # error -- and because the walk ran newest-to-oldest and kept going, the
+      # turn most likely to be dropped was the newest one: the immediate
+      # handoff to the step being built. A decision or identifier produced by
+      # step N could simply never reach step N+1, while an older, smaller
+      # output survived. Summarizing collapses the same excess without
+      # deciding, unilaterally and invisibly, that some step's work did not
+      # matter.
+      def build_messages(resolved_input, step:, chain:)
+        comp = compactor_for(chain)
+        vars = @workflow[:steps].map(&:output_var).map(&:to_sym).select { |k| @outputs.key?(k) }
+        history = vars.map { |var| { role: "assistant", content: @outputs[var].to_s } }
+        messages = history + [{ role: "user", content: resolved_input }]
+        return messages unless comp.over_budget?(messages, model: nil)
+
+        compact_history(comp, messages, step)
+      end
+
+      def compact_history(comp, messages, step)
+        outcome = comp.compact(messages: messages, step_key: step.id, model: nil,
+                               timeout: remaining_timeout)
+        @llm_calls += outcome[:llm_calls].to_i
+        log_event("context_compacted",
+                  { step: step.id, site: "cross_step", strategy: outcome[:strategy],
+                    before: outcome[:before], after: outcome[:after],
+                    collapsed: outcome[:collapsed] })
+        outcome[:messages]
+      end
+
+      # What is left of the run's wall-clock budget, mirroring ToolLoop's own.
+      # Handing a cross-step compaction the FULL timeout_seconds let a
+      # compaction starting a second before the deadline run the whole budget
+      # again on top of it.
+      def remaining_timeout
+        total = @workflow[:timeout_seconds]
+        return total unless @started_at && total
+
+        [total - (Time.now - @started_at), 1].max
+      end
+
+      # Memoized per chain, not globally: Router#chain_for honors a step's own
+      # relay_chain/provider override, and Compactor#compact routes its
+      # summarization call through @chain. A single first-step-only Compactor
+      # would silently summarize every later step's transcript through the
+      # first step's provider chain instead of its own the moment ToolLoop
+      # starts calling #compact. Most workflows share one chain across steps,
+      # so this cache still collapses to a single Compactor in the common case.
+      # Keyed on the session as well as the chain. session_id is captured at
+      # construction, and a Compactor holding a session_id with no row writes
+      # an audit that fails the riggs_audit -> riggs_sessions foreign key,
+      # which call_router's rescue turns into a silent degrade to truncation.
+      # That failure mode has already shipped once (Task 12); keying on the
+      # session means a compactor built before the session existed is never
+      # reused after it does.
+      def compactor_for(chain)
+        key = [Array(chain).map(&:to_s), @session_id]
+        @compactors ||= {}
+        @compactors[key] ||= Compactor.new(
+          router: @router,
+          chain: key.first,
+          budget: @workflow[:context_window],
+          reserve: @workflow[:reserve_tokens],
+          keep_recent: @workflow[:keep_recent_tokens],
+          record_call: method(:record_provider_call),
+          # So a summarization failure the Compactor rescues lands in this
+          # run's event stream rather than only on stderr.
+          audit: method(:audit_bridge),
+          session_id: @session_id
+        )
+      end
+
+      # No provider on this chain reports usage, so there is no anchor: every
+      # size on this run is a 4-characters-per-token estimate rather than a
+      # measurement. Compaction still runs -- a run that would otherwise blow
+      # its context degrades gracefully instead of erroring -- but the reserve
+      # is absorbing a much larger error than on a metered chain, which is
+      # worth one audit event per run.
+      def announce_unanchored_compaction!(chain)
+        return if @compaction_announced
+        return unless Providers::Router.unmetered_chain?(chain)
+
+        @compaction_announced = true
+        log_event("compaction_unanchored",
+                  { chain: Array(chain).map(&:to_s), basis: "character_estimate" })
+      end
+
+      # Storage, not resume_state, is the source of truth for "has this
+      # session already announced" -- resume_state is only written at pause
+      # time (fine for the common case), but a plain audit-history check also
+      # covers a session paused before this guard shipped, and any future
+      # resume path that does not happen to round-trip through pause_run!.
+      #
+      # This matches the CURRENT event name only. A session paused before the
+      # compaction_unavailable -> compaction_unanchored rename carries only the
+      # old row, so resuming it announces once more under the new name: one
+      # extra event on sessions that straddle the upgrade, which is preferable
+      # to carrying the retired vocabulary forward in the matcher forever.
+      def already_announced_unanchored_compaction?
+        @storage.list_audit(@session_id).any? { |row| row["event_type"] == "compaction_unanchored" }
       end
 
       def persist_memory(step, content)
