@@ -1,6 +1,7 @@
 # Token Ledger
 
-Actuals per feature, recorded at completion. Same format and protocol as
+Actuals per feature, recorded at completion — what building the feature cost
+whoever built it, not what Riggs itself cost to build. Same format and protocol as
 agentcrm's `docs/superpowers/token-ledger.md` — after a few rows, estimating a
 new feature is a lookup (tasks × historical per-task average), not a guess.
 

@@ -19,15 +19,18 @@ wrong measurement: compaction needs a per-model context window keyed exactly the
 way pricing is keyed, and it needs the measurement available *before* a request
 is sent rather than after.
 
-### Correction to `gaps.md` #2
+### Reach of `gaps.md` #2's "done when"
 
-The recorded "done when" for #2 read: *"...and the ledger fills itself."* That is
-not achievable and the line is being corrected as part of this work.
-`docs/token-ledger.md` records what it cost **Claude Code to build Riggs**
-(`/cost`, `$46.99`). Token accounting in Riggs measures what **Riggs workflows
-spend calling providers**. Riggs has never run a workflow to build itself, so no
-amount of provider accounting can populate that ledger. The rest of #2 — per-step
-and per-session counts as the prerequisite for #3 — is unaffected.
+The recorded "done when" for #2 read: *"...and the ledger fills itself."*
+`docs/token-ledger.md` records per-feature build cost — what the person building
+a feature spent building it. Token accounting produces exactly that number for a
+feature built by running Riggs workflows, so the line holds for the case it
+describes.
+
+It does not reach the ledger's existing rows. Those are Riggs' own features,
+built in Claude Code sessions rather than through Riggs, so their figures come
+from `/cost` by hand and no amount of provider accounting will supply them. That
+is a property of who did the building, not a mismatch between the two numbers.
 
 ## Non-goals
 

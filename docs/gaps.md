@@ -14,12 +14,13 @@ and two in
 - ~~**#4** Audit event stream (poll + SSE)~~ — shipped
 - ~~**#2** Token accounting~~ — shipped. A completed run reports tokens in/out
   and cost per step and per session, each with coverage on both counters.
-  Correction to the original "done when," which said this would make
-  [`token-ledger.md`](token-ledger.md) "fill itself": that ledger records what
-  it cost Claude Code to *build* Riggs; this feature measures what Riggs
-  *workflows* spend calling providers. Riggs has never run a workflow to build
-  itself, so no amount of provider accounting could populate that ledger —
-  they are two unrelated token streams.
+  That is the figure [`token-ledger.md`](token-ledger.md)'s "Tokens in/out"
+  column asks for — what a user spent building a feature — so for a feature
+  built by running Riggs workflows, `riggs workflow:inspect SESSION_ID` now
+  fills the column directly, as the original "done when" anticipated. What it
+  cannot do is populate rows whose work happened outside Riggs: rows 1–3 are
+  Riggs' own features, built in Claude Code sessions rather than through Riggs,
+  so those figures are still read from `/cost` by hand.
 - ~~**#3** Token-based context window and compaction~~ — shipped.
   `context_window` is now a token budget (`short`/`medium`/`full`/an integer),
   not a step count, and a run whose transcript exceeds it compacts instead of
