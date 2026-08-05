@@ -210,6 +210,24 @@ class TestGraphEngine < Minitest::Test
                     "history must stay chronological even though selection walks backwards"
   end
 
+  # first (older) is small enough to fit the ceiling on its own; second
+  # (newer) alone already blows past it. A `break` on the first oversized
+  # turn stops the newest-to-oldest walk before `first` is ever evaluated, so
+  # it would be silently dropped even though there was ample room for it.
+  # `next` skips only the oversized turn and keeps walking, so `first`
+  # survives. test_build_messages_drops_oldest_outputs_over_budget cannot
+  # distinguish the two because both of its outputs are equally oversized.
+  def test_build_messages_keeps_an_older_turn_that_fits_past_a_newer_oversized_one
+    engine = engine_with(context_window: 100, reserve_tokens: 0)
+    engine.instance_variable_set(:@outputs, { first: "x" * 20, second: "y" * 20_000 })
+
+    messages = engine.send(:build_messages, "next input")
+
+    assert(messages.any? { |m| m[:content] == "x" * 20 },
+           "an older turn that fits the budget must survive a newer oversized one, " \
+           "not be discarded because the walk stopped early")
+  end
+
   private
 
   # Builds a minimal GraphEngine directly from a workflow hash rather than

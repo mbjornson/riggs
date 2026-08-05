@@ -325,9 +325,11 @@ module Riggs
       end
 
       # Selects prior step outputs by token budget rather than step count.
-      # The walk is newest-to-oldest so the most recent context survives, but
-      # the emitted array is chronological -- a provider reading it in selection
-      # order would see the conversation backwards.
+      # The walk is newest-to-oldest; a turn that would push the total over
+      # the ceiling is skipped rather than stopping the walk, so history can
+      # end up non-contiguous -- an older turn that fits is kept even when a
+      # newer one did not. The emitted array is chronological -- a provider
+      # reading it in selection order would see the conversation backwards.
       def build_messages(resolved_input)
         ceiling = compactor.ceiling(model: nil)
         vars = @workflow[:steps].map(&:output_var).map(&:to_sym).select { |k| @outputs.key?(k) }
@@ -337,7 +339,7 @@ module Riggs
         vars.reverse_each do |var|
           turn = { role: "assistant", content: @outputs[var].to_s }
           size = Usage.estimate([turn])
-          break if used + size > ceiling
+          next if used + size > ceiling
 
           used += size
           kept.unshift(turn)
