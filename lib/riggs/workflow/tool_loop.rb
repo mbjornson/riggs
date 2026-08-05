@@ -8,13 +8,15 @@ module Riggs
     # Multi-turn provider ↔ MCP tool execution until final text or guardrails.
     class ToolLoop
       def initialize(router:, mcp_manager:, skill_registry:, audit:, llm_calls:, max_llm_calls:, timeout_seconds:, started_at:,
-                     session_id:, persist: nil)
+                     session_id:, persist: nil, record_call: nil)
         @router = router
         @mcp_manager = mcp_manager
         @skill_registry = skill_registry
         @audit = audit
         # Optional: a nil persist keeps the loop usable without any storage.
         @persist = persist
+        # Same contract for metering — a loop with no storage records nothing.
+        @record_call = record_call
         @llm_calls = llm_calls
         @max_llm_calls = max_llm_calls.to_i
         @timeout_seconds = timeout_seconds
@@ -44,6 +46,11 @@ module Riggs
             tools: tools.empty? ? nil : tools
           )
           @llm_calls += 1
+          @record_call&.call(
+            step_key: step.id, provider: result[:provider], model: result[:model],
+            relay_attempt: result[:relay_attempt] || 1,
+            usage: result[:usage], cost_usd: result[:cost_usd]
+          )
 
           tool_calls = Array(result[:tool_calls])
           tool_calls = parse_tool_line(result[:content]) if tool_calls.empty? && result[:content].to_s.start_with?("TOOL:")

@@ -197,6 +197,7 @@ module Riggs
             skill_registry: @skill_registry,
             audit: method(:audit_bridge),
             persist: method(:persist_bridge),
+            record_call: method(:record_provider_call),
             llm_calls: @llm_calls,
             max_llm_calls: @workflow[:max_llm_calls],
             timeout_seconds: @workflow[:timeout_seconds],
@@ -258,6 +259,18 @@ module Riggs
 
       def audit_bridge(session_id:, event_type:, payload: {})
         log_event(event_type, payload)
+      end
+
+      # The single writer for riggs_provider_calls. ToolLoop receives this as an
+      # injected callable; cross-step compaction calls it directly. One writer
+      # means the column set cannot drift between the two call sites.
+      def record_provider_call(step_key:, provider:, model:, relay_attempt:, usage:, cost_usd:)
+        return unless @session_id
+
+        @storage.record_provider_call(
+          session_id: @session_id, step_key: step_key, provider: provider, model: model,
+          relay_attempt: relay_attempt, usage: usage, cost_usd: cost_usd
+        )
       end
 
       # Writes one conversation turn as it happens; seq is allocated by Storage.

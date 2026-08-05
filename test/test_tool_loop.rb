@@ -90,7 +90,47 @@ class TestToolLoop < Minitest::Test
     refute_empty outcome[:content], "a loop without a persist callback still returns its answer"
   end
 
+  def test_records_one_provider_call_per_turn
+    recorded = []
+    router = Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } })
+    loop_runner = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: nil, skill_registry: nil,
+      audit: ->(**) {}, record_call: ->(**kw) { recorded << kw },
+      llm_calls: 0, max_llm_calls: 5, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+
+    loop_runner.run(step: build_step, chain: ["mock"], messages: [{ role: "user", content: "hello" }],
+                    system_prompt: "sys", io: StringIO.new)
+
+    assert_equal 1, recorded.length
+    assert_equal "triage", recorded.first[:step_key]
+    assert recorded.first[:usage][:measured]
+    assert_equal 1, recorded.first[:relay_attempt]
+  end
+
+  def test_runs_without_a_record_call_callable
+    router = Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } })
+    loop_runner = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: nil, skill_registry: nil, audit: ->(**) {},
+      llm_calls: 0, max_llm_calls: 5, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+
+    result = loop_runner.run(step: build_step, chain: ["mock"],
+                             messages: [{ role: "user", content: "hello" }],
+                             system_prompt: "sys", io: StringIO.new)
+
+    refute_nil result[:content]
+  end
+
   private
+
+  def build_step
+    Riggs::Workflow::StepNode.from_hash(
+      { "id" => "triage", "agent" => "triager", "input" => "x", "output_var" => "out" }
+    )
+  end
 
   def tool_calling_engine
     workflow = Riggs::Workflow::Loader.load(path: "config/riggs/workflows/example_triage.yml")
