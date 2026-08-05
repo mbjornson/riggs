@@ -525,7 +525,9 @@ In `format_skill`, add the same key:
     end
 ```
 
-Replace `list` with a version that carries the description alongside each version, and extract the version-sorting rescue that `list` already used inline so both places share it:
+Replace `list` with a version that carries the description alongside each version, and extract the version-sorting rescue that `list` already used inline so both places share it.
+
+**Placement matters:** `list` is public (it sits above the `private` keyword in this class, alongside `load` and `list_names`). The two new helpers, `summarize` and `sortable_version`, are internals and must go **below** the `private` keyword, with the other private methods. Pasting all three together above `private` would silently widen the class's public API.
 
 ```ruby
     def list
@@ -896,15 +898,20 @@ Add `require "stringio"` to the top of `test/test_skills.rb` if it is not alread
 
 The keyword is `provider_router:` — `GraphEngine.new(workflow:, user_identity:, storage: nil, db_path: nil, hub_config: {}, gate_handler: nil, provider_router: nil, skill_registry: nil, mcp_manager: nil, mcp_client: nil)`. Do not change `GraphEngine` to suit the test.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 2: Run the test — it should PASS**
 
 Run: `bundle exec ruby -Ilib -Itest test/test_skills.rb`
-Expected: fails. Before Tasks 1-5 it could not load the skill at all; run it now to confirm it passes only because of this plan's work, and note in the task report which assertion was the last to go green.
 
-- [ ] **Step 3: Confirm it passes**
+Expected: **pass**. This is the one test in the plan with no red phase, and deliberately so: Tasks 1-5 already built everything it exercises, so it is an integration proof, not a unit being driven out. No implementation change should be needed — if one is, that is a gap in Tasks 1-5 and the fix belongs in the task that owns it, not here.
 
-Run: `bundle exec ruby -Ilib -Itest test/test_skills.rb`
-Expected: pass. No implementation change should be needed — if one is, that is a gap in Tasks 1-5 and belongs there, not here.
+- [ ] **Step 3: Prove the test is not vacuous**
+
+A test that passes the moment it is written has proven nothing yet. Establish that each half is load-bearing:
+
+1. In `lib/riggs/skills/registry.rb`, temporarily change `resolve_prompt` so the body branch is skipped (`return body.to_s if false`). Re-run. Expected: the "Report correctness problems before style ones." assertion fails — the body genuinely reaches the model through this path. Revert.
+2. In `lib/riggs/skills/frontmatter.rb`, temporarily make `parse` take the **last** delimiter instead of the first (`.find` → `.to_a.reverse.find`). Re-run. Expected: the "Always name the file and line." assertion fails — content after the horizontal rule is genuinely body. Revert.
+
+Record both outcomes in the task report. If either mutation leaves the test green, the assertion is not testing what it claims and must be strengthened before this task completes.
 
 - [ ] **Step 4: Document the format in the README**
 
