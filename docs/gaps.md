@@ -113,7 +113,7 @@ JSONL to stdout for scripting and CI.
 
 ## Deferred from Phase 7
 
-Four items surfaced during the Phase 7 build and triaged as non-blocking at
+Five items surfaced during the Phase 7 build and triaged as non-blocking at
 merge. Ordered by consequence.
 
 **Compaction's reported sizes are unanchored.** `Compactor#compact` computes
@@ -141,6 +141,20 @@ answered, and the window in `Compactor#ceiling`, which does not. Returning the
 model's window from `Router` alongside `usage:` and `cost_usd:` would close it
 under the rule `pricing:` already follows, with no new precedence question about
 which provider in a chain wins.
+
+**No cross-session usage rollup.** Every usage surface stops at a single
+session: `Storage#session_usage` and `#step_usage`, `riggs workflow:inspect`,
+and `GET /api/sessions/:id/usage`. A [`token-ledger.md`](token-ledger.md) row
+covers a whole feature, and a feature spans many sessions — row 3 covers 30
+commits over roughly 26 hours. So a user building a feature through Riggs gets
+one correct number per session and still adds them up by hand, which is the
+arithmetic #2's "done when" was meant to retire. This is unbuilt scope, not a
+defect: what shipped is correct at the scope it reports. The query is nearly
+free — `USAGE_SELECT` is a bare aggregate and each caller appends its own
+`WHERE`, and `SUM`'s NULL-skipping keeps both coverage counters honest at any
+scope. The open question is the key. "Feature" is not a Riggs concept, so a
+rollup has to be scoped by date range, by an explicit list of session IDs, or by
+a new label on sessions — that choice should be made before the SQL is written.
 
 **`Compactor#call_router`'s rescue is still broad.** It now emits a
 `compaction_degraded` audit event carrying the exception class and message, so a
