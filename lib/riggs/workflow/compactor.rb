@@ -14,7 +14,7 @@ module Riggs
                        "Write it as a factual record, not a reply."
 
       def initialize(router:, chain:, budget:, reserve:, keep_recent:,
-                     model_overrides: {}, record_call: nil, audit: nil)
+                     model_overrides: {}, record_call: nil, audit: nil, session_id: nil)
         @router = router
         @chain = chain
         @budget = budget.to_i
@@ -23,6 +23,13 @@ module Riggs
         @model_overrides = model_overrides || {}
         @record_call = record_call
         @audit = audit
+        # Threaded into the summarization call's own @router.call so a
+        # real (storage-backed) Router audit callback can find the session
+        # this compaction belongs to -- a nil session_id serializes to "" in
+        # Storage#audit, which fails the riggs_audit -> riggs_sessions
+        # foreign key and gets silently swallowed by call_router's rescue,
+        # degrading every real compaction to "truncated" (see Task 12 review).
+        @session_id = session_id
       end
 
       # The lower of the workflow budget and the model's own window, less the
@@ -97,7 +104,8 @@ module Riggs
         @router.call(
           chain: @chain,
           messages: [{ role: "user", content: "#{SUMMARY_PROMPT}\n\n#{transcript}" }],
-          timeout: 60
+          timeout: 60,
+          session_id: @session_id
         )
       rescue StandardError
         # Degrading beats failing: the caller drops the old turns instead.

@@ -371,7 +371,8 @@ module Riggs
           budget: @workflow[:context_window],
           reserve: @workflow[:reserve_tokens],
           keep_recent: @workflow[:keep_recent_tokens],
-          record_call: method(:record_provider_call)
+          record_call: method(:record_provider_call),
+          session_id: @session_id
         )
       end
 

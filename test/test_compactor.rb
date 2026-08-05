@@ -173,6 +173,45 @@ class TestCompactor < Minitest::Test
   # orphaned. keep_recent: 40 is sized (verified by hand-tracing
   # Usage.heuristic) so the naive split lands index 3 -- squarely between
   # the two tool turns -- before safe_boundary's correction.
+  # GraphEngine always builds its production Router with a real audit:
+  # callback wired to storage (audit: ->(**kwargs) { @storage.audit(**kwargs) }).
+  # Storage#audit serializes a nil session_id to "" (via utf8), which fails
+  # the riggs_audit -> riggs_sessions foreign key the moment the summarization
+  # call succeeds and Router#call tries to record "provider_success". Without
+  # session_id: threaded through to that call, the exception is silently
+  # rescued by call_router and every real compaction degrades to "truncated"
+  # -- losing context with no summary and no recorded token cost, even though
+  # nothing in the test suite (which never wires a real audit: callback) can
+  # see it happen.
+  def test_summarizes_instead_of_truncating_when_the_router_audit_is_wired_to_real_storage
+    Dir.mktmpdir("riggs-compactor-audit") do |dir|
+      db_path = File.join(dir, "db", "riggs.sqlite3")
+      storage = Riggs::Storage.new(db_path: db_path)
+      session_id = storage.create_session(workflow_name: "wf", user_id: "u", memory_namespace: "ns")
+
+      router = Riggs::Providers::Router.new(
+        hub_providers: { mock: { type: "mock" } },
+        audit: ->(**kwargs) { storage.audit(**kwargs) }
+      )
+      compactor = Riggs::Workflow::Compactor.new(
+        router: router, chain: ["mock"], budget: 1_000, reserve: 100, keep_recent: 200,
+        session_id: session_id,
+        record_call: ->(**kw) { storage.record_provider_call(session_id: session_id, **kw) }
+      )
+      messages = 10.times.map { |i| { role: "user", content: "msg#{i} #{'x' * 400}" } }
+
+      result = compactor.compact(messages: messages, step_key: "s", model: nil)
+
+      assert_equal "summarized", result[:strategy],
+                   "a real audit-wired Router must not silently degrade compaction to truncation"
+      rows = storage.db.execute(
+        "SELECT COUNT(*) AS n FROM riggs_provider_calls WHERE session_id = ? AND step_key = ?", [session_id, "s"]
+      )
+      assert_equal 1, rows.first["n"], "the summarization call must be recorded"
+      storage.close
+    end
+  end
+
   def test_compact_never_orphans_tool_results_across_multiple_consecutive_tool_turns
     messages = [
       { role: "user", content: "x" * 2_000 },
