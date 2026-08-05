@@ -8,7 +8,7 @@ module Riggs
     # Multi-turn provider ↔ MCP tool execution until final text or guardrails.
     class ToolLoop
       def initialize(router:, mcp_manager:, skill_registry:, audit:, llm_calls:, max_llm_calls:, timeout_seconds:, started_at:,
-                     session_id:, persist: nil, record_call: nil)
+                     session_id:, persist: nil, record_call: nil, compactor: nil)
         @router = router
         @mcp_manager = mcp_manager
         @skill_registry = skill_registry
@@ -17,11 +17,19 @@ module Riggs
         @persist = persist
         # Same contract for metering — a loop with no storage records nothing.
         @record_call = record_call
+        # Same contract again — a loop with no compactor never trims messages.
+        @compactor = compactor
         @llm_calls = llm_calls
         @max_llm_calls = max_llm_calls.to_i
         @timeout_seconds = timeout_seconds
         @started_at = started_at
         @session_id = session_id
+        # Anchor: input_tokens from the most recent measured response, paired
+        # with how many of the current messages it covered — lets Usage.estimate
+        # avoid re-heuristicating turns a real response already priced exactly.
+        @anchor_tokens = nil
+        @anchored_count = 0
+        @last_model = nil
       end
 
       attr_reader :llm_calls
@@ -37,6 +45,7 @@ module Riggs
 
         loop do
           check_guardrails!
+          compact_if_needed!(messages, step)
           result = @router.call(
             chain: chain,
             messages: messages,
@@ -51,6 +60,11 @@ module Riggs
             relay_attempt: result[:relay_attempt] || 1,
             usage: result[:usage], cost_usd: result[:cost_usd]
           )
+          if result[:usage] && result[:usage][:measured]
+            @anchor_tokens = result[:usage][:input_tokens]
+            @anchored_count = messages.length
+          end
+          @last_model = result[:model]
 
           tool_calls = Array(result[:tool_calls])
           tool_calls = parse_tool_line(result[:content]) if tool_calls.empty? && result[:content].to_s.start_with?("TOOL:")
@@ -91,6 +105,23 @@ module Riggs
       end
 
       private
+
+      # Mutates `messages` in place so the caller's array — which GraphEngine
+      # also holds a reference to — reflects the compacted transcript.
+      def compact_if_needed!(messages, step)
+        return unless @compactor
+        return unless @compactor.over_budget?(messages, model: @last_model,
+                                                        anchor: @anchor_tokens, anchored_count: @anchored_count)
+
+        outcome = @compactor.compact(messages: messages, step_key: step.id, model: @last_model)
+        messages.replace(outcome[:messages])
+        @anchor_tokens = nil
+        @anchored_count = 0
+        @audit.call(session_id: @session_id, event_type: "context_compacted",
+                    payload: { step: step.id, strategy: outcome[:strategy],
+                               before: outcome[:before], after: outcome[:after],
+                               collapsed: outcome[:collapsed] })
+      end
 
       def persist_turn(role:, content:, step_key:, tool_call_id: nil, tool_name: nil, tool_calls: nil, provider: nil)
         @persist&.call(role: role, content: content, step_key: step_key, tool_call_id: tool_call_id,

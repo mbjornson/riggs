@@ -124,12 +124,137 @@ class TestToolLoop < Minitest::Test
     refute_nil result[:content]
   end
 
+  def test_compacts_before_calling_the_provider_when_over_budget
+    compactor = Riggs::Workflow::Compactor.new(
+      router: Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
+      chain: ["mock"], budget: 200, reserve: 0, keep_recent: 50
+    )
+    loop_runner = build_loop(compactor: compactor)
+    messages = 20.times.map { |i| { role: "user", content: "turn#{i} #{'x' * 200}" } }
+
+    result = loop_runner.run(step: build_step, chain: ["mock"], messages: messages,
+                             system_prompt: "sys", io: StringIO.new)
+
+    refute_nil result[:content], "the run completes rather than raising"
+    assert_operator messages.length, :<, 20, "the message array was compacted in place"
+  end
+
+  def test_audits_context_compacted
+    events = []
+    compactor = Riggs::Workflow::Compactor.new(
+      router: Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
+      chain: ["mock"], budget: 200, reserve: 0, keep_recent: 50
+    )
+    loop_runner = build_loop(compactor: compactor, audit: ->(**kw) { events << kw })
+
+    loop_runner.run(step: build_step, chain: ["mock"],
+                    messages: 20.times.map { |i| { role: "user", content: "t#{i} #{'x' * 200}" } },
+                    system_prompt: "sys", io: StringIO.new)
+
+    compaction = events.find { |e| e[:event_type] == "context_compacted" }
+
+    refute_nil compaction
+    assert_operator compaction[:payload][:after], :<, compaction[:payload][:before]
+  end
+
+  def test_no_compaction_without_a_compactor
+    loop_runner = build_loop(compactor: nil)
+
+    result = loop_runner.run(step: build_step, chain: ["mock"],
+                             messages: [{ role: "user", content: "hi" }],
+                             system_prompt: "sys", io: StringIO.new)
+
+    refute_nil result[:content]
+  end
+
+  def test_step_with_its_own_relay_chain_compacts_through_that_chain_not_the_first_steps
+    Dir.mktmpdir("riggs-chain-test") do |dir|
+      db_path = File.join(dir, "db", "riggs.sqlite3")
+      storage = Riggs::Storage.new(db_path: db_path)
+
+      workflow = {
+        name: "chain_test",
+        context_window: 12,
+        reserve_tokens: 0,
+        keep_recent_tokens: 1,
+        max_llm_calls: 20,
+        timeout_seconds: 60,
+        providers: {
+          default: { relay_chain: ["mock"] },
+          special: { relay_chain: ["special_mock"] },
+          special_mock: { type: "mock" }
+        },
+        steps: [
+          Riggs::Workflow::StepNode.from_hash(id: "first", input: "hello", output_var: "first", next: "second"),
+          Riggs::Workflow::StepNode.from_hash(id: "second", provider: "special",
+                                              input: "please lookup runbook now", output_var: "second")
+        ]
+      }
+
+      engine = Riggs::Workflow::GraphEngine.new(
+        workflow: workflow,
+        user_identity: { id: "test_user", memory_namespace: "test" },
+        storage: storage,
+        db_path: db_path,
+        mcp_manager: lookup_tool_mcp_manager
+      )
+
+      engine.execute(StringIO.new, input: {})
+      assert_equal :completed, engine.status
+
+      compaction = engine.audit_log.find do |e|
+        e[:event_type] == "context_compacted" && e[:payload][:step] == "second"
+      end
+      refute_nil compaction, "compaction must actually trigger for step 'second' -- " \
+                             "otherwise this test proves nothing about which chain it used"
+
+      providers = storage.db.execute(
+        "SELECT provider FROM riggs_provider_calls WHERE session_id = ? AND step_key = ?",
+        [engine.session_id, "second"]
+      ).map { |row| row["provider"] }
+
+      refute_includes providers, "mock",
+                      "step 'second' declares its own relay_chain (special_mock); its compaction " \
+                      "must not summarize through the first step's chain (mock)"
+      assert_includes providers, "special_mock"
+    ensure
+      storage&.close
+    end
+  end
+
   private
 
   def build_step
     Riggs::Workflow::StepNode.from_hash(
       { "id" => "triage", "agent" => "triager", "input" => "x", "output_var" => "out" }
     )
+  end
+
+  def build_loop(compactor: nil, audit: ->(**) {})
+    Riggs::Workflow::ToolLoop.new(
+      router: Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
+      mcp_manager: nil, skill_registry: nil, audit: audit, compactor: compactor,
+      llm_calls: 0, max_llm_calls: 5, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+  end
+
+  # A minimal MCP manager double whose only tool is the "lookup_runbook"
+  # built-in ToolLoop stub -- enough to make Mock emit a tool call so a
+  # step's transcript grows across multiple turns without needing a real
+  # skill/registry fixture.
+  def lookup_tool_mcp_manager
+    Class.new do
+      def list_tools
+        [{ name: "lookup_runbook", description: "Look up a runbook", input_schema: {}, server: "local" }]
+      end
+
+      def call_tool(*, **)
+        "unused -- lookup_runbook is handled by ToolLoop's built-in stub"
+      end
+
+      def close; end
+    end.new
   end
 
   def tool_calling_engine

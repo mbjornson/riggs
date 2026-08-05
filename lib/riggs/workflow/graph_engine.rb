@@ -198,6 +198,7 @@ module Riggs
             audit: method(:audit_bridge),
             persist: method(:persist_bridge),
             record_call: method(:record_provider_call),
+            compactor: compactor_for(chain),
             llm_calls: @llm_calls,
             max_llm_calls: @workflow[:max_llm_calls],
             timeout_seconds: @workflow[:timeout_seconds],
@@ -348,10 +349,25 @@ module Riggs
         kept + [{ role: "user", content: resolved_input }]
       end
 
+      # build_messages only needs #ceiling, which never reads @chain, so any
+      # step's chain would do here -- the first step's is as good as any.
       def compactor
-        @compactor ||= Compactor.new(
+        compactor_for(@router.chain_for(step: @workflow[:steps].first, workflow: @workflow))
+      end
+
+      # Memoized per chain, not globally: Router#chain_for honors a step's own
+      # relay_chain/provider override, and Compactor#compact routes its
+      # summarization call through @chain. A single first-step-only Compactor
+      # would silently summarize every later step's transcript through the
+      # first step's provider chain instead of its own the moment ToolLoop
+      # starts calling #compact. Most workflows share one chain across steps,
+      # so this cache still collapses to a single Compactor in the common case.
+      def compactor_for(chain)
+        key = Array(chain).map(&:to_s)
+        @compactors ||= {}
+        @compactors[key] ||= Compactor.new(
           router: @router,
-          chain: @router.chain_for(step: @workflow[:steps].first, workflow: @workflow),
+          chain: key,
           budget: @workflow[:context_window],
           reserve: @workflow[:reserve_tokens],
           keep_recent: @workflow[:keep_recent_tokens],
