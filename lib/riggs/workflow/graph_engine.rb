@@ -10,12 +10,11 @@ require_relative "../mcp/manager"
 require_relative "loader"
 require_relative "tool_loop"
 require_relative "compactor"
+require_relative "../usage"
 
 module Riggs
   module Workflow
     class GraphEngine
-      CONTEXT_LIMITS = { short: 2, medium: 6, full: 50 }.freeze
-
       attr_reader :workflow, :user_identity, :session_id, :audit_log, :outputs, :status, :llm_calls
 
       def initialize(workflow:, user_identity:, storage: nil, db_path: nil, hub_config: {}, gate_handler: nil,
@@ -325,13 +324,37 @@ module Riggs
         parts.join("\n\n")
       end
 
+      # Selects prior step outputs by token budget rather than step count.
+      # The walk is newest-to-oldest so the most recent context survives, but
+      # the emitted array is chronological -- a provider reading it in selection
+      # order would see the conversation backwards.
       def build_messages(resolved_input)
-        window = CONTEXT_LIMITS.fetch(@workflow[:context_window], 6)
-        recent = @workflow[:steps].map(&:output_var).map(&:to_sym).select { |k| @outputs.key?(k) }.last(window)
-        history = recent.map do |var|
-          { role: "assistant", content: @outputs[var].to_s }
+        ceiling = compactor.ceiling(model: nil)
+        vars = @workflow[:steps].map(&:output_var).map(&:to_sym).select { |k| @outputs.key?(k) }
+
+        kept = []
+        used = Usage.estimate([{ role: "user", content: resolved_input }])
+        vars.reverse_each do |var|
+          turn = { role: "assistant", content: @outputs[var].to_s }
+          size = Usage.estimate([turn])
+          break if used + size > ceiling
+
+          used += size
+          kept.unshift(turn)
         end
-        history + [{ role: "user", content: resolved_input }]
+
+        kept + [{ role: "user", content: resolved_input }]
+      end
+
+      def compactor
+        @compactor ||= Compactor.new(
+          router: @router,
+          chain: @router.chain_for(step: @workflow[:steps].first, workflow: @workflow),
+          budget: @workflow[:context_window],
+          reserve: @workflow[:reserve_tokens],
+          keep_recent: @workflow[:keep_recent_tokens],
+          record_call: method(:record_provider_call)
+        )
       end
 
       def persist_memory(step, content)

@@ -180,4 +180,77 @@ class TestGraphEngine < Minitest::Test
       refute engine.outputs[:debug_plan]
     end
   end
+
+  def test_build_messages_keeps_all_outputs_under_budget
+    engine = engine_with(context_window: 128_000)
+    engine.instance_variable_set(:@outputs, { first: "a" * 100, second: "b" * 100 })
+
+    messages = engine.send(:build_messages, "next input")
+
+    assert_equal 3, messages.length, "two history turns plus the new user turn"
+    assert_equal "user", messages.last[:role]
+  end
+
+  def test_build_messages_drops_oldest_outputs_over_budget
+    engine = engine_with(context_window: 100, reserve_tokens: 0)
+    engine.instance_variable_set(:@outputs, { first: "a" * 4_000, second: "b" * 4_000 })
+
+    messages = engine.send(:build_messages, "next input")
+
+    assert_operator messages.length, :<, 3
+  end
+
+  def test_build_messages_returns_history_oldest_first
+    engine = engine_with(context_window: 128_000)
+    engine.instance_variable_set(:@outputs, { first: "OLDEST", second: "NEWEST" })
+
+    contents = engine.send(:build_messages, "input").map { |m| m[:content] }
+
+    assert_operator contents.index("OLDEST"), :<, contents.index("NEWEST"),
+                    "history must stay chronological even though selection walks backwards"
+  end
+
+  private
+
+  # Builds a minimal GraphEngine directly from a workflow hash rather than
+  # through Loader.load, matching the Dir.mktmpdir + File.join(dir, "db",
+  # "riggs.sqlite3") + explicit storage.close idiom used in
+  # test_storage_audit.rb, and the Riggs::Workflow::StepNode.from_hash idiom
+  # used in test_tool_loop.rb / test_providers.rb. Two steps ("first",
+  # "second") give build_messages a deterministic chronological order to
+  # select and emit history from. Storage is built explicitly (rather than
+  # left for GraphEngine to construct) so teardown can close it before the
+  # tmpdir is removed -- WAL mode leaves -wal/-shm files that a still-open
+  # connection can race with FileUtils.remove_entry.
+  def engine_with(context_window:, reserve_tokens: 16_384, keep_recent_tokens: 20_000)
+    dir = Dir.mktmpdir("riggs-graph-engine")
+    (@engine_with_dirs ||= []) << dir
+    storage = Riggs::Storage.new(db_path: File.join(dir, "db", "riggs.sqlite3"))
+    (@engine_with_storages ||= []) << storage
+
+    workflow = {
+      name: "budget_test",
+      context_window: context_window,
+      reserve_tokens: reserve_tokens,
+      keep_recent_tokens: keep_recent_tokens,
+      max_llm_calls: 20,
+      providers: { default: { relay_chain: ["mock"] } },
+      steps: [
+        Riggs::Workflow::StepNode.from_hash(id: "first", output_var: "first"),
+        Riggs::Workflow::StepNode.from_hash(id: "second", output_var: "second")
+      ]
+    }
+
+    Riggs::Workflow::GraphEngine.new(
+      workflow: workflow,
+      user_identity: { id: "test_user", memory_namespace: "test" },
+      storage: storage,
+      db_path: File.join(dir, "db", "riggs.sqlite3")
+    )
+  end
+
+  def teardown
+    Array(@engine_with_storages).each(&:close)
+    Array(@engine_with_dirs).each { |dir| FileUtils.remove_entry(dir) }
+  end
 end
