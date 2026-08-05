@@ -5,54 +5,28 @@ Open items from comparing Riggs against [Pi](https://pi.dev)'s agent harness on
 multi-user playbook orchestrator, so only the shared substrate is comparable —
 context control, session durability, observability, extensibility, and trust.
 
-Seven items came out of that comparison. Two shipped in
-[`specs/phase6-persistence-and-events.md`](specs/phase6-persistence-and-events.md):
+Seven items came out of that comparison. Four have shipped: two in
+[`specs/phase6-persistence-and-events.md`](specs/phase6-persistence-and-events.md)
+and two in
+[`specs/phase7-token-accounting-and-compaction.md`](specs/phase7-token-accounting-and-compaction.md):
 
 - ~~**#1** Message persistence and gate pause/resume~~ — shipped
 - ~~**#4** Audit event stream (poll + SSE)~~ — shipped
+- ~~**#2** Token accounting~~ — shipped. A completed run reports tokens in/out
+  and cost per step and per session, each with coverage on both counters.
+  Correction to the original "done when," which said this would make
+  [`token-ledger.md`](token-ledger.md) "fill itself": that ledger records what
+  it cost Claude Code to *build* Riggs; this feature measures what Riggs
+  *workflows* spend calling providers. Riggs has never run a workflow to build
+  itself, so no amount of provider accounting could populate that ledger —
+  they are two unrelated token streams.
+- ~~**#3** Token-based context window and compaction~~ — shipped.
+  `context_window` is now a token budget (`short`/`medium`/`full`/an integer),
+  not a step count, and a run whose transcript exceeds it compacts instead of
+  erroring.
 
-The five below are open. Original numbering is kept so the ranking stays legible.
+The three below are open. Original numbering is kept so the ranking stays legible.
 Gaps found outside that comparison are collected at the end, labelled as such.
-
----
-
-## #2 — Token accounting
-
-**Now:** Providers parse `usage` out of responses and discard it. Guardrails are
-`max_llm_calls` and `timeout_seconds`; nothing counts tokens anywhere.
-
-**Why it matters:** [`token-ledger.md`](token-ledger.md) asks a human to run
-`/cost` and hand-copy numbers that the code already had and threw away. It is
-also the prerequisite for #3 — you cannot compact on a budget you do not measure.
-
-**Shape:** Capture `usage` in the `Providers::Base` subclasses, record it on the
-`provider_success` audit event, sum per session. Relay-chain failover means
-attributing tokens to the provider that actually answered, not the first tried.
-
-**Done when:** A completed run reports tokens in/out per step and per session,
-and the ledger fills itself.
-
----
-
-## #3 — Token-based context window and compaction
-
-**Now:** `GraphEngine::CONTEXT_LIMITS` is `{short: 2, medium: 6, full: 50}` —
-a count of *steps*, not tokens. There is no compaction. A long `ToolLoop` grows
-its `messages` array unbounded.
-
-**Why it matters:** Six steps with large outputs exceed any real context window,
-and a tool loop that runs long enough will fail with a provider 400 rather than
-degrading gracefully.
-
-**Shape:** Replace the step-count window with a per-workflow token budget. When
-messages exceed it, summarize older turns through the relay chain and keep recent
-turns verbatim. Pi's defaults are a reasonable starting point: reserve 16384
-tokens, keep the most recent 20000 intact.
-
-**Depends on:** #2.
-
-**Done when:** A run whose transcript exceeds the model window completes by
-compacting instead of erroring.
 
 ---
 
@@ -176,5 +150,6 @@ single-user coding TUI, and these belong to the latter:
 - TypeScript extensions as the extensibility mechanism
 - Dropping MCP. Pi rejects it on context cost — popular servers burn 7-9% of the
   window on unused tool descriptions. Riggs allow-lists tools per skill in
-  `ToolLoop#resolve_tools`, so that objection largely does not apply. #2 would
-  let this be measured rather than assumed.
+  `ToolLoop#resolve_tools`, so that objection largely does not apply. That can
+  now be measured rather than assumed: `riggs workflow:inspect SESSION_ID`
+  reports tokens in/out per step and per session.

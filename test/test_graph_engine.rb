@@ -228,6 +228,31 @@ class TestGraphEngine < Minitest::Test
            "not be discarded because the walk stopped early")
   end
 
+  def test_cli_only_chain_audits_compaction_unavailable
+    engine = engine_with(context_window: 32_000, chain: ["claude_cli"])
+
+    engine.send(:announce_compaction_availability!, ["claude_cli"])
+    events = engine.audit_log.map { |e| e[:event_type] }
+
+    assert_includes events, "compaction_unavailable"
+  end
+
+  def test_measurable_chain_does_not_announce
+    engine = engine_with(context_window: 32_000, chain: ["mock"])
+
+    engine.send(:announce_compaction_availability!, ["mock"])
+
+    refute_includes engine.audit_log.map { |e| e[:event_type] }, "compaction_unavailable"
+  end
+
+  def test_announcement_happens_only_once
+    engine = engine_with(context_window: 32_000, chain: ["claude_cli"])
+
+    3.times { engine.send(:announce_compaction_availability!, ["claude_cli"]) }
+
+    assert_equal 1, engine.audit_log.count { |e| e[:event_type] == "compaction_unavailable" }
+  end
+
   private
 
   # Builds a minimal GraphEngine directly from a workflow hash rather than
@@ -240,7 +265,7 @@ class TestGraphEngine < Minitest::Test
   # left for GraphEngine to construct) so teardown can close it before the
   # tmpdir is removed -- WAL mode leaves -wal/-shm files that a still-open
   # connection can race with FileUtils.remove_entry.
-  def engine_with(context_window:, reserve_tokens: 16_384, keep_recent_tokens: 20_000)
+  def engine_with(context_window:, reserve_tokens: 16_384, keep_recent_tokens: 20_000, chain: ["mock"])
     dir = Dir.mktmpdir("riggs-graph-engine")
     (@engine_with_dirs ||= []) << dir
     storage = Riggs::Storage.new(db_path: File.join(dir, "db", "riggs.sqlite3"))
@@ -252,7 +277,7 @@ class TestGraphEngine < Minitest::Test
       reserve_tokens: reserve_tokens,
       keep_recent_tokens: keep_recent_tokens,
       max_llm_calls: 20,
-      providers: { default: { relay_chain: ["mock"] } },
+      providers: { default: { relay_chain: chain } },
       steps: [
         Riggs::Workflow::StepNode.from_hash(id: "first", output_var: "first"),
         Riggs::Workflow::StepNode.from_hash(id: "second", output_var: "second")

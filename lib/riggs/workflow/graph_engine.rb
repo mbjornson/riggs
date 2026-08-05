@@ -37,6 +37,7 @@ module Riggs
         @status = :pending
         @llm_calls = 0
         @started_at = nil
+        @compaction_announced = false
       end
 
       # Restarts a paused run from its stored resume_state. The gate that paused
@@ -189,6 +190,7 @@ module Riggs
           system_prompt = build_system_prompt(current)
           messages = build_messages(resolved_input)
           chain = @router.chain_for(step: current, workflow: @workflow)
+          announce_compaction_availability!(chain)
           persist_bridge(role: "user", content: resolved_input, step_key: current.id)
 
           loop_runner = ToolLoop.new(
@@ -374,6 +376,17 @@ module Riggs
           record_call: method(:record_provider_call),
           session_id: @session_id
         )
+      end
+
+      # No provider on this chain reports usage, so there is no anchor and
+      # compaction can never trigger. Announced once per run: silent
+      # non-compaction looks exactly like compaction that is working.
+      def announce_compaction_availability!(chain)
+        return if @compaction_announced
+        return unless Providers::Router.unmetered_chain?(chain)
+
+        @compaction_announced = true
+        log_event("compaction_unavailable", { chain: Array(chain).map(&:to_s) })
       end
 
       def persist_memory(step, content)

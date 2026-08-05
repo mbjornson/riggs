@@ -30,6 +30,15 @@ module Riggs
         "openai_cli" => CodexCli
       }.freeze
 
+      # Providers that return no token usage, so nothing downstream can measure
+      # or compact a conversation running on them.
+      UNMETERED = %w[cursor cursor_cli cursor_cloud claude_cli anthropic_cli codex openai_cli cli].freeze
+
+      def self.unmetered_chain?(chain)
+        names = Array(chain).map(&:to_s)
+        !names.empty? && names.all? { |n| UNMETERED.include?(n) }
+      end
+
       def initialize(workflow_providers: {}, hub_providers: {}, audit: nil, registry: nil)
         @workflow_providers = Identity.deep_symbolize(workflow_providers || {})
         @hub_providers = Identity.deep_symbolize(hub_providers || {})

@@ -198,7 +198,7 @@ module Riggs
       end
 
       def cli_only_chain?(chain)
-        Array(chain).all? { |n| %w[cursor cursor_cli claude_cli anthropic_cli codex openai_cli].include?(n.to_s) }
+        Providers::Router.unmetered_chain?(chain)
       end
 
       def parse_tool_line(content)
