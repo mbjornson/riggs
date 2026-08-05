@@ -255,9 +255,26 @@ The effective ceiling for a request is
 unknown, the workflow budget alone applies.
 
 `reserve` (default 16,384) and `keep_recent` (default 20,000) are workflow-level
-keys alongside `context_window`, both following Pi's defaults. They are
-deliberately not per-step: a single run compacting under two different policies
-would make the resulting transcript impossible to reason about.
+keys alongside `context_window`. They are deliberately not per-step: a single run
+compacting under two different policies would make the resulting transcript
+impossible to reason about.
+
+Both are **scaled to the budget in force** rather than applied absolutely:
+
+```
+reserve     = min(configured_reserve, budget / 4)
+keep_recent = min(configured_keep_recent, ceiling / 2)
+```
+
+The defaults are Pi's, and Pi pairs them with a ~200,000-token budget. Applied
+absolutely to the budgets above they contradict each other: `short` (8,000) less
+a 16,384 reserve is a ceiling of 0 — a workflow that can retain nothing — and a
+20,000-token `keep_recent` against `medium`'s 15,616 ceiling means compaction can
+never split anything and so can never get under the ceiling it just measured.
+Scaling makes every budget internally consistent by construction, including
+budgets that do not exist yet. The clamp lowers explicitly configured values too:
+a reserve or keep_recent that breaks the ceiling is not honourable, since
+honouring it produces a workflow that cannot run.
 
 ### R3.2 Size estimation
 
@@ -298,8 +315,9 @@ able to fail a run.
 ### R3.4 Compaction strategy
 
 Recent turns are kept verbatim up to `keep_recent` (default 20,000 tokens,
-following Pi). Older turns are replaced by a single `role: "assistant"` summary
-produced by one call through the same relay chain.
+scaled down to half the effective ceiling — see R3.1). Older turns are replaced
+by a single `role: "assistant"` summary produced by one call through the same
+relay chain.
 
 Rules:
 
@@ -330,6 +348,9 @@ would be indistinguishable from compaction that is working.
   unknown symbol falls back to the default.
 - The effective ceiling is the lower of workflow budget and model window, less
   reserve.
+- Instantiated from `Loader`'s **actual defaults** (not hand-picked numbers):
+  every `context_window` word leaves a ceiling greater than zero, and a
+  transcript over the default ceiling is compacted below it.
 - `build_messages` drops the oldest step outputs when the budget is exceeded and
   returns all of them when it is not.
 - A tool loop driven past the ceiling compacts and continues rather than raising.

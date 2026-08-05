@@ -35,9 +35,8 @@ module Riggs
       # The lower of the workflow budget and the model's own window, less the
       # reserve that absorbs estimation error.
       def ceiling(model:)
-        window = ModelInfo.context_window(model, overrides: @model_overrides)
-        limit = window ? [@budget, window].min : @budget
-        [limit - @reserve, 0].max
+        limit = limit_for(model)
+        [limit - reserve_for(limit), 0].max
       end
 
       def over_budget?(messages, model:, anchor: nil, anchored_count: 0)
@@ -47,7 +46,7 @@ module Riggs
       def compact(messages:, step_key:, model:)
         list = Array(messages)
         before = Usage.estimate(list)
-        split = split_index(list)
+        split = split_index(list, keep_recent_for(model))
         return no_op(list, before) if split <= 0
 
         older = list[0...split]
@@ -61,6 +60,30 @@ module Riggs
 
       private
 
+      def limit_for(model)
+        window = ModelInfo.context_window(model, overrides: @model_overrides)
+        window ? [@budget, window].min : @budget
+      end
+
+      # The three knobs are configured independently but have to agree, and
+      # absolute defaults borrowed from a ~200k-budget system do not agree with
+      # an 8,000-token one: reserve 16,384 against `short` clamps the ceiling to
+      # 0, and keep_recent 20,000 against the default 15,616 ceiling means
+      # compaction can never reach it. Deriving both from the budget in force
+      # makes every budget internally consistent by construction, including
+      # budgets that do not exist yet.
+      #
+      # These clamp CONFIGURED values too. A reserve or keep_recent that breaks
+      # the ceiling is not honourable: honouring it produces a workflow that
+      # cannot run.
+      def reserve_for(limit)
+        [@reserve, limit / 4].min
+      end
+
+      def keep_recent_for(model)
+        [@keep_recent, ceiling(model: model) / 2].min
+      end
+
       def no_op(list, before)
         { messages: list, strategy: "summarized", before: before, after: before, collapsed: 0 }
       end
@@ -68,13 +91,13 @@ module Riggs
       # Walks backwards accumulating until keep_recent is reached, then moves
       # the boundary earlier past any leading tool results so an assistant turn
       # is never separated from the tool turns answering it.
-      def split_index(list)
+      def split_index(list, keep_recent)
         kept = 0
         idx = list.length
         while idx.positive?
           candidate = list[idx - 1]
           kept += Usage.estimate([candidate])
-          break if kept > @keep_recent && idx < list.length
+          break if kept > keep_recent && idx < list.length
 
           idx -= 1
         end

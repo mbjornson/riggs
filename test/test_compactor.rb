@@ -11,6 +11,49 @@ class TestCompactor < Minitest::Test
     )
   end
 
+  # Every other test in this file picks its own budget/reserve/keep_recent,
+  # which is exactly how `context_window: short` shipped with an effective
+  # ceiling of 0 (8,000 budget minus the default 16,384 reserve) and how the
+  # default keep_recent (20,000) shipped larger than the default ceiling
+  # (32,000 - 16,384 = 15,616), making compaction unable to reach it. These
+  # two tests instantiate from Loader's ACTUAL defaults instead.
+  def compactor_from_loader_defaults(context_window)
+    with_tmp_project do
+      config = { "name" => "defaults_test", "context_window" => context_window,
+                 "steps" => [{ "id" => "a", "input" => "x", "output_var" => "out" }] }
+      File.write("config/riggs/workflows/defaults_test.yml", YAML.dump(config))
+      wf = Riggs::Workflow::Loader.load(path: "config/riggs/workflows/defaults_test.yml")
+      return Riggs::Workflow::Compactor.new(
+        router: Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } }),
+        chain: ["mock"], budget: wf[:context_window],
+        reserve: wf[:reserve_tokens], keep_recent: wf[:keep_recent_tokens]
+      )
+    end
+  end
+
+  def test_every_shipped_context_budget_leaves_a_usable_ceiling
+    Riggs::Workflow::Loader::CONTEXT_BUDGETS.each_key do |word|
+      ceiling = compactor_from_loader_defaults(word.to_s).ceiling(model: nil)
+
+      assert_operator ceiling, :>, 0,
+                      "context_window: #{word} with the shipped defaults leaves no room for any message"
+    end
+  end
+
+  def test_a_transcript_over_the_default_ceiling_compacts_below_it
+    compactor = compactor_from_loader_defaults("medium")
+    ceiling = compactor.ceiling(model: nil)
+    messages = 80.times.map { |i| { role: "user", content: "turn#{i} #{'x' * 2_000}" } }
+
+    assert compactor.over_budget?(messages, model: nil), "test setup: the transcript must start over budget"
+
+    result = compactor.compact(messages: messages, step_key: "s", model: nil)
+
+    assert_operator result[:after], :<, ceiling,
+                    "compaction must bring the transcript under the ceiling it was measured against, " \
+                    "or the loop re-enters compaction on every turn and never recovers"
+  end
+
   def test_ceiling_is_budget_minus_reserve_when_the_model_is_unknown
     assert_equal 900, build.ceiling(model: "unknown-model")
   end

@@ -55,11 +55,15 @@ Three more keys govern the token budget (all optional; defaults shown):
 
 ```yaml
 context_window: medium      # short (8,000) | medium (32,000) | full (128,000) | an integer token budget
-reserve_tokens: 16384       # headroom that absorbs pre-flight estimation error
-keep_recent_tokens: 20000   # most recent turns kept verbatim when compacting
+reserve_tokens: 16384       # headroom that absorbs pre-flight estimation error (capped at a quarter of the budget)
+keep_recent_tokens: 20000   # most recent turns kept verbatim when compacting (capped at half the ceiling)
 ```
 
-The effective ceiling for a request is `min(context_window, model's context window) - reserve_tokens`. When a transcript — cross-step history or an in-progress tool loop — would exceed it, Riggs summarizes older turns through the same relay chain and keeps the most recent `keep_recent_tokens` verbatim, rather than growing the request unbounded or erroring. `riggs workflow:inspect SESSION_ID` reports tokens in/out and cost per step and per session, each with explicit coverage (e.g. `12,400 tokens over 6 of 9 calls · $0.0184 over 6 of 9 priced`) — unmeasured or unpriced calls are never shown as zero.
+The budget in force for a request is the workflow's `context_window`, or the model's own context window when that is lower and the model is known — the intra-step tool loop knows the model it last called, while cross-step history is selected before any model has been chosen and so is budgeted by `context_window` alone. The effective ceiling is that budget less `reserve_tokens`.
+
+Both derived knobs are scaled to the budget in force: `reserve_tokens` is capped at a quarter of it, and `keep_recent_tokens` at half the resulting ceiling. The cap applies to explicitly configured values too. The defaults suit a large budget; taken literally against `context_window: short` a 16,384-token reserve would leave a ceiling of 0, and against `medium` a 20,000-token keep_recent is larger than the ceiling compaction is trying to get under — a value that breaks the ceiling is lowered rather than honoured.
+
+When a transcript — cross-step history or an in-progress tool loop — would exceed the ceiling, Riggs summarizes older turns through the same relay chain and keeps the most recent turns verbatim, rather than growing the request unbounded or erroring. `riggs workflow:inspect SESSION_ID` reports tokens in/out and cost per step and per session, each with explicit coverage (e.g. `12,400 tokens over 6 of 9 calls · $0.0184 over 6 of 9 priced`) — unmeasured or unpriced calls are never shown as zero.
 
 ```bash
 # Interactive composer (TTY): prompts for triggers, relay_chain, steps, gates

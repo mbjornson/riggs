@@ -191,6 +191,20 @@ class TestGraphEngine < Minitest::Test
     assert_equal "user", messages.last[:role]
   end
 
+  # `short` (8,000) paired with the default reserve (16,384) clamped the
+  # ceiling to 0, so `next if used + size > ceiling` skipped every prior step
+  # output: a short workflow silently retained NO cross-step history at all,
+  # with no error and no audit event. It kept 2 steps before Phase 7.
+  def test_short_context_window_still_retains_cross_step_history
+    engine = engine_with(context_window: Riggs::Workflow::Loader::CONTEXT_BUDGETS[:short])
+    engine.instance_variable_set(:@outputs, { first: "a" * 100, second: "b" * 100 })
+
+    messages = engine.send(:build_messages, "next input")
+
+    assert_equal 3, messages.length,
+                 "a short workflow retains history; it does not silently drop all of it"
+  end
+
   def test_build_messages_drops_oldest_outputs_over_budget
     engine = engine_with(context_window: 100, reserve_tokens: 0)
     engine.instance_variable_set(:@outputs, { first: "a" * 4_000, second: "b" * 4_000 })
