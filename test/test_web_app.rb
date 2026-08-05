@@ -403,4 +403,46 @@ class TestWebApp < Minitest::Test
       assert_equal 403, last_response.status
     end
   end
+
+  def test_usage_endpoint_reports_totals_with_coverage
+    with_tmp_project do
+      session_id = create_session_with_usage
+      header "X-Riggs-User", "eng_bob"
+      get "/api/sessions/#{session_id}/usage"
+
+      assert_equal 200, last_response.status
+      body = JSON.parse(last_response.body)
+
+      assert_equal 2, body["session"]["calls"]
+      assert_equal 1, body["session"]["measured_calls"]
+      assert_equal 1, body["steps"].length
+    end
+  end
+
+  def test_usage_endpoint_requires_inspect_run
+    with_tmp_project do
+      session_id = create_session_with_usage
+      header "X-Riggs-User", "view_cara"
+      get "/api/sessions/#{session_id}/usage"
+
+      assert_equal 200, last_response.status, "viewer holds inspect_run"
+    end
+  end
+
+  def create_session_with_usage
+    storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
+    id = storage.create_session(workflow_name: "example_triage", user_id: "eng_bob", memory_namespace: "ns")
+    storage.record_provider_call(
+      session_id: id, step_key: "triage", provider: "mock", model: "m", relay_attempt: 1,
+      usage: { input_tokens: 10, output_tokens: 5, cache_read_tokens: nil,
+               cache_write_tokens: nil, total_tokens: 15, measured: true },
+      cost_usd: 0.01
+    )
+    storage.record_provider_call(
+      session_id: id, step_key: "triage", provider: "claude_cli", model: nil, relay_attempt: 1,
+      usage: Riggs::Usage::EMPTY, cost_usd: nil
+    )
+    storage.close
+    id
+  end
 end

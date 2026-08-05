@@ -414,6 +414,11 @@ module Riggs
       puts "Workflow: #{session['workflow_name']}"
       puts "User: #{session['user_id']}"
       puts "Status: #{session['status']}"
+      usage = storage.session_usage(session_id)
+      puts "Tokens: #{format_usage(usage)}"
+      storage.step_usage(session_id).each do |row|
+        puts "  #{row[:step_key]}: #{format_usage(row)}"
+      end
       puts "\nAudit:"
       storage.list_audit(session_id).each do |row|
         puts "  [#{row['created_at']}] #{row['event_type']} #{row['payload']}"
@@ -545,6 +550,8 @@ module Riggs
           timeout: 120
         )
         puts "✅ provider=#{result[:provider]} relay_attempt=#{result[:relay_attempt]}"
+        puts "   usage=#{result[:usage][:measured] ? result[:usage][:total_tokens].to_s : 'unmeasured'} " \
+             "cost=#{result[:cost_usd] ? format('$%.6f', result[:cost_usd]) : 'unpriced'}"
         puts result[:content].to_s[0, 500]
       rescue Providers::Error => e
         abort "❌ #{e.class}: #{e.message}"
@@ -552,6 +559,22 @@ module Riggs
     end
 
     no_commands do
+      # Never prints a total without its coverage — a bare number would imply
+      # complete measurement that CLI providers cannot supply.
+      def format_usage(u)
+        return "no provider calls" if u[:calls].zero?
+
+        tokens = u[:total_tokens] ? "#{u[:total_tokens]} tokens" : "unmeasured"
+        cost =
+          if u[:cost_usd]
+            format("$%<cost>.4f over %<priced>d of %<calls>d priced",
+                   cost: u[:cost_usd], priced: u[:priced_calls], calls: u[:calls])
+          else
+            "unpriced"
+          end
+        "#{tokens} over #{u[:measured_calls]} of #{u[:calls]} calls · #{cost}"
+      end
+
       def config_path
         Identity.config_path
       end

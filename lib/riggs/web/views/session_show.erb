@@ -28,6 +28,24 @@
   </div>
 <% end %>
 
+<h2>Usage</h2>
+<div class="panel">
+  <table>
+    <thead><tr><th>Step</th><th>Tokens</th><th>Calls measured</th><th>Cost</th><th>Calls priced</th></tr></thead>
+    <tbody>
+      <% steps_usage.each do |row| %>
+        <tr>
+          <td><%= h(row[:step_key]) %></td>
+          <td><%= row[:total_tokens] || "unmeasured" %></td>
+          <td><%= row[:measured_calls] %> of <%= row[:calls] %></td>
+          <td><%= row[:cost_usd] ? format("$%.4f", row[:cost_usd]) : "unpriced" %></td>
+          <td><%= row[:priced_calls] %> of <%= row[:calls] %></td>
+        </tr>
+      <% end %>
+    </tbody>
+  </table>
+</div>
+
 <h2>Audit</h2>
 <div class="panel">
   <table>
