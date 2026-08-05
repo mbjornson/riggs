@@ -46,7 +46,16 @@ module Riggs
         @registry = registry || BUILTINS
       end
 
-      def call(chain:, messages:, system: nil, timeout: 60, session_id: nil, tools: nil)
+      # `on_failed_attempt` is invoked once per dispatched attempt that raised,
+      # immediately, with the provider name and 1-based attempt number. A
+      # provider that accepted and billed a request before timing out on the
+      # read is real spend; metering only the attempt that RETURNED left that
+      # spend out of the ledger entirely, so session coverage reported a
+      # complete count over a denominator that had already dropped the failure.
+      # Reported as it happens rather than returned, so the case where every
+      # provider fails -- which raises instead of returning -- is covered too.
+      def call(chain:, messages:, system: nil, timeout: 60, session_id: nil, tools: nil,
+               on_failed_attempt: nil)
         names = Array(chain).map(&:to_s)
         names = ["mock"] if names.empty?
         last_error = nil
@@ -70,6 +79,7 @@ module Riggs
             event_type: "provider_failover",
             payload: { provider: name, attempt: idx + 1, error: e.class.name, message: e.message }
           )
+          notify_failed_attempt(on_failed_attempt, name, idx + 1, e)
           next
         end
 
@@ -97,6 +107,15 @@ module Riggs
       end
 
       private
+
+      # Never raises. A broken ledger callback must not convert a recoverable
+      # failover into a failed run -- the next provider in the chain may well
+      # answer, and the whole point of this hook is bookkeeping.
+      def notify_failed_attempt(callback, provider, attempt, error)
+        callback&.call(provider: provider, attempt: attempt, error: error)
+      rescue StandardError
+        nil
+      end
 
       def build(name)
         key = name.to_s

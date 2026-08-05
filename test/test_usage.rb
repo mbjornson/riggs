@@ -130,4 +130,38 @@ class TestUsage < Minitest::Test
     assert_nil Riggs::Usage.prompt_tokens(Riggs::Usage.normalize(nil))
     assert_nil Riggs::Usage.prompt_tokens(nil)
   end
+
+  # cached_tokens is documented as a subset of prompt_tokens, so the OpenAI path
+  # subtracts. A compatible endpoint that violates that contract used to produce
+  # a negative token count, which storage summed and pricing turned into a
+  # credit. An impossible reading is not a measurement: report nil.
+  def test_cached_tokens_exceeding_prompt_tokens_yields_nil_input
+    u = Riggs::Usage.normalize({ "prompt_tokens" => 100, "completion_tokens" => 1,
+                                 "prompt_tokens_details" => { "cached_tokens" => 200 } })
+
+    assert_nil u[:input_tokens]
+  end
+
+  def test_negative_cached_tokens_yields_nil_input
+    u = Riggs::Usage.normalize({ "prompt_tokens" => 100, "completion_tokens" => 1,
+                                 "prompt_tokens_details" => { "cached_tokens" => -5 } })
+
+    assert_nil u[:input_tokens]
+  end
+
+  def test_cached_tokens_equal_to_prompt_tokens_is_a_valid_full_cache_hit
+    u = Riggs::Usage.normalize({ "prompt_tokens" => 100, "completion_tokens" => 1,
+                                 "prompt_tokens_details" => { "cached_tokens" => 100 } })
+
+    assert_equal 0, u[:input_tokens]
+  end
+
+  def test_no_token_field_is_ever_negative
+    u = Riggs::Usage.normalize({ "prompt_tokens" => 10, "completion_tokens" => 1,
+                                 "prompt_tokens_details" => { "cached_tokens" => 999 } })
+    values = u.values_at(:input_tokens, :output_tokens, :cache_read_tokens,
+                         :cache_write_tokens, :total_tokens).compact
+
+    assert_empty values.select(&:negative?)
+  end
 end

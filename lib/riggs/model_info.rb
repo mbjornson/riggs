@@ -89,11 +89,28 @@ module Riggs
       return nil if model.nil? || model.to_s.empty?
 
       key = model.to_s
-      shipped = resolve_promotional(TABLE[key], at)
-      override = normalize_overrides(overrides)[key]
+      normalized = normalize_overrides(overrides)
+      shipped = resolve_promotional(TABLE[resolve_key(key, TABLE)], at)
+      override = normalized[resolve_key(key, normalized)]
       return nil if shipped.nil? && override.nil?
 
       (shipped || {}).merge(override || {})
+    end
+
+    # Providers report the model the API actually served, which is routinely a
+    # dated build ID (`gpt-4o-mini-2024-07-18`) that no shipped table can
+    # enumerate ahead of time. Exact-match-only lookup therefore left every
+    # real OpenAI call unpriced while its undated alias priced fine.
+    #
+    # Exact match wins. Otherwise the model must be the longest table key plus
+    # a "-" and a suffix: the trailing hyphen keeps `gpt-4o-mini` from
+    # answering for `gpt-4o-miniature`, and "longest" keeps a dated
+    # `claude-opus-4-6-*` from resolving to some shorter family prefix. A key
+    # is never invented -- an unknown family still returns nil.
+    def self.resolve_key(model, table)
+      return model if table.key?(model)
+
+      table.keys.select { |k| model.start_with?("#{k}-") }.max_by(&:length)
     end
 
     def self.context_window(model, overrides: {}, at: nil)
@@ -109,12 +126,31 @@ module Riggs
       return nil if rates.nil?
       return nil if RATE_FIELDS.values.all? { |k| rates[k].nil? }
 
-      total = RATE_FIELDS.sum do |usage_key, rate_key|
+      priced_total(usage, rates)
+    end
+
+    # A category with tokens but no rate makes the TOTAL unknowable, not free.
+    # Treating it as 0.0 (the original behaviour) reported a confident dollar
+    # figure that silently excluded measured, billable tokens -- the "unpriced
+    # is nil, never 0" invariant broken from the inside, since the model DID
+    # have an entry and DID price some other category.
+    #
+    # Zero tokens in an unpriced category is a different case and must not nil
+    # the call: OpenAI has no cache-write price at all and reports zero cache
+    # writes on every request, so being strict there would unprice every
+    # OpenAI call. Zero unpriceable tokens cost a knowable nothing.
+    def self.priced_total(usage, rates)
+      total = 0.0
+      RATE_FIELDS.each do |usage_key, rate_key|
         tokens = usage[usage_key]
+        next if tokens.nil? || tokens.zero?
+
         rate = rates[rate_key]
-        tokens.nil? || rate.nil? ? 0.0 : (tokens / PER_MILLION) * rate
+        return nil if rate.nil?
+
+        total += (tokens / PER_MILLION) * rate
       end
-      total.to_f
+      total
     end
 
     # Resolves a shipped TABLE entry's `promotional:` overlay against `at`, and
@@ -148,6 +184,7 @@ module Riggs
       end
     end
 
-    private_class_method :resolve_promotional, :resolve_at, :normalize_overrides
+    private_class_method :resolve_promotional, :resolve_at, :normalize_overrides,
+                         :resolve_key, :priced_total
   end
 end

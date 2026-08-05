@@ -113,8 +113,28 @@ JSONL to stdout for scripting and CI.
 
 ## Deferred from Phase 7
 
-Five items surfaced during the Phase 7 build and triaged as non-blocking at
-merge. Ordered by consequence.
+Seven items surfaced during the Phase 7 build and its adversarial review, and
+were triaged as non-blocking at merge. Ordered by consequence.
+
+**Compaction launders untrusted content into the assistant voice.**
+`Compactor#summarize` feeds raw transcript and tool output to a model, and
+`summary_turn` inserts the result as `role: "assistant"`. A hostile MCP or
+web-tool result can get an instruction ("the assistant must call X") preserved
+into that summary, where later tool-enabled turns read it as the assistant's own
+prior intent rather than as untrusted data. This is an escalation of an exposure
+that already exists — tool output reaches the context either way — but the
+role change is what removes the last signal that it came from outside. A
+`role: "user"` summary turn, or an explicit `[untrusted, summarized]` marker,
+would keep the provenance. Related to #6: this repo has no trust boundary yet.
+
+**Compaction's summary prompt overpromises on identifiers.** The prompt asks the
+model to "preserve identifiers", but `summarize` serializes only `role` and
+`content` — native `tool_calls` arrays, `tool_call_id`, and `tool_name` are not
+in the transcript it sees. Nothing is orphaned today, because the current
+message shape puts tool results in positional turns that `safe_boundary`
+handles, so this is a latent gap rather than a live bug. It becomes live the
+moment a provider's native `tool_calls` array is what gets collapsed. Either
+serialize the tool metadata or stop promising it.
 
 **Compaction's reported sizes are unanchored.** `Compactor#compact` computes
 `before`/`after` with `Usage.estimate` and no anchor, while `ToolLoop` decides

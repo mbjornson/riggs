@@ -90,11 +90,27 @@ module Riggs
       prompt = fetch(raw, :prompt_tokens)
       details = fetch(raw, :prompt_tokens_details)
       cached = details.is_a?(Hash) ? fetch(details, :cached_tokens) : nil
-      # prompt_tokens already contains cached_tokens; subtract so the canonical
-      # input field means uncached input on every provider.
-      uncached = prompt.nil? ? nil : prompt - cached.to_i
 
-      build(input: uncached, output: fetch(raw, :completion_tokens), cache_read: cached, cache_write: nil)
+      build(input: uncached_input(prompt, cached), output: fetch(raw, :completion_tokens),
+            cache_read: cached, cache_write: nil)
+    end
+
+    # prompt_tokens already contains cached_tokens, so the canonical "uncached
+    # input" is the difference. The subtraction is only valid while the vendor
+    # honours that contract: a compatible endpoint reporting more cached tokens
+    # than prompt tokens (or a negative count) yielded a NEGATIVE input count
+    # that storage summed and pricing turned into a credit. An arithmetically
+    # impossible reading is not a measurement, so report nil -- the same thing
+    # said about a field the vendor never sent. Clamping to 0 would instead
+    # claim the prompt was entirely cached, which is a different assertion and
+    # one this payload gives no grounds for.
+    def self.uncached_input(prompt, cached)
+      return nil if prompt.nil?
+
+      cached = cached.to_i
+      return nil if cached.negative? || cached > prompt
+
+      prompt - cached
     end
 
     def self.build(input:, output:, cache_read:, cache_write:)
@@ -114,6 +130,7 @@ module Riggs
       value
     end
 
-    private_class_method :anthropic?, :from_anthropic, :from_openai, :build, :heuristic
+    private_class_method :anthropic?, :from_anthropic, :from_openai, :build, :heuristic,
+                         :uncached_input
   end
 end

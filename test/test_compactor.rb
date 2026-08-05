@@ -328,4 +328,66 @@ class TestCompactor < Minitest::Test
              "tool result #{t[:tool_call_id]} was kept without its assistant turn")
     end
   end
+
+  # A summarization call is a real provider call. Reporting it lets the caller
+  # charge it against max_llm_calls, which is the run's only runaway-spend stop.
+  def recording_router(calls)
+    router = Object.new
+    router.define_singleton_method(:call) do |**kwargs|
+      calls << kwargs
+      { provider: "mock", model: nil, content: "summary", usage: {}, cost_usd: nil }
+    end
+    router
+  end
+
+  def compactor_with(router, keep_recent: 40)
+    Riggs::Workflow::Compactor.new(router: router, chain: ["mock"], budget: 1_000,
+                                   reserve: 100, keep_recent: keep_recent)
+  end
+
+  def long_messages
+    [{ role: "user", content: "x" * 4_000 }, { role: "user", content: "y" * 100 }]
+  end
+
+  def test_compact_reports_the_llm_call_it_made
+    calls = []
+    result = compactor_with(recording_router(calls)).compact(messages: long_messages, step_key: "s", model: nil)
+
+    assert_equal 1, calls.length, "test setup: this transcript must trigger a summarization call"
+    assert_equal 1, result[:llm_calls]
+  end
+
+  def test_compact_reports_no_llm_call_when_it_does_nothing
+    result = compactor_with(recording_router([])).compact(
+      messages: [{ role: "user", content: "tiny" }], step_key: "s", model: nil
+    )
+
+    assert_equal "noop", result[:strategy], "test setup: this transcript must not need compacting"
+    assert_equal 0, result[:llm_calls]
+  end
+
+  # A degraded summarization still spent wall-clock and may have spent tokens.
+  def test_compact_reports_the_llm_call_even_when_summarization_fails
+    result = compactor_with(failing_router).compact(messages: long_messages, step_key: "s", model: nil)
+
+    assert_equal "truncated", result[:strategy]
+    assert_equal 1, result[:llm_calls]
+  end
+
+  # The summarization call hardcoded a 60-second timeout, so a compaction that
+  # started one second before the run's deadline could run a further minute.
+  def test_compact_passes_the_callers_timeout_to_the_summarization_call
+    calls = []
+    compactor_with(recording_router(calls)).compact(messages: long_messages, step_key: "s",
+                                                    model: nil, timeout: 7)
+
+    assert_equal 7, calls.first[:timeout]
+  end
+
+  def test_compact_falls_back_to_its_own_timeout_when_the_caller_gives_none
+    calls = []
+    compactor_with(recording_router(calls)).compact(messages: long_messages, step_key: "s", model: nil)
+
+    assert_operator calls.first[:timeout], :>, 0
+  end
 end

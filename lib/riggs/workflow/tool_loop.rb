@@ -47,13 +47,19 @@ module Riggs
         loop do
           check_guardrails!
           compact_if_needed!(messages, step)
+          # Checked twice on purpose: compaction can itself make a provider
+          # call, so the budget it consumed has to be tested before the
+          # answering call is dispatched. Skipping this let max_llm_calls: 1
+          # buy two calls.
+          check_guardrails!
           result = @router.call(
             chain: chain,
             messages: messages,
             system: sys,
             timeout: remaining_timeout,
             session_id: @session_id,
-            tools: tools.empty? ? nil : tools
+            tools: tools.empty? ? nil : tools,
+            on_failed_attempt: ->(provider:, attempt:, **) { record_failed_attempt(step, provider, attempt) }
           )
           @llm_calls += 1
           @record_call&.call(
@@ -111,12 +117,24 @@ module Riggs
 
       # Mutates `messages` in place so the caller's array — which GraphEngine
       # also holds a reference to — reflects the compacted transcript.
+      # A dispatched attempt that failed is a call that happened and measured
+      # nothing. Recording it unmeasured keeps the coverage denominator honest;
+      # omitting it made every session look fully accounted for.
+      def record_failed_attempt(step, provider, attempt)
+        @record_call&.call(
+          step_key: step.id, provider: provider, model: nil,
+          relay_attempt: attempt, usage: Usage::EMPTY.dup, cost_usd: nil
+        )
+      end
+
       def compact_if_needed!(messages, step)
         return unless @compactor
         return unless @compactor.over_budget?(messages, model: @last_model,
                                                         anchor: @anchor_tokens, anchored_count: @anchored_count)
 
-        outcome = @compactor.compact(messages: messages, step_key: step.id, model: @last_model)
+        outcome = @compactor.compact(messages: messages, step_key: step.id, model: @last_model,
+                                     timeout: remaining_timeout)
+        @llm_calls += outcome[:llm_calls].to_i
         messages.replace(outcome[:messages])
         @anchor_tokens = nil
         @anchored_count = 0

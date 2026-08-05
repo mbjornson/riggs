@@ -181,11 +181,35 @@ class TestGraphEngine < Minitest::Test
     end
   end
 
+  # build_messages needs the step it is building for (so a compaction's
+  # summarization call lands on the right ledger row) and the chain to route
+  # that call through. Production supplies both; this mirrors it.
+  def messages_for(engine, input)
+    workflow = engine.instance_variable_get(:@workflow)
+    step = workflow[:steps].last
+    chain = engine.instance_variable_get(:@router).chain_for(step: step, workflow: workflow)
+    engine.send(:build_messages, input, step: step, chain: chain)
+  end
+
+  # Compaction writes an audit row, and riggs_audit has a foreign key to
+  # riggs_sessions. Without a session the write fails, the Compactor's rescue
+  # swallows it, and every compaction silently degrades to truncation -- the
+  # bug that shipped once already. execute() always creates the session first;
+  # a test that pokes build_messages directly has to do the same.
+  def with_session(engine)
+    storage = engine.instance_variable_get(:@storage)
+    engine.instance_variable_set(
+      :@session_id,
+      storage.create_session(workflow_name: "budget_test", user_id: "test_user", memory_namespace: "test")
+    )
+    engine
+  end
+
   def test_build_messages_keeps_all_outputs_under_budget
     engine = engine_with(context_window: 128_000)
     engine.instance_variable_set(:@outputs, { first: "a" * 100, second: "b" * 100 })
 
-    messages = engine.send(:build_messages, "next input")
+    messages = messages_for(engine, "next input")
 
     assert_equal 3, messages.length, "two history turns plus the new user turn"
     assert_equal "user", messages.last[:role]
@@ -199,47 +223,59 @@ class TestGraphEngine < Minitest::Test
     engine = engine_with(context_window: Riggs::Workflow::Loader::CONTEXT_BUDGETS[:short])
     engine.instance_variable_set(:@outputs, { first: "a" * 100, second: "b" * 100 })
 
-    messages = engine.send(:build_messages, "next input")
+    messages = messages_for(engine, "next input")
 
     assert_equal 3, messages.length,
                  "a short workflow retains history; it does not silently drop all of it"
   end
 
-  def test_build_messages_drops_oldest_outputs_over_budget
-    engine = engine_with(context_window: 100, reserve_tokens: 0)
+  # The cross-step site used to DROP oversized step outputs -- no summary, no
+  # audit event, no error. The immediately preceding step's result could vanish
+  # from the next step's context while an older, smaller one was kept, so a
+  # decision or identifier produced by step N never reached step N+1.
+  def test_build_messages_compacts_history_over_budget_rather_than_dropping_it
+    engine = with_session(engine_with(context_window: 100, reserve_tokens: 0))
     engine.instance_variable_set(:@outputs, { first: "a" * 4_000, second: "b" * 4_000 })
 
-    messages = engine.send(:build_messages, "next input")
+    messages = messages_for(engine, "next input")
 
-    assert_operator messages.length, :<, 3
+    assert(messages.any? { |m| m[:content].to_s.include?("[compacted summary]") },
+           "history over budget is summarized, not silently discarded")
+  end
+
+  def test_cross_step_compaction_is_audited
+    engine = with_session(engine_with(context_window: 100, reserve_tokens: 0))
+    engine.instance_variable_set(:@outputs, { first: "a" * 4_000, second: "b" * 4_000 })
+
+    messages_for(engine, "next input")
+    event = engine.audit_log.find { |e| e[:event_type] == "context_compacted" }
+
+    refute_nil event, "an operator cannot see cross-step compaction that emits no event"
+    assert_equal "cross_step", event[:payload][:site]
   end
 
   def test_build_messages_returns_history_oldest_first
     engine = engine_with(context_window: 128_000)
     engine.instance_variable_set(:@outputs, { first: "OLDEST", second: "NEWEST" })
 
-    contents = engine.send(:build_messages, "input").map { |m| m[:content] }
+    contents = messages_for(engine, "input").map { |m| m[:content] }
 
     assert_operator contents.index("OLDEST"), :<, contents.index("NEWEST"),
                     "history must stay chronological even though selection walks backwards"
   end
 
-  # first (older) is small enough to fit the ceiling on its own; second
-  # (newer) alone already blows past it. A `break` on the first oversized
-  # turn stops the newest-to-oldest walk before `first` is ever evaluated, so
-  # it would be silently dropped even though there was ample room for it.
-  # `next` skips only the oversized turn and keeps walking, so `first`
-  # survives. test_build_messages_drops_oldest_outputs_over_budget cannot
-  # distinguish the two because both of its outputs are equally oversized.
-  def test_build_messages_keeps_an_older_turn_that_fits_past_a_newer_oversized_one
-    engine = engine_with(context_window: 100, reserve_tokens: 0)
+  # The newest step output is the handoff to the step being built. Under the
+  # old drop-based selection an oversized newest turn was skipped entirely
+  # while an older turn that happened to fit was kept -- the one turn most
+  # likely to matter was the one most likely to be discarded.
+  def test_build_messages_never_discards_the_newest_output_outright
+    engine = with_session(engine_with(context_window: 100, reserve_tokens: 0))
     engine.instance_variable_set(:@outputs, { first: "x" * 20, second: "y" * 20_000 })
 
-    messages = engine.send(:build_messages, "next input")
+    messages = messages_for(engine, "next input")
 
-    assert(messages.any? { |m| m[:content] == "x" * 20 },
-           "an older turn that fits the budget must survive a newer oversized one, " \
-           "not be discarded because the walk stopped early")
+    assert(messages.any? { |m| m[:content].to_s.include?("[compacted summary]") },
+           "the newest output must be summarized into the history, never dropped on the floor")
   end
 
   def test_cli_only_chain_audits_compaction_unanchored

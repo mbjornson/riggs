@@ -75,7 +75,8 @@ Normalizes a vendor `usage` hash into one shape:
 | Provider | Source keys |
 |---|---|
 | `anthropic` | `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` |
-| `openai_compatible`, `mock` | `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens` |
+| `openai_compatible` | `prompt_tokens`, `completion_tokens`, `prompt_tokens_details.cached_tokens` |
+| `mock` | `{}` — **unmeasured**. Corrected 2026-08-05: it reported string *lengths* as token counts, so every offline run displayed ~4x-inflated numbers labelled measured |
 | `cursor_cloud` | `{duration_ms:}` — no token keys, therefore **unmeasured** |
 | `cli`, `claude_cli`, `codex_cli`, `cursor_cli` | `{}` — **unmeasured** |
 
@@ -175,9 +176,19 @@ per-model override lives in that configuration and is gone downstream.
 `cost_usd` is `nil` — never `0` — when usage is unmeasured, `model` is `nil`, or
 the model has no entry in the merged table.
 
-Failover needs no attribution logic: a failed attempt raises before returning, so
-only the answering provider ever produces a result. `relay_attempt` is already
-merged at `router.rb:52` and is recorded as-is.
+Failover needs no attribution logic for the answering provider: a failed attempt
+raises before returning, so only one provider ever produces a result.
+`relay_attempt` is already merged at `router.rb:52` and is recorded as-is.
+
+Corrected 2026-08-05: a failed attempt is still a *call*. Metering only the
+provider that answered kept dispatched-but-failed attempts out of
+`riggs_provider_calls` entirely, so a provider that accepted and billed a
+request before timing out on the read was spend with no row — and session
+coverage then reported a complete count over a denominator that had already
+dropped the failure. `Router#call` takes an `on_failed_attempt:` callback,
+invoked per failed attempt as it happens (so a chain that fails outright is
+covered too), and the caller records it unmeasured: nil tokens, nil cost, real
+`relay_attempt`.
 
 ### R2.3 ToolLoop records each call
 
@@ -308,12 +319,18 @@ recovers from the case where it does not.
 Both unbounded-growth sites are covered. Covering only one leaves the other
 able to fail a run.
 
-- **Cross-step history** — `GraphEngine#build_messages` (`graph_engine.rb:315`)
-  selects prior step outputs by token budget instead of `last(window)`. It walks
-  newest-to-oldest accumulating until the next output would breach the ceiling,
-  then **emits the retained set in chronological order**. Selection order and
-  emission order are opposite, and the returned array must stay oldest-first —
-  reversing it would scramble the conversation the provider sees.
+- **Cross-step history** — `GraphEngine#build_messages` assembles the prior step
+  outputs oldest-first and compacts them when they exceed the ceiling, routing
+  the summarization call through the step's own chain and auditing it with
+  `site: "cross_step"`.
+
+  Corrected 2026-08-05. As first shipped this site did not compact at all: it
+  walked newest-to-oldest and **skipped** any output that would breach the
+  ceiling. That silently discarded step outputs with no summary and no event,
+  and because the walk kept going, the turn most likely to be dropped was the
+  newest one — the immediate handoff to the step being built. R3.6's test
+  criterion codified the skip, which is why the contradiction with the
+  Definition of Done below survived review.
 - **Intra-step tool loop** — `ToolLoop#run` checks the estimate before each
   `@router.call`. Over the ceiling, it compacts.
 
@@ -370,8 +387,15 @@ estimate-driven compaction from a measured one.
 - Instantiated from `Loader`'s **actual defaults** (not hand-picked numbers):
   every `context_window` word leaves a ceiling greater than zero, and a
   transcript over the default ceiling is compacted below it.
-- `build_messages` drops the oldest step outputs when the budget is exceeded and
-  returns all of them when it is not.
+- `build_messages` returns every step output when the budget allows, and
+  summarizes rather than discards when it does not — including when the
+  offending output is the newest one.
+- Cross-step compaction emits a `context_compacted` event carrying
+  `site: "cross_step"`.
+- A summarization call counts against `max_llm_calls` and inherits the caller's
+  remaining timeout, at both sites.
+- Every dispatched provider attempt reaches `riggs_provider_calls`, including
+  ones that failed, recorded unmeasured.
 - A tool loop driven past the ceiling compacts and continues rather than raising.
 - The summarization call appears in `riggs_provider_calls` attributed to the
   originating step.

@@ -212,4 +212,57 @@ class TestModelInfo < Minitest::Test
                       "#{model} is a shipped provider default and must carry a price and context window"
     end
   end
+
+  # Providers report the model the API actually served, which for OpenAI is a
+  # dated build ID no shipped table can enumerate. Exact-match-only lookup made
+  # every real call unpriced while the undated alias in the table priced fine.
+  def test_a_dated_model_id_prices_as_its_base_model
+    usage = { input_tokens: 1000, output_tokens: 500, cache_read_tokens: nil,
+              cache_write_tokens: nil, measured: true }
+
+    assert_in_delta Riggs::ModelInfo.cost(model: "gpt-4o-mini", usage: usage),
+                    Riggs::ModelInfo.cost(model: "gpt-4o-mini-2024-07-18", usage: usage)
+  end
+
+  def test_a_dated_model_id_resolves_the_longest_matching_key
+    # "claude-opus-4-6" and "claude-opus-4-8" both exist; a dated 4-6 build must
+    # not fall back to some shorter prefix that happens to also match.
+    assert_equal Riggs::ModelInfo.context_window("claude-opus-4-6"),
+                 Riggs::ModelInfo.context_window("claude-opus-4-6-20260301")
+  end
+
+  def test_a_dated_model_id_reads_an_override_for_its_base_model
+    overrides = { "test-model" => { input: 2.0 } }
+    usage = { input_tokens: 1_000_000, output_tokens: nil, cache_read_tokens: nil,
+              cache_write_tokens: nil, measured: true }
+
+    assert_in_delta 2.0, Riggs::ModelInfo.cost(model: "test-model-20260101", usage: usage, overrides: overrides)
+  end
+
+  def test_an_unrelated_model_sharing_a_prefix_is_not_matched
+    # "gpt-4o-mini" must not answer for "gpt-4o-minimax" -- only a dated
+    # variant (base + "-" + suffix) counts, and this one is a different family.
+    assert_nil Riggs::ModelInfo.lookup("gpt-4o-miniature")
+  end
+
+  # The invariant is "unpriced is nil, never 0". A model priced for output but
+  # not input reported 0.0 for an input-only call: a confident zero for tokens
+  # that were measured, billed, and unpriceable.
+  def test_cost_is_nil_when_a_reported_category_has_no_rate
+    usage = { input_tokens: 10, output_tokens: nil, cache_read_tokens: nil,
+              cache_write_tokens: nil, measured: true }
+
+    assert_nil Riggs::ModelInfo.cost(model: "half", usage: usage,
+                                     overrides: { "half" => { input: nil, output: 1.0 } })
+  end
+
+  # The converse must keep working: OpenAI has no cache-write price at all, and
+  # every OpenAI call reports zero cache writes. Zero unpriceable tokens cost
+  # nothing knowable, so they must not nil out an otherwise priceable call.
+  def test_a_zero_token_category_with_no_rate_does_not_nil_the_cost
+    usage = { input_tokens: 1000, output_tokens: 500, cache_read_tokens: nil,
+              cache_write_tokens: 0, measured: true }
+
+    refute_nil Riggs::ModelInfo.cost(model: "gpt-4o-mini", usage: usage)
+  end
 end

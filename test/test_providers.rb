@@ -348,49 +348,61 @@ class TestProviders < Minitest::Test
     assert_equal "claude-configured", parsed[:model]
   end
 
-  def test_router_normalizes_usage_on_the_result
-    router = Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } })
+  # A provider that reports a real vendor-shaped usage block. The mock provider
+  # deliberately reports none (it has no tokenizer and must not invent counts),
+  # so metering tests need something that does.
+  def metered_provider
+    Class.new(Riggs::Providers::Base) do
+      def complete(**)
+        raw = { prompt_tokens: 5, completion_tokens: 7 }
+        { provider: name, model: options[:model], content: "ok", tool_calls: [],
+          usage: raw, raw: { usage: raw } }
+      end
+    end
+  end
 
-    result = router.call(chain: ["mock"], messages: [{ role: "user", content: "hello" }])
+  def metered_router(opts = {})
+    Riggs::Providers::Router.new(
+      hub_providers: { metered: { type: "metered" }.merge(opts) },
+      registry: { "metered" => metered_provider }
+    )
+  end
+
+  def test_router_normalizes_usage_on_the_result
+    result = metered_router.call(chain: ["metered"], messages: [{ role: "user", content: "hello" }])
 
     assert result[:usage][:measured]
     assert_kind_of Integer, result[:usage][:total_tokens]
   end
 
   def test_router_prices_a_call_using_hubrc_overrides
-    router = Riggs::Providers::Router.new(
-      hub_providers: {
-        mock: { type: "mock", model: "priced-model",
-                pricing: { "priced-model" => { input: 1000.0, output: 1000.0 } } }
-      }
-    )
+    router = metered_router(model: "priced-model",
+                            pricing: { "priced-model" => { input: 1000.0, output: 1000.0 } })
 
-    result = router.call(chain: ["mock"], messages: [{ role: "user", content: "hello" }])
+    result = router.call(chain: ["metered"], messages: [{ role: "user", content: "hello" }])
 
     refute_nil result[:cost_usd]
     assert result[:cost_usd].positive?
   end
 
   def test_router_cost_is_nil_for_an_unpriced_model
-    router = Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock", model: "unpriced-xyz" } })
+    router = metered_router(model: "unpriced-xyz")
 
-    result = router.call(chain: ["mock"], messages: [{ role: "user", content: "hello" }])
+    result = router.call(chain: ["metered"], messages: [{ role: "user", content: "hello" }])
 
     assert result[:usage][:measured], "tokens still record even when the model has no price"
     assert_nil result[:cost_usd]
   end
 
   def test_router_replaces_vendor_usage_but_preserves_it_under_raw
-    router = Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } })
-
-    result = router.call(chain: ["mock"], messages: [{ role: "user", content: "hello" }])
+    result = metered_router.call(chain: ["metered"], messages: [{ role: "user", content: "hello" }])
 
     # The normalized shape uses canonical names...
     assert_includes result[:usage].keys, :input_tokens
     refute_includes result[:usage].keys, :prompt_tokens
     # ...while raw keeps the vendor's own.
     assert_includes result[:raw][:usage].keys, :prompt_tokens
-    assert_equal 5, result[:raw][:usage][:prompt_tokens], "mock counts the user text length"
+    assert_equal 5, result[:raw][:usage][:prompt_tokens]
   end
 
   # R2.7: usage belongs to the provider that answered, not the first one tried.
@@ -401,14 +413,45 @@ class TestProviders < Minitest::Test
       end
     end
     router = Riggs::Providers::Router.new(
-      hub_providers: { flaky: { type: "flaky" }, mock: { type: "mock" } },
-      registry: { "flaky" => failing, "mock" => Riggs::Providers::Mock }
+      hub_providers: { flaky: { type: "flaky" }, metered: { type: "metered" } },
+      registry: { "flaky" => failing, "metered" => metered_provider }
     )
 
-    result = router.call(chain: %w[flaky mock], messages: [{ role: "user", content: "hello" }])
+    result = router.call(chain: %w[flaky metered], messages: [{ role: "user", content: "hello" }])
 
-    assert_equal "mock", result[:provider]
+    assert_equal "metered", result[:provider]
     assert_equal 2, result[:relay_attempt]
     assert result[:usage][:measured], "the answering provider's usage is what gets recorded"
+  end
+
+  # The mock provider counted string LENGTHS and shipped them as measured token
+  # counts, so every mock run reported ~4x-inflated "measured" tokens and the
+  # demo workflow displayed character counts wearing a token label.
+  def test_mock_reports_no_measured_usage
+    router = Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } })
+
+    result = router.call(chain: ["mock"], messages: [{ role: "user", content: "hello" }])
+
+    refute result[:usage][:measured], "mock has no tokenizer and must not claim measured tokens"
+    assert_nil result[:usage][:total_tokens]
+  end
+
+  # Coverage is per-call, so a provider that measures some turns and not others
+  # reports a fraction no operator can act on. Mock reports none, uniformly.
+  def test_mock_reports_no_usage_on_every_branch
+    provider = Riggs::Providers::Mock.new(name: "mock", options: {})
+    tools = [{ name: "lookup_runbook", description: "x" }]
+    branches = [
+      provider.complete(messages: [{ role: "user", content: "please lookup the runbook" }], tools: tools),
+      provider.complete(messages: [{ role: "user", content: "database down" }]),
+      provider.complete(messages: [{ role: "user", content: "hello" }])
+    ]
+
+    branches.each do |result|
+      normalized = Riggs::Usage.normalize(result[:usage])
+
+      refute normalized[:measured], "every mock branch must report the same (absent) usage"
+      assert_nil normalized[:total_tokens]
+    end
   end
 end

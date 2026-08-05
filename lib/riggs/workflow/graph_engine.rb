@@ -194,9 +194,12 @@ module Riggs
 
           resolved_input = Loader.resolve_context(current.input, workflow_context)
           system_prompt = build_system_prompt(current)
-          messages = build_messages(resolved_input)
+          # Chain first: cross-step compaction routes its summarization call
+          # through this step's own chain, so it has to be resolved before the
+          # history that may need compacting is assembled.
           chain = @router.chain_for(step: current, workflow: @workflow)
           announce_unanchored_compaction!(chain)
+          messages = build_messages(resolved_input, step: current, chain: chain)
           persist_bridge(role: "user", content: resolved_input, step_key: current.id)
 
           loop_runner = ToolLoop.new(
@@ -333,34 +336,37 @@ module Riggs
         parts.join("\n\n")
       end
 
-      # Selects prior step outputs by token budget rather than step count.
-      # The walk is newest-to-oldest; a turn that would push the total over
-      # the ceiling is skipped rather than stopping the walk, so history can
-      # end up non-contiguous -- an older turn that fits is kept even when a
-      # newer one did not. The emitted array is chronological -- a provider
-      # reading it in selection order would see the conversation backwards.
-      def build_messages(resolved_input)
-        ceiling = compactor.ceiling(model: nil)
+      # Assembles the prior step outputs, oldest first, and compacts them if
+      # they exceed the token budget.
+      #
+      # This used to SKIP any turn that would push the total over the ceiling.
+      # That silently discarded step outputs -- no summary, no audit event, no
+      # error -- and because the walk ran newest-to-oldest and kept going, the
+      # turn most likely to be dropped was the newest one: the immediate
+      # handoff to the step being built. A decision or identifier produced by
+      # step N could simply never reach step N+1, while an older, smaller
+      # output survived. Summarizing collapses the same excess without
+      # deciding, unilaterally and invisibly, that some step's work did not
+      # matter.
+      def build_messages(resolved_input, step:, chain:)
+        comp = compactor_for(chain)
         vars = @workflow[:steps].map(&:output_var).map(&:to_sym).select { |k| @outputs.key?(k) }
+        history = vars.map { |var| { role: "assistant", content: @outputs[var].to_s } }
+        messages = history + [{ role: "user", content: resolved_input }]
+        return messages unless comp.over_budget?(messages, model: nil)
 
-        kept = []
-        used = Usage.estimate([{ role: "user", content: resolved_input }])
-        vars.reverse_each do |var|
-          turn = { role: "assistant", content: @outputs[var].to_s }
-          size = Usage.estimate([turn])
-          next if used + size > ceiling
-
-          used += size
-          kept.unshift(turn)
-        end
-
-        kept + [{ role: "user", content: resolved_input }]
+        compact_history(comp, messages, step)
       end
 
-      # build_messages only needs #ceiling, which never reads @chain, so any
-      # step's chain would do here -- the first step's is as good as any.
-      def compactor
-        compactor_for(@router.chain_for(step: @workflow[:steps].first, workflow: @workflow))
+      def compact_history(comp, messages, step)
+        outcome = comp.compact(messages: messages, step_key: step.id, model: nil,
+                               timeout: @workflow[:timeout_seconds])
+        @llm_calls += outcome[:llm_calls].to_i
+        log_event("context_compacted",
+                  { step: step.id, site: "cross_step", strategy: outcome[:strategy],
+                    before: outcome[:before], after: outcome[:after],
+                    collapsed: outcome[:collapsed] })
+        outcome[:messages]
       end
 
       # Memoized per chain, not globally: Router#chain_for honors a step's own
@@ -370,12 +376,19 @@ module Riggs
       # first step's provider chain instead of its own the moment ToolLoop
       # starts calling #compact. Most workflows share one chain across steps,
       # so this cache still collapses to a single Compactor in the common case.
+      # Keyed on the session as well as the chain. session_id is captured at
+      # construction, and a Compactor holding a session_id with no row writes
+      # an audit that fails the riggs_audit -> riggs_sessions foreign key,
+      # which call_router's rescue turns into a silent degrade to truncation.
+      # That failure mode has already shipped once (Task 12); keying on the
+      # session means a compactor built before the session existed is never
+      # reused after it does.
       def compactor_for(chain)
-        key = Array(chain).map(&:to_s)
+        key = [Array(chain).map(&:to_s), @session_id]
         @compactors ||= {}
         @compactors[key] ||= Compactor.new(
           router: @router,
-          chain: key,
+          chain: key.first,
           budget: @workflow[:context_window],
           reserve: @workflow[:reserve_tokens],
           keep_recent: @workflow[:keep_recent_tokens],

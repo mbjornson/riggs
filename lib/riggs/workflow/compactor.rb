@@ -13,6 +13,9 @@ module Riggs
                        "Preserve decisions, tool results, and any identifiers. " \
                        "Write it as a factual record, not a reply."
 
+      # Only used when a caller supplies no remaining-budget timeout of its own.
+      DEFAULT_SUMMARY_TIMEOUT = 60
+
       def initialize(router:, chain:, budget:, reserve:, keep_recent:,
                      model_overrides: {}, record_call: nil, audit: nil, session_id: nil)
         @router = router
@@ -45,7 +48,10 @@ module Riggs
         Usage.estimate(messages, anchor: anchor, anchored_count: anchored_count) > ceiling(model: model)
       end
 
-      def compact(messages:, step_key:, model:)
+      # `timeout` is the caller's REMAINING budget. Summarization used to
+      # hardcode 60 seconds, so a compaction starting one second before a run's
+      # deadline could run a further minute past it.
+      def compact(messages:, step_key:, model:, timeout: nil)
         list = Array(messages)
         before = Usage.estimate(list)
         split = split_index(list, keep_recent_for(model))
@@ -53,11 +59,13 @@ module Riggs
 
         older = list[0...split]
         recent = list[split..] || []
-        summary = summarize(older, step_key: step_key)
+        @llm_calls = 0
+        summary = summarize(older, step_key: step_key, timeout: timeout)
 
         kept = summary ? [summary_turn(summary)] + recent : recent
         { messages: kept, strategy: summary ? "summarized" : "truncated",
-          before: before, after: Usage.estimate(kept), collapsed: older.length }
+          before: before, after: Usage.estimate(kept), collapsed: older.length,
+          llm_calls: @llm_calls }
       end
 
       private
@@ -92,7 +100,8 @@ module Riggs
       # do-nothing pass reported as a successful compaction shows an operator
       # compaction working while the request is over budget and unchanged.
       def no_op(list, before)
-        { messages: list, strategy: "noop", before: before, after: before, collapsed: 0 }
+        { messages: list, strategy: "noop", before: before, after: before, collapsed: 0,
+          llm_calls: 0 }
       end
 
       # Walks backwards accumulating until keep_recent is reached, then moves
@@ -116,9 +125,9 @@ module Riggs
         idx
       end
 
-      def summarize(older, step_key:)
+      def summarize(older, step_key:, timeout: nil)
         transcript = older.map { |m| "#{m[:role]}: #{m[:content]}" }.join("\n")
-        result = call_router(transcript)
+        result = call_router(transcript, timeout)
         return nil unless result
 
         # Outside the rescue deliberately: record_call: is caller-supplied
@@ -130,11 +139,16 @@ module Riggs
         result[:content].to_s
       end
 
-      def call_router(transcript)
+      # Counted before the call, not after: an attempt that raises still spent
+      # wall-clock and may have spent tokens on a provider that billed before
+      # failing. The caller charges this against max_llm_calls, which is the
+      # run's only hard stop on runaway spend.
+      def call_router(transcript, timeout = nil)
+        @llm_calls = @llm_calls.to_i + 1
         @router.call(
           chain: @chain,
           messages: [{ role: "user", content: "#{SUMMARY_PROMPT}\n\n#{transcript}" }],
-          timeout: 60,
+          timeout: timeout || DEFAULT_SUMMARY_TIMEOUT,
           session_id: @session_id
         )
       rescue StandardError => e

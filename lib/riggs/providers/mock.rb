@@ -66,14 +66,19 @@ module Riggs
                end
 
         tool_calls = parse_tool_line(body)
-        usage = { prompt_tokens: user_text.length, completion_tokens: body.length }
+        # No usage, deliberately, and the same on every branch above. This
+        # provider has no tokenizer: it once reported STRING LENGTHS as
+        # prompt_tokens/completion_tokens, which the pipeline recorded as
+        # measured tokens roughly 4x too large. A demo run then displayed
+        # character counts wearing a token label, which is worse than
+        # displaying nothing. Unmeasured is the honest answer, and it is
+        # exactly what a CLI-only chain reports.
         {
           provider: name,
           model: options[:model],
           content: tool_calls.empty? ? body : "",
           tool_calls: tool_calls,
-          usage: usage,
-          raw: { usage: usage }
+          usage: {}
         }
       end
     end

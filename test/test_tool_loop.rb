@@ -105,8 +105,106 @@ class TestToolLoop < Minitest::Test
 
     assert_equal 1, recorded.length
     assert_equal "triage", recorded.first[:step_key]
-    assert recorded.first[:usage][:measured]
+    refute_nil recorded.first[:usage]
     assert_equal 1, recorded.first[:relay_attempt]
+  end
+
+  def flaky_provider
+    Class.new(Riggs::Providers::Base) do
+      def complete(**)
+        raise Riggs::Providers::TimeoutError, "read timeout"
+      end
+    end
+  end
+
+  # A provider that accepted the request, billed for it, then timed out on the
+  # read is spend. Metering only the successful attempt let session coverage
+  # report "1 of 1 measured" over a denominator that had already dropped the
+  # failure -- the exact overstatement nil-not-zero exists to prevent.
+  def test_a_failed_provider_attempt_is_recorded_as_an_unmeasured_call
+    recorded = []
+    router = Riggs::Providers::Router.new(
+      hub_providers: { flaky: { type: "flaky" }, mock: { type: "mock" } },
+      registry: { "flaky" => flaky_provider, "mock" => Riggs::Providers::Mock }
+    )
+    loop_runner = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: nil, skill_registry: nil,
+      audit: ->(**) {}, record_call: ->(**kw) { recorded << kw },
+      llm_calls: 0, max_llm_calls: 5, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+
+    loop_runner.run(step: build_step, chain: %w[flaky mock], messages: [{ role: "user", content: "hello" }],
+                    system_prompt: "sys", io: StringIO.new)
+
+    assert_equal 2, recorded.length, "both the failed attempt and the answering one are calls"
+    failed = recorded.find { |r| r[:provider] == "flaky" }
+    refute_nil failed, "the failed attempt must reach the ledger"
+    refute failed[:usage][:measured], "a failed attempt reports no tokens, and says so"
+    assert_nil failed[:cost_usd]
+    assert_equal 1, failed[:relay_attempt]
+  end
+
+  def test_a_chain_that_fails_entirely_still_records_its_attempts
+    recorded = []
+    router = Riggs::Providers::Router.new(
+      hub_providers: { flaky: { type: "flaky" } },
+      registry: { "flaky" => flaky_provider }
+    )
+    loop_runner = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: nil, skill_registry: nil,
+      audit: ->(**) {}, record_call: ->(**kw) { recorded << kw },
+      llm_calls: 0, max_llm_calls: 5, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+
+    assert_raises(Riggs::Providers::Error) do
+      loop_runner.run(step: build_step, chain: ["flaky"], messages: [{ role: "user", content: "hello" }],
+                      system_prompt: "sys", io: StringIO.new)
+    end
+
+    assert_equal 1, recorded.length, "a chain that fails entirely still spent the attempt"
+    refute recorded.first[:usage][:measured]
+  end
+
+  def compacting_loop(max_llm_calls:, record_call: ->(**) {})
+    router = Riggs::Providers::Router.new(hub_providers: { mock: { type: "mock" } })
+    compactor = Riggs::Workflow::Compactor.new(
+      router: router, chain: ["mock"], budget: 1_000, reserve: 100, keep_recent: 40
+    )
+    Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: nil, skill_registry: nil, audit: ->(**) {},
+      record_call: record_call, compactor: compactor, llm_calls: 0,
+      max_llm_calls: max_llm_calls, timeout_seconds: 60,
+      started_at: Time.now, session_id: "sess-1"
+    )
+  end
+
+  # max_llm_calls is the run's only hard stop on runaway spend. The
+  # summarization call did not increment the counter, so a limit of 1 bought
+  # two provider calls and the loop reported one.
+  def test_compaction_counts_against_max_llm_calls
+    assert_raises(Riggs::WorkflowError) do
+      compacting_loop(max_llm_calls: 1).run(
+        step: build_step, chain: ["mock"],
+        messages: [{ role: "user", content: "x" * 4_000 },
+                   { role: "user", content: "y" * 4_000 },
+                   { role: "user", content: "z" }],
+        system_prompt: "sys", io: StringIO.new
+      )
+    end
+  end
+
+  def test_a_compacted_turn_reports_both_calls_it_made
+    outcome = compacting_loop(max_llm_calls: 5).run(
+      step: build_step, chain: ["mock"],
+      messages: [{ role: "user", content: "x" * 4_000 },
+                 { role: "user", content: "y" * 4_000 },
+                 { role: "user", content: "z" }],
+      system_prompt: "sys", io: StringIO.new
+    )
+
+    assert_equal 2, outcome[:llm_calls], "one summarization call plus one answering call"
   end
 
   def test_runs_without_a_record_call_callable
