@@ -113,6 +113,8 @@ module Riggs
       yml = File.join(dir, "SKILL.yml")
       if File.exist?(yml)
         raw = Psych.safe_load(File.read(yml), permitted_classes: [Symbol], aliases: true) || {}
+        raise ArgumentError, "SKILL.yml must be a mapping, got #{raw.class}" unless raw.is_a?(Hash)
+
         return { data: raw, body: nil }
       end
 

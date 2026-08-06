@@ -188,12 +188,13 @@ class TestSkills < Minitest::Test
       write_skill_md("healthy", "---\nname: healthy\n---\nBody.\n")
 
       names = nil
-      out = capture_io { names = registry.list_names }.join
+      stdout, stderr = capture_io { names = registry.list_names }
 
       assert_includes names, "healthy"
       refute_includes names, "broken"
-      assert_match(/skipping skill/, out)
-      assert_match(%r{config/riggs/skills/broken}, out)
+      assert_match(/skipping skill/, stderr)
+      assert_match(%r{config/riggs/skills/broken}, stderr)
+      assert_empty stdout
     end
   end
 
@@ -236,6 +237,22 @@ class TestSkills < Minitest::Test
 
       assert_includes names, "triage_v1", "the bundled skill must still load"
       refute_includes names, "badyml"
+    end
+  end
+
+  # The mapping guard applies to the native container too: a SKILL.yml that
+  # parses to a list or scalar must not crash sibling skills either.
+  def test_a_skill_yml_with_non_mapping_content_is_skipped
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/listy")
+      File.write("config/riggs/skills/listy/SKILL.yml", "- one\n- two\n")
+      write_skill_md("healthy", "---\nname: healthy\n---\nBody.\n")
+
+      names = nil
+      capture_io { names = registry.list_names }
+
+      refute_includes names, "listy"
+      assert_includes names, "healthy"
     end
   end
 end
