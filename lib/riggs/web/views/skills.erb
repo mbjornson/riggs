@@ -6,13 +6,14 @@
     <p class="muted">No skills found.</p>
   <% else %>
     <table>
-      <thead><tr><th>Name</th><th>Versions</th><th>Latest</th></tr></thead>
+      <thead><tr><th>Name</th><th>Versions</th><th>Latest</th><th>Description</th></tr></thead>
       <tbody>
         <% skills.each do |sk| %>
           <tr>
             <td><%= h((sk[:name] || sk['name']).to_s) %></td>
             <td><%= h(Array(sk[:versions] || sk['versions']).join(', ')) %></td>
             <td><%= h((sk[:latest] || sk['latest']).to_s) %></td>
+            <td><%= h((sk[:description] || sk['description']).to_s) %></td>
           </tr>
         <% end %>
       </tbody>

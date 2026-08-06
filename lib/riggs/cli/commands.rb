@@ -475,7 +475,11 @@ module Riggs
       if list.empty?
         puts "No skills found in config/riggs/skills"
       else
-        list.each { |s| puts "• #{s[:name]} (latest #{s[:latest]}; versions: #{s[:versions].join(', ')})" }
+        list.each do |s|
+          line = "• #{s[:name]} (latest #{s[:latest]}; versions: #{s[:versions].join(', ')})"
+          line = "#{line} — #{s[:description]}" unless s[:description].to_s.empty?
+          puts line
+        end
       end
     end
 
@@ -486,6 +490,7 @@ module Riggs
       abort "❌ Skill not found: #{name}" unless skill
 
       print_header("Skill #{skill[:name]}@#{skill[:version]}")
+      puts skill[:description] unless skill[:description].to_s.empty?
       puts skill[:system_prompt]
       puts "\nMCP servers: #{skill[:mcp_servers].empty? ? '(none)' : skill[:mcp_servers].join(', ')}"
       puts "Tools:"

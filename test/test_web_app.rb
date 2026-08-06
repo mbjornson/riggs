@@ -454,6 +454,20 @@ class TestWebApp < Minitest::Test
     end
   end
 
+  def test_skills_page_shows_the_description
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/writer")
+      File.write("config/riggs/skills/writer/SKILL.md",
+                 "---\nname: writer\ndescription: Writes clearly.\n---\nBody.\n")
+
+      header "X-Riggs-User", "eng_bob"
+      get "/skills"
+
+      assert_equal 200, last_response.status
+      assert_includes last_response.body, "Writes clearly."
+    end
+  end
+
   def create_session_with_usage
     storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
     id = storage.create_session(workflow_name: "example_triage", user_id: "eng_bob", memory_namespace: "ns")

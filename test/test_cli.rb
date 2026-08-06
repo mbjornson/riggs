@@ -45,4 +45,29 @@ class TestCLI < Minitest::Test
       assert_match(/Memory Recall/i, out)
     end
   end
+
+  def test_skills_show_prints_the_description
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/writer")
+      File.write("config/riggs/skills/writer/SKILL.md",
+                 "---\nname: writer\ndescription: Writes clearly.\n---\nBody.\n")
+
+      out = capture_io { Riggs::CLI.start(%w[skills:show writer]) }.first
+
+      assert_match(/Writes clearly\./, out)
+    end
+  end
+
+  def test_skills_list_prints_the_description
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/writer")
+      File.write("config/riggs/skills/writer/SKILL.md",
+                 "---\nname: writer\ndescription: Writes clearly.\n---\nBody.\n")
+
+      out = capture_io { Riggs::CLI.start(%w[skills:list]) }.first
+
+      assert_match(/writer/, out)
+      assert_match(/Writes clearly\./, out)
+    end
+  end
 end
