@@ -139,4 +139,44 @@ class TestSkills < Minitest::Test
       assert_includes registry.list_names, "writer"
     end
   end
+
+  def test_description_reaches_the_loaded_skill
+    with_tmp_project do
+      write_skill_md("writer", "---\nname: writer\ndescription: Writes clearly.\n---\nBody.\n")
+
+      assert_equal "Writes clearly.", registry.load("writer")[:description]
+    end
+  end
+
+  # One key space in two containers: description works in SKILL.yml too.
+  def test_description_works_in_skill_yml_as_well
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/ymldesc")
+      File.write("config/riggs/skills/ymldesc/SKILL.yml", "name: ymldesc\ndescription: From yaml.\nsystem_prompt: x\n")
+
+      assert_equal "From yaml.", registry.load("ymldesc")[:description]
+    end
+  end
+
+  def test_a_skill_without_a_description_reports_an_empty_string
+    with_tmp_project do
+      write_skill_md("plain", "---\nname: plain\n---\nBody.\n")
+
+      assert_equal "", registry.load("plain")[:description]
+    end
+  end
+
+  # list groups by name across versions; the description shown must be the one
+  # belonging to the version list also reports as `latest`.
+  def test_list_reports_the_newest_versions_description
+    with_tmp_project do
+      write_skill_md("multi@1.0.0", "---\nname: multi\nversion: \"1.0.0\"\ndescription: old one\n---\nB.\n")
+      write_skill_md("multi@2.0.0", "---\nname: multi\nversion: \"2.0.0\"\ndescription: new one\n---\nB.\n")
+
+      row = registry.list.find { |s| s[:name] == "multi" }
+
+      assert_equal "2.0.0", row[:latest]
+      assert_equal "new one", row[:description]
+    end
+  end
 end

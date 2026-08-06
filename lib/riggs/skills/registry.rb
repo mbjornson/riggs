@@ -33,16 +33,9 @@ module Riggs
         data = read_skill_dir(dir, entry)
         next unless data
 
-        by_name[data[:name]] << data[:version]
+        by_name[data[:name]] << { version: data[:version], description: data[:description] }
       end
-      by_name.keys.sort.map do |name|
-        versions = by_name[name].uniq.sort_by do |v|
-          Gem::Version.new(normalize_version(v))
-        rescue StandardError
-          Gem::Version.new("0")
-        end
-        { name: name, versions: versions, latest: versions.last }
-      end
+      by_name.keys.sort.map { |name| summarize(name, by_name[name]) }
     end
 
     def list_names
@@ -98,6 +91,7 @@ module Riggs
       {
         name: name,
         version: version,
+        description: (data[:description] || "").to_s,
         system_prompt: resolve_prompt(dir, data, source[:body]),
         tools: normalize_tools(Array(data[:tools])),
         mcp_servers: Array(data[:mcp_servers]).map(&:to_s),
@@ -150,6 +144,7 @@ module Riggs
       {
         name: data[:name],
         version: data[:version],
+        description: data[:description],
         system_prompt: data[:system_prompt],
         tools: data[:tools],
         mcp_servers: data[:mcp_servers]
@@ -164,6 +159,22 @@ module Riggs
 
     def normalize_version(ver)
       ver.to_s.sub(/\Av/i, "")
+    end
+
+    # The description reported for a name must belong to the same version
+    # reported as `latest`, or the table describes one skill and versions
+    # another.
+    def summarize(name, entries)
+      ordered = entries.uniq { |e| e[:version] }.sort_by { |e| sortable_version(e[:version]) }
+      newest = ordered.last
+      { name: name, versions: ordered.map { |e| e[:version] },
+        latest: newest&.fetch(:version), description: newest ? newest[:description] : "" }
+    end
+
+    def sortable_version(ver)
+      Gem::Version.new(normalize_version(ver))
+    rescue StandardError
+      Gem::Version.new("0")
     end
 
     def version_eq?(a, b)
