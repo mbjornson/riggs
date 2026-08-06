@@ -97,6 +97,13 @@ module Riggs
         mcp_servers: Array(data[:mcp_servers]).map(&:to_s),
         path: dir
       }
+    rescue Psych::SyntaxError, ArgumentError, SystemCallError => e
+      # Named classes, not StandardError: a rescue that wide would turn a
+      # genuine bug in this registry into "that skill doesn't exist", which is
+      # the failure mode Phase 7's review found hiding a real defect in
+      # Compactor#call_router.
+      warn "riggs: skipping skill at #{dir} (#{e.class}: #{e.message.to_s[0, 200]})"
+      nil
     end
 
     # SKILL.yml wins when both exist. Adding SKILL.md support must not change

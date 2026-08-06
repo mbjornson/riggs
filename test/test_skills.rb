@@ -179,4 +179,63 @@ class TestSkills < Minitest::Test
       assert_equal "new one", row[:description]
     end
   end
+
+  # One bad directory -- often imported from someone else's repository --
+  # must not take down every command that touches the registry.
+  def test_a_malformed_skill_md_is_skipped_and_its_neighbour_still_loads
+    with_tmp_project do
+      write_skill_md("broken", "---\nname: [unclosed\n---\nBody.\n")
+      write_skill_md("healthy", "---\nname: healthy\n---\nBody.\n")
+
+      names = nil
+      out = capture_io { names = registry.list_names }.join
+
+      assert_includes names, "healthy"
+      refute_includes names, "broken"
+      assert_match(/skipping skill/, out)
+      assert_match(%r{config/riggs/skills/broken}, out)
+    end
+  end
+
+  def test_a_malformed_skill_md_does_not_break_loading_another_skill
+    with_tmp_project do
+      write_skill_md("broken", "---\nname: [unclosed\n---\nBody.\n")
+      write_skill_md("healthy", "---\nname: healthy\n---\nGood body.\n")
+
+      skill = nil
+      capture_io { skill = registry.load("healthy") }
+
+      refute_nil skill
+      assert_equal "Good body.\n", skill[:system_prompt]
+    end
+  end
+
+  # Non-mapping frontmatter raises ArgumentError from the parser; that is a
+  # malformed file, not a crash.
+  def test_a_skill_md_with_non_mapping_frontmatter_is_skipped
+    with_tmp_project do
+      write_skill_md("listy", "---\n- one\n- two\n---\nBody.\n")
+
+      names = nil
+      capture_io { names = registry.list_names }
+
+      refute_includes names, "listy"
+    end
+  end
+
+  # The same posture applies to the native container. Today a malformed
+  # SKILL.yml raises out of #list and takes down every command that touches
+  # the registry, including runs that wanted a different skill entirely.
+  def test_a_malformed_skill_yml_is_skipped_too
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/badyml")
+      File.write("config/riggs/skills/badyml/SKILL.yml", "name: [unclosed\n")
+
+      names = nil
+      capture_io { names = registry.list_names }
+
+      assert_includes names, "triage_v1", "the bundled skill must still load"
+      refute_includes names, "badyml"
+    end
+  end
 end
