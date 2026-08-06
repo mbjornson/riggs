@@ -468,6 +468,33 @@ class TestWebApp < Minitest::Test
     end
   end
 
+  def test_skills_page_escapes_html_in_the_description
+    with_tmp_project do
+      # Descriptions come from files Riggs did not author; a skill copied in
+      # from another repository could carry markup or a script tag. The
+      # single-quoted YAML scalar below (with '' escaping the embedded
+      # apostrophes) parses to the literal: <script>alert('xss')</script> & "quotes"
+      FileUtils.mkdir_p("config/riggs/skills/writer")
+      File.write("config/riggs/skills/writer/SKILL.md", <<~MD)
+        ---
+        name: writer
+        description: '<script>alert(''xss'')</script> & "quotes"'
+        ---
+        Body.
+      MD
+
+      header "X-Riggs-User", "eng_bob"
+      get "/skills"
+
+      assert_equal 200, last_response.status
+      # CGI.escapeHTML's actual output for this input (verified directly,
+      # not guessed): & -> &amp;, " -> &quot;, ' -> &#39;, < -> &lt;, > -> &gt;.
+      assert_includes last_response.body,
+                      "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt; &amp; &quot;quotes&quot;"
+      refute_includes last_response.body, "<script>alert('xss')</script>"
+    end
+  end
+
   def create_session_with_usage
     storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
     id = storage.create_session(workflow_name: "example_triage", user_id: "eng_bob", memory_namespace: "ns")
