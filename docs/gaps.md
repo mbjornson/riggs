@@ -5,10 +5,12 @@ Open items from comparing Riggs against [Pi](https://pi.dev)'s agent harness on
 multi-user playbook orchestrator, so only the shared substrate is comparable —
 context control, session durability, observability, extensibility, and trust.
 
-Seven items came out of that comparison. Four have shipped: two in
-[`specs/phase6-persistence-and-events.md`](specs/phase6-persistence-and-events.md)
-and two in
-[`specs/phase7-token-accounting-and-compaction.md`](specs/phase7-token-accounting-and-compaction.md):
+Seven items came out of that comparison. Five have shipped: two in
+[`specs/phase6-persistence-and-events.md`](specs/phase6-persistence-and-events.md),
+two in
+[`specs/phase7-token-accounting-and-compaction.md`](specs/phase7-token-accounting-and-compaction.md),
+and one in
+[`specs/phase8-skill-md-frontmatter.md`](specs/phase8-skill-md-frontmatter.md):
 
 - ~~**#1** Message persistence and gate pause/resume~~ — shipped
 - ~~**#4** Audit event stream (poll + SSE)~~ — shipped
@@ -25,8 +27,12 @@ and two in
   `context_window` is now a token budget (`short`/`medium`/`full`/an integer),
   not a step count, and a run whose transcript exceeds it compacts instead of
   erroring.
+- ~~**#7** Read `SKILL.md` frontmatter~~ — shipped. A skill bundle may be
+  `SKILL.md` (YAML frontmatter plus a markdown body) or `SKILL.yml`, sharing
+  one key space. Discovery is unchanged: `.agents/skills/` is deliberately not
+  a root, since a repo-local one is gap #6's exposure.
 
-The three below are open. Original numbering is kept so the ranking stays legible.
+The two below are open. Original numbering is kept so the ranking stays legible.
 Gaps found outside that comparison are collected at the end, labelled as such.
 
 ---
@@ -79,25 +85,6 @@ resolve from `~/.riggs/` while only workflows and skills come from the repo.
 
 **Done when:** Cloning a hostile repo and running a Riggs command cannot execute
 attacker-chosen commands or grant attacker-chosen roles.
-
----
-
-## #7 — Read `SKILL.md` frontmatter
-
-**Now:** Skills load only from `config/riggs/skills/<name>/SKILL.yml`.
-
-**Why it matters:** Pi reads `~/.agents/skills/` and `.agents/skills/` using
-`SKILL.md` with YAML frontmatter (`name`, `description`), which is becoming the
-cross-harness convention. Riggs's YAML-only loader cannot consume that ecosystem.
-
-**Shape:** Add an alternate loader in `SkillRegistry` that parses `SKILL.md`
-frontmatter, alongside the existing `SKILL.yml` path. Riggs pins skills per step
-rather than letting the model choose one, so only the file format needs to
-interoperate, not the discovery semantics.
-
-**Done when:** An off-the-shelf `SKILL.md` drops into a workflow step unmodified.
-
-**Cheapest item on this list.**
 
 ---
 

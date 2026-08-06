@@ -2,6 +2,7 @@
 
 require "test_helper"
 require "fileutils"
+require "stringio"
 
 class TestSkills < Minitest::Test
   def test_load_latest_and_pin
@@ -253,6 +254,65 @@ class TestSkills < Minitest::Test
 
       refute_includes names, "listy"
       assert_includes names, "healthy"
+    end
+  end
+
+  # The whole point of the feature: a file written for another harness, with no
+  # Riggs-specific keys, copied in and used verbatim. Asserting on the system
+  # prompt the PROVIDER received proves the body actually reached the model,
+  # rather than merely that the registry parsed something.
+  def test_an_off_the_shelf_skill_md_drives_a_workflow_step_unmodified
+    with_tmp_project do
+      write_skill_md("code-reviewer", <<~MD)
+        ---
+        name: code-reviewer
+        description: Reviews a diff for correctness and clarity.
+        ---
+        # Code Reviewer
+
+        Review the diff. Report correctness problems before style ones.
+
+        ---
+
+        Always name the file and line.
+      MD
+
+      captured = []
+      capturing = Class.new(Riggs::Providers::Base) do
+        define_method(:complete) do |system: nil, **|
+          captured << system.to_s
+          { provider: name, model: nil, content: "reviewed", tool_calls: [], usage: {} }
+        end
+      end
+      router = Riggs::Providers::Router.new(
+        hub_providers: { cap: { type: "cap" } }, registry: { "cap" => capturing }
+      )
+
+      workflow = {
+        name: "review_flow",
+        context_window: 32_000, reserve_tokens: 16_384, keep_recent_tokens: 20_000,
+        max_llm_calls: 5, timeout_seconds: 60,
+        providers: { default: { relay_chain: ["cap"] } },
+        steps: [Riggs::Workflow::StepNode.from_hash(
+          "id" => "review", "input" => "Review this.", "output_var" => "review",
+          "skill" => "code-reviewer"
+        )]
+      }
+      engine = Riggs::Workflow::GraphEngine.new(
+        workflow: workflow,
+        user_identity: { id: "eng_bob", memory_namespace: "eng_bob_private" },
+        db_path: "./db/riggs.sqlite3",
+        provider_router: router,
+        skill_registry: registry
+      )
+
+      engine.execute(StringIO.new, input: {})
+
+      assert_equal :completed, engine.status
+      assert_includes captured.first, "Report correctness problems before style ones.",
+                      "the markdown body must reach the model as the step's system prompt"
+      assert_includes captured.first, "Always name the file and line.",
+                      "content after a horizontal rule is body, not a second frontmatter block"
     end
   end
 end
