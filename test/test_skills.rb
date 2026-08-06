@@ -34,4 +34,109 @@ class TestSkills < Minitest::Test
       assert_includes names, "triage_v1"
     end
   end
+
+  def write_skill_md(dir, contents)
+    FileUtils.mkdir_p("config/riggs/skills/#{dir}")
+    File.write("config/riggs/skills/#{dir}/SKILL.md", contents)
+  end
+
+  def registry
+    Riggs::SkillRegistry.new(roots: ["./config/riggs/skills"])
+  end
+
+  def test_loads_a_skill_from_skill_md_with_the_body_as_the_prompt
+    with_tmp_project do
+      write_skill_md("writer", "---\nname: writer\n---\nWrite clearly. Cite sources.\n")
+
+      skill = registry.load("writer")
+
+      refute_nil skill, "a SKILL.md directory must be discoverable"
+      assert_equal "Write clearly. Cite sources.\n", skill[:system_prompt]
+    end
+  end
+
+  # Same key space in both containers: an imported skill can gain a tool
+  # without being converted to SKILL.yml.
+  def test_tools_declared_in_skill_md_frontmatter_are_normalized
+    with_tmp_project do
+      write_skill_md("searcher", <<~MD)
+        ---
+        name: searcher
+        tools:
+          - name: search_issues
+            description: Search known issues.
+            mcp_server: github
+            input_schema:
+              type: object
+              properties:
+                query:
+                  type: string
+        ---
+        Search before answering.
+      MD
+
+      tool = registry.load("searcher")[:tools].first
+
+      assert_equal "search_issues", tool[:name]
+      assert_equal "github", tool[:mcp_server]
+      assert_equal "object", tool[:input_schema][:type]
+    end
+  end
+
+  def test_a_version_in_skill_md_frontmatter_can_be_pinned
+    with_tmp_project do
+      write_skill_md("pinned", "---\nname: pinned\nversion: \"2.1.0\"\n---\nBody.\n")
+
+      assert_equal "2.1.0", registry.load("pinned")[:version]
+      assert_equal "2.1.0", registry.load("pinned@2.1.0")[:version]
+      assert_nil registry.load("pinned@9.9.9")
+    end
+  end
+
+  def test_a_skill_md_without_a_name_falls_back_to_its_directory
+    with_tmp_project do
+      write_skill_md("unnamed", "---\ndescription: No name key.\n---\nBody.\n")
+
+      assert_equal "unnamed", registry.load("unnamed")[:name]
+    end
+  end
+
+  # Adding SKILL.md support must not change how any skill that exists today
+  # behaves, so the native container wins and nothing is announced.
+  def test_skill_yml_wins_when_both_files_exist
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/both")
+      File.write("config/riggs/skills/both/SKILL.yml", "name: both\nsystem_prompt: from yml\n")
+      File.write("config/riggs/skills/both/SKILL.md", "---\nname: both\n---\nfrom md\n")
+
+      assert_equal "from yml", registry.load("both")[:system_prompt]
+    end
+  end
+
+  # The existing rule -- an explicit key beats a file -- is preserved, with the
+  # markdown body slotted in between the key and prompt.md.
+  def test_an_explicit_system_prompt_key_beats_the_markdown_body
+    with_tmp_project do
+      write_skill_md("explicit", "---\nname: explicit\nsystem_prompt: from key\n---\nfrom body\n")
+
+      assert_equal "from key", registry.load("explicit")[:system_prompt]
+    end
+  end
+
+  def test_a_skill_md_with_an_empty_body_falls_back_to_prompt_md
+    with_tmp_project do
+      write_skill_md("fallback", "---\nname: fallback\n---\n")
+      File.write("config/riggs/skills/fallback/prompt.md", "from prompt.md")
+
+      assert_equal "from prompt.md", registry.load("fallback")[:system_prompt]
+    end
+  end
+
+  def test_list_includes_skill_md_bundles
+    with_tmp_project do
+      write_skill_md("writer", "---\nname: writer\n---\nBody.\n")
+
+      assert_includes registry.list_names, "writer"
+    end
+  end
 end

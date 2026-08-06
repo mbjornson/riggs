@@ -88,26 +88,50 @@ module Riggs
     end
 
     def read_skill_dir(dir, entry)
-      skill_yml = File.join(dir, "SKILL.yml")
-      return nil unless File.exist?(skill_yml)
+      source = skill_source(dir)
+      return nil unless source
 
-      raw = Psych.safe_load(File.read(skill_yml), permitted_classes: [Symbol], aliases: true) || {}
-      data = Identity.deep_symbolize(raw)
-      prompt_file = File.join(dir, "prompt.md")
-      system_prompt = data[:system_prompt]
-      system_prompt = File.read(prompt_file) if (system_prompt.nil? || system_prompt.empty?) && File.exist?(prompt_file)
-
+      data = Identity.deep_symbolize(source[:data])
       version = (data[:version] || version_from_dirname(entry) || "0.1.0").to_s
       name = (data[:name] || entry.split("@").first).to_s
 
       {
         name: name,
         version: version,
-        system_prompt: system_prompt.to_s,
+        system_prompt: resolve_prompt(dir, data, source[:body]),
         tools: normalize_tools(Array(data[:tools])),
         mcp_servers: Array(data[:mcp_servers]).map(&:to_s),
         path: dir
       }
+    end
+
+    # SKILL.yml wins when both exist. Adding SKILL.md support must not change
+    # how a skill that already ships behaves, so the native container takes
+    # precedence and nothing is announced about the one that lost.
+    def skill_source(dir)
+      yml = File.join(dir, "SKILL.yml")
+      if File.exist?(yml)
+        raw = Psych.safe_load(File.read(yml), permitted_classes: [Symbol], aliases: true) || {}
+        return { data: raw, body: nil }
+      end
+
+      md = File.join(dir, "SKILL.md")
+      return nil unless File.exist?(md)
+
+      SkillFrontmatter.parse(File.read(md))
+    end
+
+    # Explicit key beats a file -- the rule SKILL.yml already followed with
+    # prompt.md. The markdown body slots in between: it is the natural home for
+    # a SKILL.md's instructions, but an author who writes system_prompt: in
+    # frontmatter has said something more specific.
+    def resolve_prompt(dir, data, body)
+      explicit = data[:system_prompt]
+      return explicit.to_s unless explicit.nil? || explicit.to_s.empty?
+      return body.to_s unless body.nil? || body.to_s.strip.empty?
+
+      prompt_file = File.join(dir, "prompt.md")
+      File.exist?(prompt_file) ? File.read(prompt_file) : ""
     end
 
     def normalize_tools(tools)
