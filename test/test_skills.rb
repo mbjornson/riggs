@@ -433,4 +433,79 @@ class TestSkills < Minitest::Test
       assert_match(/skipping skill/, stderr)
     end
   end
+
+  def deeply_nested_flow_yaml(depth)
+    ("[" * depth) + ("]" * depth)
+  end
+
+  # Psych recurses once per nesting level while composing a document;
+  # sufficiently deep flow-style ([...]) nesting overflows the Ruby call
+  # stack and raises SystemStackError. Unlike every other Psych failure,
+  # SystemStackError descends from Exception, not StandardError, so it
+  # would escape read_skill_dir's rescue outright and take every skill in
+  # the registry down with it -- defeating R7.5 for every command that
+  # touches the registry, not just this one skill. SkillFrontmatter rejects
+  # the input before Psych ever sees it, so it is skipped like any other
+  # malformed file.
+  def test_a_deeply_nested_skill_md_is_skipped_and_healthy_sibling_still_loads
+    with_tmp_project do
+      depth = Riggs::SkillFrontmatter::MAX_NESTING_DEPTH * 20
+      write_skill_md("deep", "---\nname: deep\nx: #{deeply_nested_flow_yaml(depth)}\n---\nBody.\n")
+      write_skill_md("healthy", "---\nname: healthy\n---\nBody.\n")
+
+      names = nil
+      stdout, stderr = capture_io { names = registry.list_names }
+
+      refute_includes names, "deep"
+      assert_includes names, "healthy"
+      assert_match(/skipping skill/, stderr)
+      assert_empty stdout
+    end
+  end
+
+  # The same vector reaches Psych identically through the native container:
+  # SKILL.yml has no frontmatter delimiters, but skill_source hands its
+  # contents to the same guarded loader.
+  def test_a_deeply_nested_skill_yml_is_skipped_and_healthy_sibling_still_loads
+    with_tmp_project do
+      depth = Riggs::SkillFrontmatter::MAX_NESTING_DEPTH * 20
+      FileUtils.mkdir_p("config/riggs/skills/deep_yml")
+      File.write("config/riggs/skills/deep_yml/SKILL.yml", "name: deep_yml\nx: #{deeply_nested_flow_yaml(depth)}\n")
+      write_skill_md("healthy", "---\nname: healthy\n---\nBody.\n")
+
+      names = nil
+      stdout, stderr = capture_io { names = registry.list_names }
+
+      refute_includes names, "deep_yml"
+      assert_includes names, "healthy"
+      assert_match(/skipping skill/, stderr)
+      assert_empty stdout
+    end
+  end
+
+  # The guard must not reject legitimate structure -- nesting right up to
+  # the limit still has to load, for both containers.
+  def test_a_skill_md_nested_just_under_the_limit_still_loads
+    with_tmp_project do
+      depth = Riggs::SkillFrontmatter::MAX_NESTING_DEPTH - 1
+      write_skill_md("deep_ok", "---\nname: deep_ok\nx: #{deeply_nested_flow_yaml(depth)}\n---\nBody.\n")
+
+      skill = registry.load("deep_ok")
+
+      refute_nil skill, "nesting right up to the limit must still load"
+    end
+  end
+
+  def test_a_skill_yml_nested_just_under_the_limit_still_loads
+    with_tmp_project do
+      depth = Riggs::SkillFrontmatter::MAX_NESTING_DEPTH - 1
+      FileUtils.mkdir_p("config/riggs/skills/deep_yml_ok")
+      yaml = "name: deep_yml_ok\nx: #{deeply_nested_flow_yaml(depth)}\n"
+      File.write("config/riggs/skills/deep_yml_ok/SKILL.yml", yaml)
+
+      skill = registry.load("deep_yml_ok")
+
+      refute_nil skill, "nesting right up to the limit must still load"
+    end
+  end
 end

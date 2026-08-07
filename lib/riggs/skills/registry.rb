@@ -1,6 +1,5 @@
 # frozen_string_literal: true
 
-require "date"
 require "psych"
 require_relative "frontmatter"
 
@@ -117,12 +116,7 @@ module Riggs
     # precedence and nothing is announced about the one that lost.
     def skill_source(dir)
       yml = File.join(dir, "SKILL.yml")
-      if File.exist?(yml)
-        raw = Psych.safe_load(File.read(yml), permitted_classes: [Symbol, Date, Time], aliases: false) || {}
-        raise ArgumentError, "SKILL.yml must be a mapping, got #{raw.class}" unless raw.is_a?(Hash)
-
-        return { data: raw, body: nil }
-      end
+      return { data: SkillFrontmatter.load_mapping(File.read(yml), source: "SKILL.yml"), body: nil } if File.exist?(yml)
 
       md = File.join(dir, "SKILL.md")
       return nil unless File.exist?(md)
