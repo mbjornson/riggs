@@ -475,7 +475,13 @@ module Riggs
       if list.empty?
         puts "No skills found in config/riggs/skills"
       else
-        list.each { |s| puts "• #{s[:name]} (latest #{s[:latest]}; versions: #{s[:versions].join(', ')})" }
+        list.each do |s|
+          line = "• #{s[:name]} (latest #{s[:latest]}; versions: #{s[:versions].join(', ')})"
+          line = "#{line} — #{s[:description]}" unless s[:description].to_s.empty?
+          # Sanitized as a whole line: name and version come out of the same
+          # untrusted file the description does.
+          puts sanitize_for_terminal(line)
+        end
       end
     end
 
@@ -485,16 +491,20 @@ module Riggs
       skill = SkillRegistry.new.load(name)
       abort "❌ Skill not found: #{name}" unless skill
 
-      print_header("Skill #{skill[:name]}@#{skill[:version]}")
-      puts skill[:system_prompt]
-      puts "\nMCP servers: #{skill[:mcp_servers].empty? ? '(none)' : skill[:mcp_servers].join(', ')}"
+      # Every field below is read out of a file Riggs did not author, so all of
+      # them go through sanitize_for_terminal -- not the description alone.
+      print_header(sanitize_for_terminal("Skill #{skill[:name]}@#{skill[:version]}"))
+      puts sanitize_for_terminal(skill[:description]) unless skill[:description].to_s.empty?
+      puts sanitize_for_terminal(skill[:system_prompt])
+      servers = skill[:mcp_servers].empty? ? "(none)" : skill[:mcp_servers].join(", ")
+      puts "\nMCP servers: #{sanitize_for_terminal(servers)}"
       puts "Tools:"
       if skill[:tools].empty?
         puts "  (none)"
       else
         skill[:tools].each do |t|
           mcp = t[:mcp_server] ? " [mcp:#{t[:mcp_server]}]" : ""
-          puts "  • #{t[:name]}#{mcp} — #{t[:description]}"
+          puts sanitize_for_terminal("  • #{t[:name]}#{mcp} — #{t[:description]}")
         end
       end
     end
@@ -608,6 +618,10 @@ module Riggs
       def print_header(title)
         puts "\n== #{title.upcase} =="
         puts "─" * 40
+      end
+
+      def sanitize_for_terminal(text)
+        Riggs.sanitize_for_terminal(text)
       end
 
       def compose_non_interactive(name)

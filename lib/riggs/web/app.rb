@@ -750,8 +750,19 @@ module Riggs
         ERB.new(File.read(File.join(VIEWS, "layout.erb")), trim_mode: "-").result(binding)
       end
 
+      # Two different questions, both answered here because every view already
+      # routes untrusted text through this one helper. CGI.escapeHTML answers
+      # HTML injection; it passes a control byte straight through. Those cannot
+      # render in a browser, so dropping them costs nothing on the page, and it
+      # keeps the markup from carrying a payload that a copied cell or a "view
+      # source" would hand to a terminal. Tab and newline survive, so anything
+      # rendered in a <pre> keeps its shape.
+      #
+      # /api/skills deliberately does NOT go through this: it reports what the
+      # file says, and JSON already encodes a control byte correctly on the
+      # wire. See docs/gaps.md.
       def h(text)
-        CGI.escapeHTML(text.to_s)
+        CGI.escapeHTML(Riggs.sanitize_for_terminal(text))
       end
 
       def json_ok(data)

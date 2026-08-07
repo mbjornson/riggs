@@ -454,6 +454,91 @@ class TestWebApp < Minitest::Test
     end
   end
 
+  def test_skills_page_shows_the_description
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/writer")
+      File.write("config/riggs/skills/writer/SKILL.md",
+                 "---\nname: writer\ndescription: Writes clearly.\n---\nBody.\n")
+
+      header "X-Riggs-User", "eng_bob"
+      get "/skills"
+
+      assert_equal 200, last_response.status
+      assert_includes last_response.body, "Writes clearly."
+    end
+  end
+
+  def test_skills_page_escapes_html_in_the_description
+    with_tmp_project do
+      # Descriptions come from files Riggs did not author; a skill copied in
+      # from another repository could carry markup or a script tag. The
+      # single-quoted YAML scalar below (with '' escaping the embedded
+      # apostrophes) parses to the literal: <script>alert('xss')</script> & "quotes"
+      FileUtils.mkdir_p("config/riggs/skills/writer")
+      File.write("config/riggs/skills/writer/SKILL.md", <<~MD)
+        ---
+        name: writer
+        description: '<script>alert(''xss'')</script> & "quotes"'
+        ---
+        Body.
+      MD
+
+      header "X-Riggs-User", "eng_bob"
+      get "/skills"
+
+      assert_equal 200, last_response.status
+      # CGI.escapeHTML's actual output for this input (verified directly,
+      # not guessed): & -> &amp;, " -> &quot;, ' -> &#39;, < -> &lt;, > -> &gt;.
+      assert_includes last_response.body,
+                      "&lt;script&gt;alert(&#39;xss&#39;)&lt;/script&gt; &amp; &quot;quotes&quot;"
+      refute_includes last_response.body, "<script>alert('xss')</script>"
+    end
+  end
+
+  # `h` answers HTML injection, which is a different question from terminal
+  # control bytes: CGI.escapeHTML passes an ESC straight through. In a browser
+  # it renders as nothing, so stripping it costs no information -- and it keeps
+  # the rendered page from carrying a payload that a "view source" or a copied
+  # cell would hand to a terminal.
+  def test_skills_page_strips_terminal_control_sequences
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/spoof")
+      File.write("config/riggs/skills/spoof/SKILL.md",
+                 "---\nname: spoof\ndescription: \"helper\\e[2K\\r\\e[1;32m[verified]\\e[0m\"\n---\nBody.\n")
+
+      header "X-Riggs-User", "eng_bob"
+      get "/skills"
+
+      assert_equal 200, last_response.status
+      refute_includes last_response.body, "\e", "the rendered page must not carry an ESC byte"
+      refute_includes last_response.body, "\r", "nor a carriage return from a skill file"
+      assert_includes last_response.body, "verified", "only the control bytes go, not the text"
+    end
+  end
+
+  # Deliberate asymmetry, decided rather than overlooked: the HTML view is a
+  # rendering and may drop bytes that cannot render, but /api/skills reports
+  # what the file says. JSON already encodes a control byte correctly on the
+  # wire as a \u001b escape. A client that parses that and prints it raw to
+  # a terminal owns the sanitizing; mangling the payload here would make the
+  # API disagree with the file on disk. Recorded in docs/gaps.md.
+  def test_skills_api_reports_the_description_faithfully
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/spoof")
+      File.write("config/riggs/skills/spoof/SKILL.md",
+                 "---\nname: spoof\ndescription: \"helper\\e[2K\\r\"\n---\nBody.\n")
+
+      header "X-Riggs-User", "eng_bob"
+      get "/api/skills"
+
+      assert_equal 200, last_response.status
+      refute_includes last_response.body, "\e", "the wire form must escape the control byte, not emit it raw"
+      described = JSON.parse(last_response.body).find { |s| s["name"] == "spoof" }
+      assert_equal "helper\e[2K\r", described["description"],
+                   "the API must round-trip exactly what the skill file declares"
+    end
+  end
+
   def create_session_with_usage
     storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
     id = storage.create_session(workflow_name: "example_triage", user_id: "eng_bob", memory_namespace: "ns")

@@ -7,6 +7,23 @@ require "json"
 
 module Riggs
   class Error < StandardError; end
+
+  # Text that came out of a file Riggs did not author, on its way to a
+  # terminal. Psych rejects a raw ESC byte, but YAML's double-quoted style
+  # decodes its own "\e" escape into one, a SKILL.md body is not YAML at all,
+  # and a directory name can hold any byte the filesystem allows. The damage is
+  # not garbled output: "\e[2K\r" erases the line and returns the cursor to
+  # column 0, so the real text is replaced by whatever the file wanted the
+  # operator to read.
+  #
+  # \p{Cc} is C0, DEL, and C1 -- every control character. Tab and newline are
+  # subtracted because a skill body is markdown and needs its line structure.
+  # scrub first: a file holding invalid UTF-8 would otherwise raise here.
+  TERMINAL_CONTROL = /[\p{Cc}&&[^\n\t]]/
+
+  def self.sanitize_for_terminal(text)
+    text.to_s.scrub("").gsub(TERMINAL_CONTROL, "")
+  end
 end
 
 require_relative "riggs/version"

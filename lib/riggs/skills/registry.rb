@@ -1,11 +1,65 @@
 # frozen_string_literal: true
 
 require "psych"
+require_relative "frontmatter"
 
 module Riggs
+  # A caller asked for a specific skill by name and it could not be produced --
+  # missing, malformed, or pinned to a version that does not exist.
+  class SkillUnavailable < Error; end
+
   class SkillRegistry
     def initialize(roots: nil)
       @roots = Array(roots || default_roots)
+    end
+
+    # Resolves the skill a workflow step declares, for the two callers that run
+    # steps -- ToolLoop (which turns a skill into the tool list) and
+    # GraphEngine (which turns it into the system prompt). One choke point on
+    # purpose: these two disagreeing is exactly how the fail-open below got in,
+    # and how it survived the first fix.
+    #
+    # Returns nil only when the step declares no skill at all. Every other
+    # outcome either returns a loaded skill or raises, because a nil skill
+    # means "nothing constrains this step" to ToolLoop#resolve_tools, and a
+    # declaration that cannot be honored must not decay into that.
+    #
+    # `registry` may be nil: GraphEngine and GraphEngine.resume both default it
+    # that way, and a step that names a skill with nothing to resolve it
+    # against is in the same position as one whose file will not parse.
+    def self.for_step(step, registry)
+      declared = !step.skill.nil? || !Array(step.skills).empty?
+      return nil unless declared
+
+      # First usable entry, not `.first`: a bare "-" in a `skills:` list is a
+      # blank entry, and reading it as the answer both unscoped the step and
+      # silently discarded the skill declared on the next line.
+      name = ([step.skill] + Array(step.skills)).map { |s| s.to_s.strip }.find { |s| !s.empty? }
+      raise SkillUnavailable, "step #{step.id.inspect} declares a skill but no name could be read from it" if name.nil?
+      if registry.nil?
+        raise SkillUnavailable,
+              "step #{step.id.inspect} names skill #{name.inspect} but no skill registry is configured"
+      end
+
+      registry.load!(name)
+    end
+
+    # The loud variant of `load`, for callers that named a skill on purpose.
+    #
+    # `load` returns nil for two unrelated situations: no skill was requested,
+    # and the skill requested could not be read. Enumeration and `skills:show`
+    # want that softness. A workflow step does not: ToolLoop#resolve_tools
+    # reads a nil skill as "nothing constrains this step" and offers every MCP
+    # tool the manager advertises, and GraphEngine#build_system_prompt drops
+    # the skill's instructions and keeps going. A skill's `mcp_servers` pin
+    # that evaporates when its file fails to parse is not a boundary, so a step
+    # that cannot get the skill it named must not run at all.
+    def load!(spec)
+      load(spec) || raise(SkillUnavailable, <<~MSG.chomp)
+        skill #{spec.to_s.inspect} could not be loaded (missing, unreadable, or no such version). \
+        A step that names a skill will not run without it. If the file exists, a \
+        "riggs: skipping skill at ..." warning above names it and the parse error.
+      MSG
     end
 
     # load("triage_v1") or load("triage_v1@1.0.0")
@@ -32,16 +86,9 @@ module Riggs
         data = read_skill_dir(dir, entry)
         next unless data
 
-        by_name[data[:name]] << data[:version]
+        by_name[data[:name]] << { version: data[:version], description: data[:description] }
       end
-      by_name.keys.sort.map do |name|
-        versions = by_name[name].uniq.sort_by do |v|
-          Gem::Version.new(normalize_version(v))
-        rescue StandardError
-          Gem::Version.new("0")
-        end
-        { name: name, versions: versions, latest: versions.last }
-      end
+      by_name.keys.sort.map { |name| summarize(name, by_name[name]) }
     end
 
     def list_names
@@ -87,26 +134,64 @@ module Riggs
     end
 
     def read_skill_dir(dir, entry)
-      skill_yml = File.join(dir, "SKILL.yml")
-      return nil unless File.exist?(skill_yml)
+      source = skill_source(dir)
+      return nil unless source
 
-      raw = Psych.safe_load(File.read(skill_yml), permitted_classes: [Symbol], aliases: true) || {}
-      data = Identity.deep_symbolize(raw)
-      prompt_file = File.join(dir, "prompt.md")
-      system_prompt = data[:system_prompt]
-      system_prompt = File.read(prompt_file) if (system_prompt.nil? || system_prompt.empty?) && File.exist?(prompt_file)
-
+      data = Identity.deep_symbolize(source[:data])
       version = (data[:version] || version_from_dirname(entry) || "0.1.0").to_s
       name = (data[:name] || entry.split("@").first).to_s
 
       {
         name: name,
         version: version,
-        system_prompt: system_prompt.to_s,
+        description: (data[:description] || "").to_s,
+        system_prompt: resolve_prompt(dir, data, source[:body]),
         tools: normalize_tools(Array(data[:tools])),
         mcp_servers: Array(data[:mcp_servers]).map(&:to_s),
         path: dir
       }
+    rescue Psych::Exception, ArgumentError, SystemCallError => e
+      # Named classes, not StandardError: a rescue that wide would turn a
+      # genuine bug in this registry into "that skill doesn't exist", which is
+      # the failure mode Phase 7's review found hiding a real defect in
+      # Compactor#call_router. Psych::Exception (not just SyntaxError) is
+      # required because Psych.safe_load raises other subclasses of it --
+      # Psych::DisallowedClass for an auto-typed Date/Time outside
+      # permitted_classes, Psych::AliasesNotEnabled for an anchor-bearing
+      # file now that aliases are disabled below -- and both are malformed
+      # input from this registry's point of view, not a registry bug.
+      # Both interpolations are untrusted: the directory name is whatever the
+      # filesystem allowed whoever installed the skill, and a parser message
+      # can quote the document. This warning is also the one line guaranteed to
+      # print when a hostile skill file is present.
+      warn Riggs.sanitize_for_terminal("riggs: skipping skill at #{dir} (#{e.class}: #{e.message.to_s[0, 200]})")
+      nil
+    end
+
+    # SKILL.yml wins when both exist. Adding SKILL.md support must not change
+    # how a skill that already ships behaves, so the native container takes
+    # precedence and nothing is announced about the one that lost.
+    def skill_source(dir)
+      yml = File.join(dir, "SKILL.yml")
+      return { data: SkillFrontmatter.load_mapping(File.read(yml), source: "SKILL.yml"), body: nil } if File.exist?(yml)
+
+      md = File.join(dir, "SKILL.md")
+      return nil unless File.exist?(md)
+
+      SkillFrontmatter.parse(File.read(md))
+    end
+
+    # Explicit key beats a file -- the rule SKILL.yml already followed with
+    # prompt.md. The markdown body slots in between: it is the natural home for
+    # a SKILL.md's instructions, but an author who writes system_prompt: in
+    # frontmatter has said something more specific.
+    def resolve_prompt(dir, data, body)
+      explicit = data[:system_prompt]
+      return explicit.to_s unless explicit.nil? || explicit.to_s.empty?
+      return body.to_s unless body.nil? || body.to_s.strip.empty?
+
+      prompt_file = File.join(dir, "prompt.md")
+      File.exist?(prompt_file) ? File.read(prompt_file) : ""
     end
 
     def normalize_tools(tools)
@@ -125,6 +210,7 @@ module Riggs
       {
         name: data[:name],
         version: data[:version],
+        description: data[:description],
         system_prompt: data[:system_prompt],
         tools: data[:tools],
         mcp_servers: data[:mcp_servers]
@@ -139,6 +225,22 @@ module Riggs
 
     def normalize_version(ver)
       ver.to_s.sub(/\Av/i, "")
+    end
+
+    # The description reported for a name must belong to the same version
+    # reported as `latest`, or the table describes one skill and versions
+    # another.
+    def summarize(name, entries)
+      ordered = entries.uniq { |e| e[:version] }.sort_by { |e| sortable_version(e[:version]) }
+      newest = ordered.last
+      { name: name, versions: ordered.map { |e| e[:version] },
+        latest: newest&.fetch(:version), description: newest ? newest[:description] : "" }
+    end
+
+    def sortable_version(ver)
+      Gem::Version.new(normalize_version(ver))
+    rescue StandardError
+      Gem::Version.new("0")
     end
 
     def version_eq?(a, b)

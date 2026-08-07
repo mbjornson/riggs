@@ -328,11 +328,11 @@ module Riggs
 
       def build_system_prompt(step)
         parts = ["You are agent '#{step.agent}' in Riggs playbook '#{@workflow[:name]}'."]
-        skill_name = step.skill || step.skills.first
-        if skill_name && @skill_registry
-          skill = @skill_registry.load(skill_name)
-          parts << skill[:system_prompt] if skill && skill[:system_prompt]
-        end
+        # Same resolution ToolLoop uses, for the same reason: a step that
+        # declared a skill must not quietly run on the generic preamble alone
+        # when that skill cannot be read.
+        skill = SkillRegistry.for_step(step, @skill_registry)
+        parts << skill[:system_prompt] if skill && skill[:system_prompt]
         parts.join("\n\n")
       end
 

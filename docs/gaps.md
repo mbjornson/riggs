@@ -5,10 +5,12 @@ Open items from comparing Riggs against [Pi](https://pi.dev)'s agent harness on
 multi-user playbook orchestrator, so only the shared substrate is comparable —
 context control, session durability, observability, extensibility, and trust.
 
-Seven items came out of that comparison. Four have shipped: two in
-[`specs/phase6-persistence-and-events.md`](specs/phase6-persistence-and-events.md)
-and two in
-[`specs/phase7-token-accounting-and-compaction.md`](specs/phase7-token-accounting-and-compaction.md):
+Seven items came out of that comparison. Five have shipped: two in
+[`specs/phase6-persistence-and-events.md`](specs/phase6-persistence-and-events.md),
+two in
+[`specs/phase7-token-accounting-and-compaction.md`](specs/phase7-token-accounting-and-compaction.md),
+and one in
+[`specs/phase8-skill-md-frontmatter.md`](specs/phase8-skill-md-frontmatter.md):
 
 - ~~**#1** Message persistence and gate pause/resume~~ — shipped
 - ~~**#4** Audit event stream (poll + SSE)~~ — shipped
@@ -25,8 +27,12 @@ and two in
   `context_window` is now a token budget (`short`/`medium`/`full`/an integer),
   not a step count, and a run whose transcript exceeds it compacts instead of
   erroring.
+- ~~**#7** Read `SKILL.md` frontmatter~~ — shipped. A skill bundle may be
+  `SKILL.md` (YAML frontmatter plus a markdown body) or `SKILL.yml`, sharing
+  one key space. Discovery is unchanged: `.agents/skills/` is deliberately not
+  a root, since a repo-local one is gap #6's exposure.
 
-The three below are open. Original numbering is kept so the ranking stays legible.
+The two below are open. Original numbering is kept so the ranking stays legible.
 Gaps found outside that comparison are collected at the end, labelled as such.
 
 ---
@@ -79,25 +85,6 @@ resolve from `~/.riggs/` while only workflows and skills come from the repo.
 
 **Done when:** Cloning a hostile repo and running a Riggs command cannot execute
 attacker-chosen commands or grant attacker-chosen roles.
-
----
-
-## #7 — Read `SKILL.md` frontmatter
-
-**Now:** Skills load only from `config/riggs/skills/<name>/SKILL.yml`.
-
-**Why it matters:** Pi reads `~/.agents/skills/` and `.agents/skills/` using
-`SKILL.md` with YAML frontmatter (`name`, `description`), which is becoming the
-cross-harness convention. Riggs's YAML-only loader cannot consume that ecosystem.
-
-**Shape:** Add an alternate loader in `SkillRegistry` that parses `SKILL.md`
-frontmatter, alongside the existing `SKILL.yml` path. Riggs pins skills per step
-rather than letting the model choose one, so only the file format needs to
-interoperate, not the discovery semantics.
-
-**Done when:** An off-the-shelf `SKILL.md` drops into a workflow step unmodified.
-
-**Cheapest item on this list.**
 
 ---
 
@@ -210,6 +197,105 @@ the assertions cannot pass vacuously.
 
 **Done when:** Adding a column to any Riggs table migrates existing databases,
 and a test proves it against a hand-built database that predates the column.
+
+---
+
+## Found separately — three more `Psych.safe_load` sites carry the Phase 8 defect
+
+Not from the Pi comparison. Surfaced by the whole-branch review of Phase 8,
+which found and fixed this pattern in the skill loader and then noticed the same
+two lines elsewhere.
+
+**Now:** Phase 8 hardened both skill-loading call sites to
+`permitted_classes: [Symbol, Date, Time], aliases: false`, and widened the
+rescue around them to `Psych::Exception`. Three other call sites still read
+`permitted_classes: [Symbol], aliases: true`, with no equivalent rescue:
+
+- `lib/riggs/identity.rb:23` — `.agent_hubrc`
+- `lib/riggs/workflow/loader.rb:23` — workflow YAML
+- `lib/riggs/web/app.rb:265` — `req.params["yaml"]`, i.e. YAML posted over HTTP
+
+**Why it matters:** two distinct failure modes, both demonstrated on the skill
+path before Phase 8 closed them there.
+
+1. *An ordinary date field crashes the loader.* Psych auto-types an unquoted
+   `2026-08-05`, `permitted_classes: [Symbol]` rejects the resulting `Date`, and
+   `Psych::DisallowedClass` is `Psych::Exception < RuntimeError` — not a
+   `SyntaxError`. So a workflow file with a `created:` line raises rather than
+   reporting a readable error.
+2. *A YAML alias bomb hangs the process.* `Psych.safe_load` returns fast because
+   aliases are shared references, but `Identity.deep_symbolize` then rebuilds
+   the structure and materializes every leaf. On the skill path a 478-byte file
+   drove RSS past 8 GB and never returned. The web site is the sharp one: it
+   parses YAML straight from a request parameter, so this is reachable by
+   anyone who can reach that endpoint.
+
+**Shape:** apply the Phase 8 treatment — `permitted_classes: [Symbol, Date,
+Time]`, `aliases: false`, and a rescue naming `Psych::Exception` that turns a
+bad document into an error the caller can report. The web endpoint additionally
+wants a size cap, since it is the only one of the three that parses input Riggs
+never wrote to disk itself.
+
+**Done when:** a date-bearing workflow file loads, an anchor-bearing one is
+rejected with a readable error rather than hanging, and a test covers both for
+each of the three sites.
+
+---
+
+## Found separately — no size cap on a skill file before it is read
+
+From the adversarial review of Phase 8. Recorded rather than fixed, to keep that
+branch scoped to the fail-open defect the same review found.
+
+**Now:** `SkillRegistry#skill_source` calls `File.read` on `SKILL.yml` or
+`SKILL.md` with no size check, and `SkillFrontmatter.parse` then makes two more
+full copies of a `SKILL.md` (`normalize` strips the BOM and rewrites CRLF) plus
+an array of every line. Enumeration touches every skill directory, so the cost
+is paid by `skills:list`, the web Skills table, and workflow startup even when
+the oversized skill is not the one being run.
+
+**Why it matters:** it is the weakest of the three findings from that review and
+is recorded for completeness, not urgency. Reaching it needs write access to
+`config/riggs/skills/`, which is the operator's own directory — the realistic
+route is importing a skill bundle without reading it. The unbounded `File.read`
+predates Phase 8 (`main` reads `SKILL.yml` the same way); what Phase 8 adds is
+the `.md` container and its extra copies.
+
+**Shape:** stat the file and skip it with the existing "riggs: skipping skill
+at ..." warning when it exceeds a cap, before any read. The cap belongs next to
+`SkillFrontmatter::MAX_NESTING_DEPTH`, which guards the same class of input for
+the same reason.
+
+**Done when:** an oversized `SKILL.md` and an oversized `SKILL.yml` are each
+skipped with a warning naming the path, a sibling skill in the same root still
+loads, and neither is ever passed to `File.read`.
+
+---
+
+## Decided, not a gap — `/api/skills` reports skill text verbatim
+
+From the same adversarial review. Recorded so it reads as a decision rather
+than an oversight the next time someone greps for unsanitized output.
+
+**Now:** skill text reaches a terminal through three surfaces. Two are
+sanitized: the CLI (`skills:list`, `skills:show`) and the registry's
+"skipping skill" warning both go through `Riggs.sanitize_for_terminal`, as does
+every HTML view via the `h` helper in `web/app.rb`. `/api/skills` does not.
+
+**Why that is deliberate:** JSON already encodes a control byte correctly on
+the wire as a `\u001b` escape — nothing raw is emitted. The exposure needs a
+consumer that parses the JSON and prints the decoded string straight to a
+terminal, e.g. `curl -s /api/skills | jq -r '.[].description'`. Sanitizing the
+payload to cover that would make the API disagree with the file on disk, so a
+client could no longer read back what a skill actually declares. The HTML view
+is a rendering and may drop bytes that cannot render; an API response is not.
+
+`test_skills_api_reports_the_description_faithfully` pins the round-trip, so
+this cannot be "fixed" by accident.
+
+**Revisit if:** Riggs ever ships a client of its own that prints API output to
+a terminal. That client sanitizes at its own print boundary — the same rule the
+CLI already follows — rather than the server mangling the payload for everyone.
 
 ---
 

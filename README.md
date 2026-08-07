@@ -182,6 +182,34 @@ riggs skills:show triage_v1
 riggs skills:show triage_v1@1.0.0
 ```
 
+A skill bundle is a directory under `config/riggs/skills/` holding either
+`SKILL.yml` or `SKILL.md`. Both containers use the same keys — `name`,
+`version`, `description`, `system_prompt`, `tools`, `mcp_servers`.
+
+`SKILL.md` is the cross-harness convention: YAML frontmatter, then the
+instructions as a markdown body.
+
+```markdown
+---
+name: code-reviewer
+description: Reviews a diff for correctness and clarity.
+---
+
+Review the diff. Report correctness problems before style ones.
+```
+
+The body becomes the skill's system prompt, so an off-the-shelf `SKILL.md`
+works unmodified. A `system_prompt:` key in frontmatter takes precedence over
+the body, and the body takes precedence over a `prompt.md` file beside it.
+`tools:` and `mcp_servers:` work in frontmatter too, so an imported skill can
+gain a Riggs tool without being converted.
+
+If a directory holds both files, `SKILL.yml` wins. A skill file that fails to
+parse is skipped with a warning naming it; the other skills still load.
+
+Riggs does not read `.agents/skills/`. Copy the skill directory into
+`config/riggs/skills/`.
+
 Skill YAML may declare `tools:` and optional `mcp_servers:` allow-list. GraphEngine runs a multi-turn tool loop: provider may return native `tool_calls` (Anthropic/OpenAI) or `TOOL:name|{json}` (Mock/CLI fallback), results are executed via MCP or built-ins (`lookup_runbook`), then fed back until final text.
 
 Configure multiple MCP servers in `.agent_hubrc`:

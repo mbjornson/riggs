@@ -149,13 +149,10 @@ module Riggs
                        tool_name: tool_name, tool_calls: tool_calls, provider: provider)
       end
 
+      # nil only when the step declared no skill -- the one nil resolve_tools
+      # is allowed to read as "unconstrained". See SkillRegistry.for_step.
       def load_skill(step)
-        return nil unless @skill_registry
-
-        name = step.skill || step.skills.first
-        return nil unless name
-
-        @skill_registry.load(name)
+        SkillRegistry.for_step(step, @skill_registry)
       end
 
       def resolve_tools(skill)
