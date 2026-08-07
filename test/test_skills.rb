@@ -3,6 +3,7 @@
 require "test_helper"
 require "fileutils"
 require "stringio"
+require "timeout"
 
 class TestSkills < Minitest::Test
   def test_load_latest_and_pin
@@ -313,6 +314,123 @@ class TestSkills < Minitest::Test
                       "the markdown body must reach the model as the step's system prompt"
       assert_includes captured.first, "Always name the file and line.",
                       "content after a horizontal rule is body, not a second frontmatter block"
+    end
+  end
+
+  # An off-the-shelf SKILL.md is ordinary content, not an attack: an unquoted
+  # date-shaped scalar is auto-typed by Psych. It must load, not merely be
+  # skipped -- Psych::DisallowedClass previously escaped read_skill_dir's
+  # rescue and took down every sibling skill in the registry with it.
+  def test_a_skill_md_with_a_date_field_loads_successfully
+    with_tmp_project do
+      write_skill_md("dated", <<~MD)
+        ---
+        name: dated
+        description: A skill with a date.
+        updated: 2026-08-05
+        ---
+        Body.
+      MD
+
+      skill = registry.load("dated")
+
+      refute_nil skill, "a dated SKILL.md must load, not be skipped"
+      assert_equal "dated", skill[:name]
+      assert_equal "A skill with a date.", skill[:description]
+    end
+  end
+
+  # The same posture applies to the native container: SKILL.yml shares the
+  # fix, not just SKILL.md.
+  def test_a_skill_yml_with_a_date_field_loads_successfully
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/dated_yml")
+      File.write("config/riggs/skills/dated_yml/SKILL.yml", <<~YAML)
+        name: dated_yml
+        description: A yaml skill with a date.
+        updated: 2026-08-05
+        system_prompt: x
+      YAML
+
+      skill = registry.load("dated_yml")
+
+      refute_nil skill, "a dated SKILL.yml must load, not be skipped"
+      assert_equal "dated_yml", skill[:name]
+      assert_equal "A yaml skill with a date.", skill[:description]
+    end
+  end
+
+  # Skill files have no legitimate need for YAML anchors. An alias to an
+  # anchor that was never defined must be skipped like any other malformed
+  # file, not crash the whole registry.
+  def test_a_skill_md_with_an_undefined_alias_is_skipped_and_healthy_sibling_still_loads
+    with_tmp_project do
+      write_skill_md("undefined_anchor", "---\nname: undefined_anchor\ntools: *nope\n---\nBody.\n")
+      write_skill_md("healthy", "---\nname: healthy\n---\nBody.\n")
+
+      names = nil
+      stdout, stderr = capture_io { names = registry.list_names }
+
+      refute_includes names, "undefined_anchor"
+      assert_includes names, "healthy"
+      assert_match(/skipping skill/, stderr)
+      assert_empty stdout
+    end
+  end
+
+  # Aliases are disabled outright, so even a well-formed, self-contained
+  # anchor/alias pair is rejected -- not just a broken reference.
+  def test_a_skill_md_using_yaml_aliases_is_skipped_and_healthy_sibling_still_loads
+    with_tmp_project do
+      write_skill_md("aliased", "---\nname: aliased\ntags: &t [a, b]\nmore: *t\n---\nBody.\n")
+      write_skill_md("healthy", "---\nname: healthy\n---\nBody.\n")
+
+      names = nil
+      stdout, stderr = capture_io { names = registry.list_names }
+
+      refute_includes names, "aliased"
+      assert_includes names, "healthy"
+      assert_match(/skipping skill/, stderr)
+      assert_empty stdout
+    end
+  end
+
+  # Billion-laughs shape: nested anchors with ~9-way fan-out over ~10 levels.
+  # Psych.safe_load itself stays fast because aliases produce shared
+  # references -- the danger was Identity.deep_symbolize walking those shared
+  # references and materializing billions of leaf copies. With aliases
+  # disabled, Psych raises before any of that expansion happens, so this must
+  # complete well within the timeout rather than hang or exhaust memory.
+  def alias_bomb_frontmatter
+    lines = []
+    prev = nil
+    10.times do |i|
+      key = "a#{i}"
+      lines << if prev.nil?
+                 "#{key}: &#{key} [\"leaf\"]"
+               else
+                 "#{key}: &#{key} [#{Array.new(9) { "*#{prev}" }.join(', ')}]"
+               end
+      prev = key
+    end
+    lines << "tools: *#{prev}"
+    "---\nname: bomb\n#{lines.join("\n")}\n---\nBody.\n"
+  end
+
+  def test_an_alias_bomb_skill_md_does_not_hang
+    with_tmp_project do
+      write_skill_md("bomb", alias_bomb_frontmatter)
+      write_skill_md("healthy", "---\nname: healthy\n---\nBody.\n")
+
+      names = nil
+      stderr = nil
+      Timeout.timeout(10) do
+        _stdout, stderr = capture_io { names = registry.list_names }
+      end
+
+      refute_includes names, "bomb"
+      assert_includes names, "healthy"
+      assert_match(/skipping skill/, stderr)
     end
   end
 end

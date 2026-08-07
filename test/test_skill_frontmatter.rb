@@ -84,4 +84,24 @@ class TestSkillFrontmatter < Minitest::Test
 
     assert_raises(Psych::SyntaxError) { Riggs::SkillFrontmatter.parse(text) }
   end
+
+  # An off-the-shelf skill file is ordinary content, not an attack: an
+  # unquoted date-shaped scalar is auto-typed by Psych and must load as a
+  # Date, not be rejected as a disallowed class.
+  def test_a_date_valued_frontmatter_key_parses_without_raising
+    text = "---\nname: dated\nupdated: 2026-08-05\n---\nBody.\n"
+
+    result = Riggs::SkillFrontmatter.parse(text)
+
+    assert_equal "dated", result[:data]["name"]
+    assert_equal Date.new(2026, 8, 5), result[:data]["updated"]
+  end
+
+  # Skill files have no legitimate need for YAML anchors; aliases are
+  # disabled outright rather than merely constrained.
+  def test_an_alias_reference_raises_aliases_not_enabled
+    text = "---\nname: aliased\ntags: &t [a, b]\nmore: *t\n---\nBody.\n"
+
+    assert_raises(Psych::AliasesNotEnabled) { Riggs::SkillFrontmatter.parse(text) }
+  end
 end
