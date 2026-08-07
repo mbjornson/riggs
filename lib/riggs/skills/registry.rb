@@ -4,9 +4,31 @@ require "psych"
 require_relative "frontmatter"
 
 module Riggs
+  # A caller asked for a specific skill by name and it could not be produced --
+  # missing, malformed, or pinned to a version that does not exist.
+  class SkillUnavailable < Error; end
+
   class SkillRegistry
     def initialize(roots: nil)
       @roots = Array(roots || default_roots)
+    end
+
+    # The loud variant of `load`, for callers that named a skill on purpose.
+    #
+    # `load` returns nil for two unrelated situations: no skill was requested,
+    # and the skill requested could not be read. Enumeration and `skills:show`
+    # want that softness. A workflow step does not: ToolLoop#resolve_tools
+    # reads a nil skill as "nothing constrains this step" and offers every MCP
+    # tool the manager advertises, and GraphEngine#build_system_prompt drops
+    # the skill's instructions and keeps going. A skill's `mcp_servers` pin
+    # that evaporates when its file fails to parse is not a boundary, so a step
+    # that cannot get the skill it named must not run at all.
+    def load!(spec)
+      load(spec) || raise(SkillUnavailable, <<~MSG.chomp)
+        skill #{spec.to_s.inspect} could not be loaded (missing, unreadable, or no such version). \
+        A step that names a skill will not run without it. If the file exists, a \
+        "riggs: skipping skill at ..." warning above names it and the parse error.
+      MSG
     end
 
     # load("triage_v1") or load("triage_v1@1.0.0")

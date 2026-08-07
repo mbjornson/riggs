@@ -478,7 +478,9 @@ module Riggs
         list.each do |s|
           line = "• #{s[:name]} (latest #{s[:latest]}; versions: #{s[:versions].join(', ')})"
           line = "#{line} — #{s[:description]}" unless s[:description].to_s.empty?
-          puts line
+          # Sanitized as a whole line: name and version come out of the same
+          # untrusted file the description does.
+          puts sanitize_for_terminal(line)
         end
       end
     end
@@ -489,17 +491,20 @@ module Riggs
       skill = SkillRegistry.new.load(name)
       abort "❌ Skill not found: #{name}" unless skill
 
-      print_header("Skill #{skill[:name]}@#{skill[:version]}")
-      puts skill[:description] unless skill[:description].to_s.empty?
-      puts skill[:system_prompt]
-      puts "\nMCP servers: #{skill[:mcp_servers].empty? ? '(none)' : skill[:mcp_servers].join(', ')}"
+      # Every field below is read out of a file Riggs did not author, so all of
+      # them go through sanitize_for_terminal -- not the description alone.
+      print_header(sanitize_for_terminal("Skill #{skill[:name]}@#{skill[:version]}"))
+      puts sanitize_for_terminal(skill[:description]) unless skill[:description].to_s.empty?
+      puts sanitize_for_terminal(skill[:system_prompt])
+      servers = skill[:mcp_servers].empty? ? "(none)" : skill[:mcp_servers].join(", ")
+      puts "\nMCP servers: #{sanitize_for_terminal(servers)}"
       puts "Tools:"
       if skill[:tools].empty?
         puts "  (none)"
       else
         skill[:tools].each do |t|
           mcp = t[:mcp_server] ? " [mcp:#{t[:mcp_server]}]" : ""
-          puts "  • #{t[:name]}#{mcp} — #{t[:description]}"
+          puts sanitize_for_terminal("  • #{t[:name]}#{mcp} — #{t[:description]}")
         end
       end
     end
@@ -563,6 +568,22 @@ module Riggs
       end
     end
 
+    # A skill file is content Riggs did not author, and its description and
+    # body go straight to a terminal. Psych rejects a raw ESC byte, but
+    # YAML's double-quoted style decodes its own "\e" escape into one, and a
+    # SKILL.md body is not YAML at all -- so both channels can carry control
+    # sequences. The damage is not garbled text: "\e[2K\r" erases the line
+    # and returns the cursor to column 0, so the skill's real name and
+    # description are wiped and whatever the file wanted the operator to read
+    # takes their place. Stripped at the print boundary rather than at load,
+    # because the body is also the system prompt and the model must receive
+    # what the author wrote.
+    #
+    # Tab and newline survive -- the body is markdown and needs its line
+    # structure. Everything else in C0, DEL, and C1 goes. scrub first: a file
+    # holding invalid UTF-8 would otherwise raise from the match.
+    TERMINAL_CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/
+
     no_commands do
       # Never prints a total without its coverage — a bare number would imply
       # complete measurement that CLI providers cannot supply.
@@ -613,6 +634,10 @@ module Riggs
       def print_header(title)
         puts "\n== #{title.upcase} =="
         puts "─" * 40
+      end
+
+      def sanitize_for_terminal(text)
+        text.to_s.scrub("").gsub(TERMINAL_CONTROL, "")
       end
 
       def compose_non_interactive(name)

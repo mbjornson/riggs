@@ -330,8 +330,10 @@ module Riggs
         parts = ["You are agent '#{step.agent}' in Riggs playbook '#{@workflow[:name]}'."]
         skill_name = step.skill || step.skills.first
         if skill_name && @skill_registry
-          skill = @skill_registry.load(skill_name)
-          parts << skill[:system_prompt] if skill && skill[:system_prompt]
+          # load!, not load: a step that named a skill must not quietly run
+          # with the generic preamble alone when that skill cannot be read.
+          skill = @skill_registry.load!(skill_name)
+          parts << skill[:system_prompt] if skill[:system_prompt]
         end
         parts.join("\n\n")
       end

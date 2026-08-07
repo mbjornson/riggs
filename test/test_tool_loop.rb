@@ -398,6 +398,85 @@ class TestToolLoop < Minitest::Test
     end
   end
 
+  # The regression an adversarial review found on this branch. This exact
+  # SKILL.yml loads on main -- aliases were enabled -- with mcp_servers pinned
+  # to ["github"], and the step is offered gh_search and nothing else.
+  # Disabling aliases makes the file malformed; skip-and-warn turns malformed
+  # into nil; and resolve_tools reads nil as "no skill constrains this step",
+  # so the step would be handed prod_sql and fs_write from servers the skill
+  # never pinned. A pin that disappears when a file fails to parse is not a
+  # boundary. The step must not run at all.
+  def test_a_step_naming_an_unloadable_skill_is_not_handed_unpinned_tools
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/gh_only")
+      File.write("config/riggs/skills/gh_only/SKILL.yml", <<~YAML)
+        name: gh_only
+        version: "1.0.0"
+        defaults: &d
+          description: shared
+        system_prompt: Only GitHub.
+        mcp_servers:
+          - github
+        tools:
+          - name: gh_search
+            mcp_server: github
+            <<: *d
+      YAML
+      step = Riggs::Workflow::StepNode.from_hash(
+        "id" => "s", "input" => "go", "output_var" => "o", "skill" => "gh_only"
+      )
+
+      err = assert_raises(Riggs::SkillUnavailable) do
+        capture_io { unloadable_skill_loop.send(:load_skill, step) }
+      end
+
+      assert_match(/gh_only/, err.message, "the failure must name the skill the step pinned")
+    end
+  end
+
+  # The step named no skill at all, so there is no pin to lose and nothing to
+  # fail closed on. This is the nil that resolve_tools was always allowed to
+  # read as "unconstrained", and it must keep working.
+  def test_a_step_naming_no_skill_still_runs_with_every_tool
+    with_tmp_project do
+      step = Riggs::Workflow::StepNode.from_hash("id" => "s", "input" => "go", "output_var" => "o")
+      loop_obj = unloadable_skill_loop
+
+      skill = loop_obj.send(:load_skill, step)
+      tools = loop_obj.send(:resolve_tools, skill)
+
+      assert_nil skill
+      assert_equal %w[gh_search prod_sql fs_write], tools.map { |t| t[:name] }
+    end
+  end
+
+  # A skill that loads still scopes the step to the servers it pins.
+  def test_a_loadable_skill_still_scopes_tools_to_its_pinned_servers
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/gh_only")
+      File.write("config/riggs/skills/gh_only/SKILL.yml", <<~YAML)
+        name: gh_only
+        version: "1.0.0"
+        system_prompt: Only GitHub.
+        mcp_servers:
+          - github
+        tools:
+          - name: gh_search
+            mcp_server: github
+            description: Search GitHub.
+      YAML
+      step = Riggs::Workflow::StepNode.from_hash(
+        "id" => "s", "input" => "go", "output_var" => "o", "skill" => "gh_only"
+      )
+      loop_obj = unloadable_skill_loop
+
+      tools = loop_obj.send(:resolve_tools, loop_obj.send(:load_skill, step))
+
+      assert_equal ["gh_search"], tools.map { |t| t[:name] },
+                   "a pinned skill must not see servers it did not list"
+    end
+  end
+
   private
 
   def build_step
@@ -467,6 +546,31 @@ class TestToolLoop < Minitest::Test
       hub_config: Riggs::Identity.load_config,
       skill_registry: Riggs::SkillRegistry.new(roots: ["./config/riggs/skills"]),
       gate_handler: ->(*) { :approved }
+    )
+  end
+
+  # An MCP manager advertising one tool the skill pins and two it never
+  # mentions, from servers it never lists. If a skill fails to resolve and the
+  # step runs anyway, these are what the model is handed.
+  def multi_server_mcp_manager
+    Class.new do
+      def list_tools
+        [{ name: "gh_search", description: "Search GitHub", input_schema: {}, server: "github" },
+         { name: "prod_sql", description: "Query production", input_schema: {}, server: "postgres_prod" },
+         { name: "fs_write", description: "Write a file", input_schema: {}, server: "filesystem" }]
+      end
+
+      def call_tool(*, **) = "unused"
+      def close; end
+    end.new
+  end
+
+  def unloadable_skill_loop(dir: "./config/riggs/skills")
+    Riggs::Workflow::ToolLoop.new(
+      router: nil, mcp_manager: multi_server_mcp_manager,
+      skill_registry: Riggs::SkillRegistry.new(roots: [dir]),
+      audit: ->(*) {}, llm_calls: 0, max_llm_calls: 5,
+      timeout_seconds: 60, started_at: Time.now, session_id: "s1"
     )
   end
 end

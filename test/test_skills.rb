@@ -508,4 +508,81 @@ class TestSkills < Minitest::Test
       refute_nil skill, "nesting right up to the limit must still load"
     end
   end
+
+  # `load` returns nil for two unrelated reasons: nobody asked for a skill,
+  # and the skill that was asked for could not be read. Enumeration wants the
+  # second one soft -- one bad file must not take down `skills:list`. A caller
+  # that named a skill on purpose wants it loud, because downstream
+  # (ToolLoop#resolve_tools) nil means "this step is unconstrained" and hands
+  # over every MCP tool. `load!` is the loud variant; `load` keeps its
+  # nil-returning contract for enumeration and for `skills:show`.
+  def test_load_bang_raises_when_a_named_skill_cannot_be_parsed
+    with_tmp_project do
+      write_skill_md("broken", "---\nname: broken\ndesc: [unclosed\n---\nBody.\n")
+
+      err = assert_raises(Riggs::SkillUnavailable) { registry.load!("broken") }
+
+      assert_match(/broken/, err.message, "the error must name the skill the step asked for")
+    end
+  end
+
+  def test_load_bang_raises_when_a_named_skill_does_not_exist
+    with_tmp_project do
+      assert_raises(Riggs::SkillUnavailable) { registry.load!("no_such_skill") }
+    end
+  end
+
+  def test_load_bang_returns_the_skill_when_it_loads
+    with_tmp_project do
+      write_skill_md("fine", "---\nname: fine\ndescription: Fine.\n---\nBody.\n")
+
+      assert_equal "fine", registry.load!("fine")[:name]
+    end
+  end
+
+  def test_load_bang_honors_a_version_pin_that_cannot_be_satisfied
+    with_tmp_project do
+      assert_raises(Riggs::SkillUnavailable) { registry.load!("triage_v1@9.9.9") }
+    end
+  end
+
+  # `load` must NOT start raising: `skills:show` prints "Skill not found" for a
+  # typo, and enumeration tolerates a bad file. Only `load!` is loud.
+  def test_load_still_returns_nil_for_an_unloadable_skill
+    with_tmp_project do
+      write_skill_md("broken", "---\nname: broken\ndesc: [unclosed\n---\nBody.\n")
+
+      assert_nil registry.load("broken")
+    end
+  end
+
+  # The other half of the same hole, in a second call site: an unloadable skill
+  # made build_system_prompt drop the skill's instructions and keep going, so
+  # the step ran with only the generic "You are agent X" preamble. Unscoped
+  # tools and missing instructions arrive together, and neither is announced.
+  def test_a_step_naming_an_unloadable_skill_does_not_run_without_its_prompt
+    with_tmp_project do
+      write_skill_md("broken", "---\nname: broken\ndesc: [unclosed\n---\nBe careful.\n")
+      workflow = {
+        name: "flow", context_window: 32_000, reserve_tokens: 16_384,
+        keep_recent_tokens: 20_000, max_llm_calls: 5, timeout_seconds: 60,
+        providers: { default: { relay_chain: ["mock"] } },
+        steps: [Riggs::Workflow::StepNode.from_hash(
+          "id" => "s", "input" => "go", "output_var" => "o", "skill" => "broken"
+        )]
+      }
+      engine = Riggs::Workflow::GraphEngine.new(
+        workflow: workflow,
+        user_identity: { id: "eng_bob", memory_namespace: "eng_bob_private" },
+        db_path: "./db/riggs.sqlite3",
+        skill_registry: registry
+      )
+
+      capture_io do
+        assert_raises(Riggs::SkillUnavailable) { engine.execute(StringIO.new, input: {}) }
+      end
+
+      assert_equal :failed, engine.status
+    end
+  end
 end

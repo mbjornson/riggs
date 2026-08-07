@@ -153,9 +153,12 @@ module Riggs
         return nil unless @skill_registry
 
         name = step.skill || step.skills.first
+        # No skill named: the nil resolve_tools is allowed to read as
+        # "unconstrained". Every other nil is a skill that was asked for and
+        # could not be produced, which load! turns into a raise.
         return nil unless name
 
-        @skill_registry.load(name)
+        @skill_registry.load!(name)
       end
 
       def resolve_tools(skill)

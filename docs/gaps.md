@@ -242,6 +242,36 @@ each of the three sites.
 
 ---
 
+## Found separately — no size cap on a skill file before it is read
+
+From the adversarial review of Phase 8. Recorded rather than fixed, to keep that
+branch scoped to the fail-open defect the same review found.
+
+**Now:** `SkillRegistry#skill_source` calls `File.read` on `SKILL.yml` or
+`SKILL.md` with no size check, and `SkillFrontmatter.parse` then makes two more
+full copies of a `SKILL.md` (`normalize` strips the BOM and rewrites CRLF) plus
+an array of every line. Enumeration touches every skill directory, so the cost
+is paid by `skills:list`, the web Skills table, and workflow startup even when
+the oversized skill is not the one being run.
+
+**Why it matters:** it is the weakest of the three findings from that review and
+is recorded for completeness, not urgency. Reaching it needs write access to
+`config/riggs/skills/`, which is the operator's own directory — the realistic
+route is importing a skill bundle without reading it. The unbounded `File.read`
+predates Phase 8 (`main` reads `SKILL.yml` the same way); what Phase 8 adds is
+the `.md` container and its extra copies.
+
+**Shape:** stat the file and skip it with the existing "riggs: skipping skill
+at ..." warning when it exceeds a cap, before any read. The cap belongs next to
+`SkillFrontmatter::MAX_NESTING_DEPTH`, which guards the same class of input for
+the same reason.
+
+**Done when:** an oversized `SKILL.md` and an oversized `SKILL.yml` are each
+skipped with a warning naming the path, a sibling skill in the same root still
+loads, and neither is ever passed to `File.read`.
+
+---
+
 ## Not adopting from Pi
 
 Recorded so these do not get relitigated. Riggs is a team orchestrator, not a
