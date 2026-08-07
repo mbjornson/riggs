@@ -116,6 +116,9 @@ class TestGraphEngine < Minitest::Test
         user_identity: identity,
         db_path: "./db/riggs.sqlite3",
         hub_config: Riggs::Identity.load_config,
+        # example_triage.yml pins its classify step to triage_v1, and a step
+        # that declares a skill will not run without a registry to resolve it.
+        skill_registry: Riggs::SkillRegistry.new(roots: ["./config/riggs/skills"]),
         gate_handler: ->(*) { :approved }
       )
       # "Password reset request" classifies OK, so the run is classify -> summarize.
@@ -149,6 +152,9 @@ class TestGraphEngine < Minitest::Test
         user_identity: identity,
         db_path: "./db/riggs.sqlite3",
         hub_config: Riggs::Identity.load_config,
+        # example_triage.yml pins its classify step to triage_v1, and a step
+        # that declares a skill will not run without a registry to resolve it.
+        skill_registry: Riggs::SkillRegistry.new(roots: ["./config/riggs/skills"]),
         gate_handler: ->(*) { :rejected }
       )
       engine.execute(io, input: { ticket: "Something ERROR happened" })
@@ -168,6 +174,9 @@ class TestGraphEngine < Minitest::Test
         user_identity: identity,
         db_path: "./db/riggs.sqlite3",
         hub_config: Riggs::Identity.load_config,
+        # example_triage.yml pins its classify step to triage_v1, and a step
+        # that declares a skill will not run without a registry to resolve it.
+        skill_registry: Riggs::SkillRegistry.new(roots: ["./config/riggs/skills"]),
         gate_handler: lambda { |s, _|
           gates << s.id
           :approved

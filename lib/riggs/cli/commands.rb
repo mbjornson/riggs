@@ -568,22 +568,6 @@ module Riggs
       end
     end
 
-    # A skill file is content Riggs did not author, and its description and
-    # body go straight to a terminal. Psych rejects a raw ESC byte, but
-    # YAML's double-quoted style decodes its own "\e" escape into one, and a
-    # SKILL.md body is not YAML at all -- so both channels can carry control
-    # sequences. The damage is not garbled text: "\e[2K\r" erases the line
-    # and returns the cursor to column 0, so the skill's real name and
-    # description are wiped and whatever the file wanted the operator to read
-    # takes their place. Stripped at the print boundary rather than at load,
-    # because the body is also the system prompt and the model must receive
-    # what the author wrote.
-    #
-    # Tab and newline survive -- the body is markdown and needs its line
-    # structure. Everything else in C0, DEL, and C1 goes. scrub first: a file
-    # holding invalid UTF-8 would otherwise raise from the match.
-    TERMINAL_CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/
-
     no_commands do
       # Never prints a total without its coverage — a bare number would imply
       # complete measurement that CLI providers cannot supply.
@@ -637,7 +621,7 @@ module Riggs
       end
 
       def sanitize_for_terminal(text)
-        text.to_s.scrub("").gsub(TERMINAL_CONTROL, "")
+        Riggs.sanitize_for_terminal(text)
       end
 
       def compose_non_interactive(name)

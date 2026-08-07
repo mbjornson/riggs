@@ -13,6 +13,37 @@ module Riggs
       @roots = Array(roots || default_roots)
     end
 
+    # Resolves the skill a workflow step declares, for the two callers that run
+    # steps -- ToolLoop (which turns a skill into the tool list) and
+    # GraphEngine (which turns it into the system prompt). One choke point on
+    # purpose: these two disagreeing is exactly how the fail-open below got in,
+    # and how it survived the first fix.
+    #
+    # Returns nil only when the step declares no skill at all. Every other
+    # outcome either returns a loaded skill or raises, because a nil skill
+    # means "nothing constrains this step" to ToolLoop#resolve_tools, and a
+    # declaration that cannot be honored must not decay into that.
+    #
+    # `registry` may be nil: GraphEngine and GraphEngine.resume both default it
+    # that way, and a step that names a skill with nothing to resolve it
+    # against is in the same position as one whose file will not parse.
+    def self.for_step(step, registry)
+      declared = !step.skill.nil? || !Array(step.skills).empty?
+      return nil unless declared
+
+      # First usable entry, not `.first`: a bare "-" in a `skills:` list is a
+      # blank entry, and reading it as the answer both unscoped the step and
+      # silently discarded the skill declared on the next line.
+      name = ([step.skill] + Array(step.skills)).map { |s| s.to_s.strip }.find { |s| !s.empty? }
+      raise SkillUnavailable, "step #{step.id.inspect} declares a skill but no name could be read from it" if name.nil?
+      if registry.nil?
+        raise SkillUnavailable,
+              "step #{step.id.inspect} names skill #{name.inspect} but no skill registry is configured"
+      end
+
+      registry.load!(name)
+    end
+
     # The loud variant of `load`, for callers that named a skill on purpose.
     #
     # `load` returns nil for two unrelated situations: no skill was requested,
@@ -129,7 +160,11 @@ module Riggs
       # permitted_classes, Psych::AliasesNotEnabled for an anchor-bearing
       # file now that aliases are disabled below -- and both are malformed
       # input from this registry's point of view, not a registry bug.
-      warn "riggs: skipping skill at #{dir} (#{e.class}: #{e.message.to_s[0, 200]})"
+      # Both interpolations are untrusted: the directory name is whatever the
+      # filesystem allowed whoever installed the skill, and a parser message
+      # can quote the document. This warning is also the one line guaranteed to
+      # print when a hostile skill file is present.
+      warn Riggs.sanitize_for_terminal("riggs: skipping skill at #{dir} (#{e.class}: #{e.message.to_s[0, 200]})")
       nil
     end
 

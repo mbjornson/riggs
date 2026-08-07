@@ -556,6 +556,24 @@ class TestSkills < Minitest::Test
     end
   end
 
+  # The skip warning is the one line guaranteed to print when a hostile skill
+  # file is present, which makes it the worst place to interpolate untrusted
+  # text unescaped. The directory name is attacker-controlled wherever the
+  # skill file is, and a filename may contain an ESC byte.
+  def test_the_skip_warning_strips_terminal_control_sequences
+    with_tmp_project do
+      dir = "config/riggs/skills/ok\e[2K\rSAFE"
+      FileUtils.mkdir_p(dir)
+      File.write("#{dir}/SKILL.md", "---\nname: x\nbad: [unclosed\n---\nBody.\n")
+
+      err = capture_io { registry.list }.last
+
+      refute_includes err, "\e", "a skill directory name must not carry an ESC byte to stderr"
+      refute_includes err, "\r", "nor a carriage return that would rewrite the warning line"
+      assert_includes err, "skipping skill", "the warning itself must still be printed"
+    end
+  end
+
   # The other half of the same hole, in a second call site: an unloadable skill
   # made build_system_prompt drop the skill's instructions and keep going, so
   # the step ran with only the generic "You are agent X" preamble. Unscoped

@@ -426,11 +426,91 @@ class TestToolLoop < Minitest::Test
         "id" => "s", "input" => "go", "output_var" => "o", "skill" => "gh_only"
       )
 
+      loop_obj = unloadable_skill_loop
+      tools = :never_assigned
+
       err = assert_raises(Riggs::SkillUnavailable) do
-        capture_io { unloadable_skill_loop.send(:load_skill, step) }
+        capture_io { tools = loop_obj.send(:resolve_tools, loop_obj.send(:load_skill, step)) }
       end
 
       assert_match(/gh_only/, err.message, "the failure must name the skill the step pinned")
+      assert_equal :never_assigned, tools,
+                   "resolve_tools must never run for a step whose skill could not be loaded"
+    end
+  end
+
+  # A step that declares a skill but has no registry to resolve it against is
+  # in the same position as one whose file will not parse: the pin cannot be
+  # enforced. GraphEngine and GraphEngine.resume both default skill_registry
+  # to nil, so this is reachable by any embedder constructing the engine
+  # directly with an MCP manager.
+  def test_a_step_naming_a_skill_with_no_registry_configured_does_not_run
+    with_tmp_project do
+      step = Riggs::Workflow::StepNode.from_hash(
+        "id" => "s", "input" => "go", "output_var" => "o", "skill" => "restricted"
+      )
+      loop_obj = Riggs::Workflow::ToolLoop.new(
+        router: nil, mcp_manager: multi_server_mcp_manager, skill_registry: nil,
+        audit: ->(*) {}, llm_calls: 0, max_llm_calls: 5,
+        timeout_seconds: 60, started_at: Time.now, session_id: "s1"
+      )
+
+      assert_raises(Riggs::SkillUnavailable) { loop_obj.send(:load_skill, step) }
+    end
+  end
+
+  # `skills:` reached the skill through `.first`, so a stray blank list entry
+  # -- a bare "-" in the YAML -- resolved to nil. That did two things at once:
+  # unscoped the step, and silently discarded the skill the author actually
+  # declared on the next line. The declared skill must win.
+  def test_a_blank_first_entry_does_not_discard_the_skill_the_step_declares
+    with_tmp_project do
+      write_scoped_skill("restricted")
+      step = Riggs::Workflow::StepNode.from_hash(
+        "id" => "s", "input" => "go", "output_var" => "o",
+        "skills" => [nil, "restricted@1.0.0"]
+      )
+      loop_obj = unloadable_skill_loop
+
+      tools = loop_obj.send(:resolve_tools, loop_obj.send(:load_skill, step))
+
+      assert_equal ["gh_search"], tools.map { |t| t[:name] },
+                   "the pinned skill on the second line must scope the step"
+    end
+  end
+
+  # Declaring a list and putting nothing usable in it is a broken declaration,
+  # not a decision to run unscoped.
+  def test_a_skills_list_with_no_usable_entry_does_not_run_unscoped
+    with_tmp_project do
+      step = Riggs::Workflow::StepNode.from_hash(
+        "id" => "s", "input" => "go", "output_var" => "o", "skills" => [nil, ""]
+      )
+
+      assert_raises(Riggs::SkillUnavailable) { unloadable_skill_loop.send(:load_skill, step) }
+    end
+  end
+
+  def test_an_empty_skill_name_does_not_run_unscoped
+    with_tmp_project do
+      step = Riggs::Workflow::StepNode.from_hash(
+        "id" => "s", "input" => "go", "output_var" => "o", "skill" => ""
+      )
+
+      assert_raises(Riggs::SkillUnavailable) { unloadable_skill_loop.send(:load_skill, step) }
+    end
+  end
+
+  # An empty `skills: []` is not a declaration -- it is the absence of one, and
+  # must keep behaving like a step that never mentioned skills at all.
+  def test_an_empty_skills_list_is_not_a_declaration
+    with_tmp_project do
+      step = Riggs::Workflow::StepNode.from_hash(
+        "id" => "s", "input" => "go", "output_var" => "o", "skills" => []
+      )
+      loop_obj = unloadable_skill_loop
+
+      assert_nil loop_obj.send(:load_skill, step)
     end
   end
 
@@ -563,6 +643,22 @@ class TestToolLoop < Minitest::Test
       def call_tool(*, **) = "unused"
       def close; end
     end.new
+  end
+
+  # A skill pinned to one server, with one tool on it.
+  def write_scoped_skill(name)
+    FileUtils.mkdir_p("config/riggs/skills/#{name}")
+    File.write("config/riggs/skills/#{name}/SKILL.yml", <<~YAML)
+      name: #{name}
+      version: "1.0.0"
+      system_prompt: Only GitHub.
+      mcp_servers:
+        - github
+      tools:
+        - name: gh_search
+          mcp_server: github
+          description: Search GitHub.
+    YAML
   end
 
   def unloadable_skill_loop(dir: "./config/riggs/skills")
