@@ -200,6 +200,48 @@ and a test proves it against a hand-built database that predates the column.
 
 ---
 
+## Found separately — three more `Psych.safe_load` sites carry the Phase 8 defect
+
+Not from the Pi comparison. Surfaced by the whole-branch review of Phase 8,
+which found and fixed this pattern in the skill loader and then noticed the same
+two lines elsewhere.
+
+**Now:** Phase 8 hardened both skill-loading call sites to
+`permitted_classes: [Symbol, Date, Time], aliases: false`, and widened the
+rescue around them to `Psych::Exception`. Three other call sites still read
+`permitted_classes: [Symbol], aliases: true`, with no equivalent rescue:
+
+- `lib/riggs/identity.rb:23` — `.agent_hubrc`
+- `lib/riggs/workflow/loader.rb:23` — workflow YAML
+- `lib/riggs/web/app.rb:265` — `req.params["yaml"]`, i.e. YAML posted over HTTP
+
+**Why it matters:** two distinct failure modes, both demonstrated on the skill
+path before Phase 8 closed them there.
+
+1. *An ordinary date field crashes the loader.* Psych auto-types an unquoted
+   `2026-08-05`, `permitted_classes: [Symbol]` rejects the resulting `Date`, and
+   `Psych::DisallowedClass` is `Psych::Exception < RuntimeError` — not a
+   `SyntaxError`. So a workflow file with a `created:` line raises rather than
+   reporting a readable error.
+2. *A YAML alias bomb hangs the process.* `Psych.safe_load` returns fast because
+   aliases are shared references, but `Identity.deep_symbolize` then rebuilds
+   the structure and materializes every leaf. On the skill path a 478-byte file
+   drove RSS past 8 GB and never returned. The web site is the sharp one: it
+   parses YAML straight from a request parameter, so this is reachable by
+   anyone who can reach that endpoint.
+
+**Shape:** apply the Phase 8 treatment — `permitted_classes: [Symbol, Date,
+Time]`, `aliases: false`, and a rescue naming `Psych::Exception` that turns a
+bad document into an error the caller can report. The web endpoint additionally
+wants a size cap, since it is the only one of the three that parses input Riggs
+never wrote to disk itself.
+
+**Done when:** a date-bearing workflow file loads, an anchor-bearing one is
+rejected with a readable error rather than hanging, and a test covers both for
+each of the three sites.
+
+---
+
 ## Not adopting from Pi
 
 Recorded so these do not get relitigated. Riggs is a team orchestrator, not a
