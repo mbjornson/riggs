@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "date"
 require "psych"
 require_relative "frontmatter"
 
@@ -97,11 +98,16 @@ module Riggs
         mcp_servers: Array(data[:mcp_servers]).map(&:to_s),
         path: dir
       }
-    rescue Psych::SyntaxError, ArgumentError, SystemCallError => e
+    rescue Psych::Exception, ArgumentError, SystemCallError => e
       # Named classes, not StandardError: a rescue that wide would turn a
       # genuine bug in this registry into "that skill doesn't exist", which is
       # the failure mode Phase 7's review found hiding a real defect in
-      # Compactor#call_router.
+      # Compactor#call_router. Psych::Exception (not just SyntaxError) is
+      # required because Psych.safe_load raises other subclasses of it --
+      # Psych::DisallowedClass for an auto-typed Date/Time outside
+      # permitted_classes, Psych::AliasesNotEnabled for an anchor-bearing
+      # file now that aliases are disabled below -- and both are malformed
+      # input from this registry's point of view, not a registry bug.
       warn "riggs: skipping skill at #{dir} (#{e.class}: #{e.message.to_s[0, 200]})"
       nil
     end
@@ -112,7 +118,7 @@ module Riggs
     def skill_source(dir)
       yml = File.join(dir, "SKILL.yml")
       if File.exist?(yml)
-        raw = Psych.safe_load(File.read(yml), permitted_classes: [Symbol], aliases: true) || {}
+        raw = Psych.safe_load(File.read(yml), permitted_classes: [Symbol, Date, Time], aliases: false) || {}
         raise ArgumentError, "SKILL.yml must be a mapping, got #{raw.class}" unless raw.is_a?(Hash)
 
         return { data: raw, body: nil }

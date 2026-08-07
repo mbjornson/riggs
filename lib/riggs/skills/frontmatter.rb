@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "date"
 require "psych"
 
 module Riggs
@@ -40,7 +41,7 @@ module Riggs
     end
 
     def self.load_yaml(yaml)
-      raw = Psych.safe_load(yaml, permitted_classes: [Symbol], aliases: true)
+      raw = Psych.safe_load(yaml, permitted_classes: [Symbol, Date, Time], aliases: false)
       return {} if raw.nil?
       raise ArgumentError, "SKILL.md frontmatter must be a mapping, got #{raw.class}" unless raw.is_a?(Hash)
 
