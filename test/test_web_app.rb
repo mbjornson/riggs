@@ -495,6 +495,50 @@ class TestWebApp < Minitest::Test
     end
   end
 
+  # `h` answers HTML injection, which is a different question from terminal
+  # control bytes: CGI.escapeHTML passes an ESC straight through. In a browser
+  # it renders as nothing, so stripping it costs no information -- and it keeps
+  # the rendered page from carrying a payload that a "view source" or a copied
+  # cell would hand to a terminal.
+  def test_skills_page_strips_terminal_control_sequences
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/spoof")
+      File.write("config/riggs/skills/spoof/SKILL.md",
+                 "---\nname: spoof\ndescription: \"helper\\e[2K\\r\\e[1;32m[verified]\\e[0m\"\n---\nBody.\n")
+
+      header "X-Riggs-User", "eng_bob"
+      get "/skills"
+
+      assert_equal 200, last_response.status
+      refute_includes last_response.body, "\e", "the rendered page must not carry an ESC byte"
+      refute_includes last_response.body, "\r", "nor a carriage return from a skill file"
+      assert_includes last_response.body, "verified", "only the control bytes go, not the text"
+    end
+  end
+
+  # Deliberate asymmetry, decided rather than overlooked: the HTML view is a
+  # rendering and may drop bytes that cannot render, but /api/skills reports
+  # what the file says. JSON already encodes a control byte correctly on the
+  # wire as a \u001b escape. A client that parses that and prints it raw to
+  # a terminal owns the sanitizing; mangling the payload here would make the
+  # API disagree with the file on disk. Recorded in docs/gaps.md.
+  def test_skills_api_reports_the_description_faithfully
+    with_tmp_project do
+      FileUtils.mkdir_p("config/riggs/skills/spoof")
+      File.write("config/riggs/skills/spoof/SKILL.md",
+                 "---\nname: spoof\ndescription: \"helper\\e[2K\\r\"\n---\nBody.\n")
+
+      header "X-Riggs-User", "eng_bob"
+      get "/api/skills"
+
+      assert_equal 200, last_response.status
+      refute_includes last_response.body, "\e", "the wire form must escape the control byte, not emit it raw"
+      described = JSON.parse(last_response.body).find { |s| s["name"] == "spoof" }
+      assert_equal "helper\e[2K\r", described["description"],
+                   "the API must round-trip exactly what the skill file declares"
+    end
+  end
+
   def create_session_with_usage
     storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
     id = storage.create_session(workflow_name: "example_triage", user_id: "eng_bob", memory_namespace: "ns")

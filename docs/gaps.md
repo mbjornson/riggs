@@ -272,6 +272,33 @@ loads, and neither is ever passed to `File.read`.
 
 ---
 
+## Decided, not a gap — `/api/skills` reports skill text verbatim
+
+From the same adversarial review. Recorded so it reads as a decision rather
+than an oversight the next time someone greps for unsanitized output.
+
+**Now:** skill text reaches a terminal through three surfaces. Two are
+sanitized: the CLI (`skills:list`, `skills:show`) and the registry's
+"skipping skill" warning both go through `Riggs.sanitize_for_terminal`, as does
+every HTML view via the `h` helper in `web/app.rb`. `/api/skills` does not.
+
+**Why that is deliberate:** JSON already encodes a control byte correctly on
+the wire as a `\u001b` escape — nothing raw is emitted. The exposure needs a
+consumer that parses the JSON and prints the decoded string straight to a
+terminal, e.g. `curl -s /api/skills | jq -r '.[].description'`. Sanitizing the
+payload to cover that would make the API disagree with the file on disk, so a
+client could no longer read back what a skill actually declares. The HTML view
+is a rendering and may drop bytes that cannot render; an API response is not.
+
+`test_skills_api_reports_the_description_faithfully` pins the round-trip, so
+this cannot be "fixed" by accident.
+
+**Revisit if:** Riggs ever ships a client of its own that prints API output to
+a terminal. That client sanitizes at its own print boundary — the same rule the
+CLI already follows — rather than the server mangling the payload for everyone.
+
+---
+
 ## Not adopting from Pi
 
 Recorded so these do not get relitigated. Riggs is a team orchestrator, not a
