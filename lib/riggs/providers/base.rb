@@ -9,6 +9,11 @@ module Riggs
     class RateLimitError < Error; end
     class TimeoutError < Error; end
 
+    # The CLI ran but is not authenticated. A subclass of Error on purpose:
+    # Router relays to the next provider on Error, and a provider that is not
+    # logged in should fail over exactly like any other failure.
+    class AuthError < Error; end
+
     class Base
       attr_reader :name, :options
 

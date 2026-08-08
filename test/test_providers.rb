@@ -334,6 +334,62 @@ class TestProviders < Minitest::Test
     end
   end
 
+  # "Not logged in" is the error an operator will hit most often now that the
+  # pre-flight is gone. It gets its own class so a failed run says which
+  # problem it was, rather than looking like a crash.
+  def test_cli_runner_raises_auth_error_on_a_not_logged_in_failure
+    err = assert_raises(Riggs::Providers::AuthError) do
+      Riggs::Providers::CliRunner.run(
+        command: "sh", args: ["-c", "echo 'Not logged in. Run codex login.' >&2; exit 1"]
+      )
+    end
+
+    assert_match(/Not logged in/, err.message, "the CLI's own words must survive")
+  end
+
+  # AuthError must stay a subclass of Error: Router rescues
+  # `RateLimitError, TimeoutError, Error` in one clause and relays to the next
+  # provider. A sibling class would propagate and kill the run instead.
+  def test_auth_error_is_an_error_so_the_relay_chain_still_falls_through
+    assert_operator Riggs::Providers::AuthError, :<, Riggs::Providers::Error
+  end
+
+  def test_a_rate_limited_failure_is_still_a_rate_limit_error
+    assert_raises(Riggs::Providers::RateLimitError) do
+      Riggs::Providers::CliRunner.run(
+        command: "sh", args: ["-c", "echo '429 too many requests' >&2; exit 1"]
+      )
+    end
+  end
+
+  def test_an_ordinary_failure_is_still_a_plain_error
+    err = assert_raises(Riggs::Providers::Error) do
+      Riggs::Providers::CliRunner.run(command: "sh", args: ["-c", "echo 'segfault' >&2; exit 3"])
+    end
+
+    refute_instance_of Riggs::Providers::AuthError, err
+    refute_instance_of Riggs::Providers::RateLimitError, err
+  end
+
+  # The subclassing above is only meaningful if the relay actually falls
+  # through, so assert the behavior and not just the class hierarchy.
+  def test_router_relays_past_a_provider_that_is_not_authenticated
+    unauthenticated = Class.new(Riggs::Providers::Base) do
+      def complete(**)
+        raise Riggs::Providers::AuthError, "CLI not authenticated: codex: Not logged in"
+      end
+    end
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "broken" => { "type" => "broken" }, "mock" => { "type" => "mock" } },
+      registry: { "broken" => unauthenticated, "mock" => Riggs::Providers::Mock }
+    )
+
+    result = router.call(chain: %w[broken mock], messages: [{ role: "user", content: "hi" }])
+
+    assert_equal "mock", result[:provider], "an unauthenticated provider must fail over, not kill the run"
+    assert_equal 2, result[:relay_attempt]
+  end
+
   def test_cursor_cloud_create_and_poll
     ENV["CURSOR_API_KEY"] = "crsr_test"
     calls = []
