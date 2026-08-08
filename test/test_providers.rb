@@ -309,6 +309,31 @@ class TestProviders < Minitest::Test
     ENV.delete("ANTHROPIC_API_KEY")
   end
 
+  # ANTHROPIC_AUTH_TOKEN outranks ANTHROPIC_API_KEY in Claude Code's own
+  # authentication precedence and is the documented variable for a corporate
+  # Anthropic-compatible gateway (code.claude.com/docs/en/llm-gateway-connect),
+  # so leaving it unscrubbed would let a gateway operator bypass the
+  # subscription through a sibling variable -- exactly the failure this phase
+  # exists to close, reached one variable over.
+  def test_claude_cli_scrubs_the_auth_token_under_subscription
+    ENV["ANTHROPIC_AUTH_TOKEN"] = "sk-auth-token-test"
+    env = env_handed_to_runner(Riggs::Providers::ClaudeCli, name: "claude_cli")
+
+    assert env.key?("ANTHROPIC_AUTH_TOKEN"), "the key must be present in the hash so it can be unset"
+    assert_nil env["ANTHROPIC_AUTH_TOKEN"], "and nil so the child does not receive it"
+  ensure
+    ENV.delete("ANTHROPIC_AUTH_TOKEN")
+  end
+
+  def test_claude_cli_passes_the_auth_token_under_api_mode
+    ENV["ANTHROPIC_AUTH_TOKEN"] = "sk-auth-token-test"
+    env = env_handed_to_runner(Riggs::Providers::ClaudeCli, name: "claude_cli", options: { auth: "api" })
+
+    assert_equal "sk-auth-token-test", env["ANTHROPIC_AUTH_TOKEN"]
+  ensure
+    ENV.delete("ANTHROPIC_AUTH_TOKEN")
+  end
+
   # CLAUDE_CODE_OAUTH_TOKEN is itself a subscription credential -- the
   # documented path for non-interactive use -- so scrubbing it would defeat
   # the mode that is meant to use it.
