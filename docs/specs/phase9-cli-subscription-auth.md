@@ -139,7 +139,7 @@ Under `auth: subscription`:
 
 | Adapter | Set to `nil` | Left alone |
 |---|---|---|
-| `ClaudeCli` | `ANTHROPIC_API_KEY` | `CLAUDE_CODE_OAUTH_TOKEN` |
+| `ClaudeCli` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` | `CLAUDE_CODE_OAUTH_TOKEN` |
 | `CodexCli` | `CODEX_API_KEY`, `OPENAI_API_KEY` | — |
 | `CursorCli` | `CURSOR_API_KEY` | — |
 
