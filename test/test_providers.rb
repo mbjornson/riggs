@@ -197,6 +197,24 @@ class TestProviders < Minitest::Test
     assert_equal({ "codex" => "api" }, router.auth_modes)
   end
 
+  # R9.5 fix (see task-4-report.md): providers.default is the documented way
+  # to declare a workflow's relay chain, not a provider -- #chain_for never
+  # dispatches it, only unpacks its relay_chain into other providers' names,
+  # so it never appears in riggs_provider_calls.provider and does not belong
+  # in this map. Both halves matter: absence alone would pass if the filter
+  # were too aggressive and dropped real entries along with the routing key.
+  def test_auth_modes_excludes_the_default_routing_alias_but_keeps_real_providers
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "mock" => { "type" => "mock" } },
+      workflow_providers: { "default" => { "relay_chain" => ["mock"] } }
+    )
+
+    modes = router.auth_modes
+
+    refute_includes modes.keys, "default", "providers.default is a routing directive, not a provider"
+    assert_equal "api", modes["mock"], "a real provider in the same providers: block must still be reported"
+  end
+
   # Spec R9.1: `auth:` on a non-CLI provider is ignored, not an error -- there
   # is no CLI to defer to, so validating the value would reject a harmless
   # stray key.

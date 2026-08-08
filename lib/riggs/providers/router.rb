@@ -123,9 +123,20 @@ module Riggs
       # This is an observability field, so it must not be able to abort the run
       # it observes -- see #provider_auth_mode for why the rescue there gives up
       # nothing on the money-safety axis Task 1 built.
+      #
+      # A name whose config is a routing directive (providers.default and any
+      # other relay_chain alias, hub- or workflow-level) is not itself a
+      # dispatchable provider -- #chain_for never passes it to #build, it only
+      # unpacks its relay_chain into other providers' names -- so
+      # #provider_auth_mode returns nil for it and it is left out of the map
+      # entirely, rather than reported under a name no call in
+      # riggs_provider_calls.provider can ever match.
       def auth_modes
         names = (@hub_providers.keys + @workflow_providers.keys).map(&:to_s).uniq.sort
-        names.to_h { |name| [name, provider_auth_mode(name)] }
+        names.each_with_object({}) do |name, modes|
+          mode = provider_auth_mode(name)
+          modes[name] = mode if mode
+        end
       end
 
       private
@@ -174,8 +185,18 @@ module Riggs
       # entry does not blank out the good ones. "invalid" is deliberately
       # outside Cli::AUTH_MODES: it can only appear for a provider that was
       # configured but never dispatched.
+      #
+      # Returns nil for a routing directive (a relay_chain alias, e.g.
+      # providers.default) rather than "api": #chain_for's own named-lookup
+      # branch treats a `relay_chain` key as the entry's whole identity
+      # (`return ... if named[:relay_chain]`, checked before any type/registry
+      # resolution and never reached again) so this mirrors, key for key, the
+      # one place Router already decides "is this name a real provider or a
+      # chain to unpack."
       def provider_auth_mode(name)
         opts = provider_config(name)
+        return nil if opts[:relay_chain]
+
         klass = @registry[name] || @registry[opts[:type]&.to_s || name]
         return "api" unless klass && klass <= Cli
 
