@@ -7,6 +7,29 @@ module Riggs
   module Providers
     # Base for providers that shell out to a local agent CLI.
     class Cli < Base
+      AUTH_MODES = %w[subscription api].freeze
+      DEFAULT_AUTH_MODE = "subscription"
+
+      # Which account a CLI provider bills. `subscription` scrubs that
+      # provider's API-key variables from the child so the CLI falls back to
+      # its own stored login; `api` passes them through.
+      #
+      # An unrecognized value raises rather than defaulting: both defaults
+      # spend money, and silently picking one when the operator wrote
+      # something else is how a typo becomes a bill against the wrong account.
+      def self.resolve_auth_mode(value, provider:)
+        mode = value.to_s.strip.downcase
+        return DEFAULT_AUTH_MODE if mode.empty?
+        return mode if AUTH_MODES.include?(mode)
+
+        raise Error, "provider '#{provider}': unknown auth mode #{value.inspect} " \
+                     "(expected one of: #{AUTH_MODES.join(', ')})"
+      end
+
+      def auth_mode
+        Cli.resolve_auth_mode(options[:auth], provider: name)
+      end
+
       def complete(messages:, system: nil, timeout: 60, tools: nil)
         ensure_auth!
         prompt = build_prompt(messages: messages, system: system)

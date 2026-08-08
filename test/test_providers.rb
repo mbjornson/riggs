@@ -143,6 +143,37 @@ class TestProviders < Minitest::Test
     ENV.delete("OPENAI_API_KEY")
   end
 
+  # auth_mode decides whether Riggs scrubs API keys before handing control to
+  # the CLI. An unrecognized value must not fall back to a default, because
+  # both defaults spend money -- one from the wrong account.
+  def auth_provider(value)
+    Riggs::Providers::CodexCli.new(name: "codex", options: { auth: value })
+  end
+
+  def test_auth_mode_defaults_to_subscription
+    assert_equal "subscription", Riggs::Providers::CodexCli.new(name: "codex", options: {}).auth_mode
+    assert_equal "subscription", auth_provider(nil).auth_mode
+    assert_equal "subscription", auth_provider("").auth_mode
+    assert_equal "subscription", auth_provider("   ").auth_mode
+  end
+
+  def test_auth_mode_accepts_api
+    assert_equal "api", auth_provider("api").auth_mode
+  end
+
+  def test_auth_mode_is_case_insensitive_and_trims
+    assert_equal "api", auth_provider("  API  ").auth_mode
+    assert_equal "subscription", auth_provider("Subscription").auth_mode
+  end
+
+  def test_an_unknown_auth_mode_raises_naming_the_provider_and_the_valid_values
+    err = assert_raises(Riggs::Providers::Error) { auth_provider("subscribe").auth_mode }
+
+    assert_match(/codex/, err.message, "the error must name which provider is misconfigured")
+    assert_match(/subscription/, err.message, "and list the values that would have worked")
+    assert_match(/api/, err.message)
+  end
+
   def test_cursor_cli_requires_api_key
     ENV.delete("CURSOR_API_KEY")
     provider = Riggs::Providers::CursorCli.new(name: "cursor", options: {
