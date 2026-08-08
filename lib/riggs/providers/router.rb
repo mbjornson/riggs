@@ -4,6 +4,7 @@ require_relative "base"
 require_relative "mock"
 require_relative "anthropic"
 require_relative "openai_compatible"
+require_relative "cli"
 require_relative "cursor_cli"
 require_relative "claude_cli"
 require_relative "codex_cli"
@@ -112,6 +113,32 @@ module Riggs
         Array(chain).map(&:to_s)
       end
 
+      # Every configured provider mapped to the account it will bill. Recorded
+      # once per run rather than per call: auth mode is a property of provider
+      # configuration, and riggs_provider_calls already records which provider
+      # answered each call, so the two together recover the billing account for
+      # every step -- without a schema change, which riggs_provider_calls has no
+      # migration path for.
+      #
+      # This is an observability field, so it must not be able to abort the run
+      # it observes -- see #provider_auth_mode for why the rescue there gives up
+      # nothing on the money-safety axis Task 1 built.
+      #
+      # A name whose config is a routing directive (providers.default and any
+      # other relay_chain alias, hub- or workflow-level) is not itself a
+      # dispatchable provider -- #chain_for never passes it to #build, it only
+      # unpacks its relay_chain into other providers' names -- so
+      # #provider_auth_mode returns nil for it and it is left out of the map
+      # entirely, rather than reported under a name no call in
+      # riggs_provider_calls.provider can ever match.
+      def auth_modes
+        names = (@hub_providers.keys + @workflow_providers.keys).map(&:to_s).uniq.sort
+        names.each_with_object({}) do |name, modes|
+          mode = provider_auth_mode(name)
+          modes[name] = mode if mode
+        end
+      end
+
       private
 
       # Never raises. A broken ledger callback must not convert a recoverable
@@ -147,6 +174,35 @@ module Riggs
         hub = {} unless hub.is_a?(Hash)
         wf = {} unless wf.is_a?(Hash)
         Identity.deep_symbolize(hub).merge(Identity.deep_symbolize(wf))
+      end
+
+      # Non-CLI providers take an API key by definition, so a stray `auth:` on
+      # one is ignored rather than validated (R9.1) -- there is no CLI to defer
+      # to. A CLI provider with an invalid `auth:` still raises if it is ever
+      # actually dispatched: Cli#auth_mode makes the same call from inside
+      # child_env, which is the money-safety path Task 1 built. Rescued here
+      # per provider name, not around the whole #auth_modes loop, so one bad
+      # entry does not blank out the good ones. "invalid" is deliberately
+      # outside Cli::AUTH_MODES: it can only appear for a provider that was
+      # configured but never dispatched.
+      #
+      # Returns nil for a routing directive (a relay_chain alias, e.g.
+      # providers.default) rather than "api": #chain_for's own named-lookup
+      # branch treats a `relay_chain` key as the entry's whole identity
+      # (`return ... if named[:relay_chain]`, checked before any type/registry
+      # resolution and never reached again) so this mirrors, key for key, the
+      # one place Router already decides "is this name a real provider or a
+      # chain to unpack."
+      def provider_auth_mode(name)
+        opts = provider_config(name)
+        return nil if opts[:relay_chain]
+
+        klass = @registry[name] || @registry[opts[:type]&.to_s || name]
+        return "api" unless klass && klass <= Cli
+
+        Cli.resolve_auth_mode(opts[:auth], provider: name)
+      rescue Error
+        "invalid"
       end
 
       # Normalizes vendor usage and prices it. Only Router resolves provider

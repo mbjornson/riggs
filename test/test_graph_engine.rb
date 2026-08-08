@@ -66,6 +66,31 @@ class TestGraphEngine < Minitest::Test
     end
   end
 
+  # Which account a step billed must be recoverable from the audit trail alone,
+  # without reading whatever the config happens to say later.
+  def test_workflow_start_records_the_auth_mode_of_every_provider
+    with_tmp_project do
+      workflow = Riggs::Workflow::Loader.load(path: "config/riggs/workflows/example_triage.yml")
+      engine = Riggs::Workflow::GraphEngine.new(
+        workflow: workflow,
+        user_identity: Riggs::Identity.resolve(cli_user: "eng_bob"),
+        db_path: "./db/riggs.sqlite3",
+        hub_config: Riggs::Identity.load_config,
+        skill_registry: Riggs::SkillRegistry.new(roots: ["./config/riggs/skills"]),
+        gate_handler: ->(*) { :approved }
+      )
+      engine.execute(StringIO.new, input: { ticket: "Password reset request" })
+
+      start = engine.audit_log.find { |e| e[:event_type] == "workflow_start" }
+      refute_nil start, "expected a workflow_start event"
+      modes = start[:payload][:provider_auth_modes] || start[:payload]["provider_auth_modes"]
+
+      refute_nil modes, "workflow_start must carry provider_auth_modes"
+      assert_equal "api", modes["mock"] || modes[:mock],
+                   "a non-CLI provider bills its API key by definition"
+    end
+  end
+
   def test_three_steps_with_hitl_auto_approve
     with_tmp_project do
       workflow = Riggs::Workflow::Loader.load(path: "config/riggs/workflows/example_triage.yml")

@@ -104,13 +104,42 @@ HTTP providers (direct API):
 | `openai` | OpenAI-compatible chat | `OPENAI_API_KEY` |
 | `ollama` | Local OpenAI-compatible | optional |
 
-CLI providers (shell out; binaries must be on `PATH`):
+CLI providers (shell out; binaries must be on `PATH`). These run against your
+**subscription** by default — Riggs removes the API-key variables from the
+*inherited environment* before spawning the child, so an exported key in your
+shell cannot reach the CLI and override its own stored login (`codex login`,
+`claude /login`, `cursor-agent login`). Set `auth: api` on the provider to bill
+metered API credits instead.
 
-| Name | Command | Auth |
-|------|---------|------|
-| `cursor` | `agent -p … --output-format text` | `CURSOR_API_KEY` |
-| `claude_cli` | `claude -p … --bare` | `ANTHROPIC_API_KEY` |
-| `codex` | `codex exec …` | `CODEX_API_KEY` or `OPENAI_API_KEY` |
+| Name | Command | `auth: subscription` (default) | `auth: api` |
+|------|---------|-------------------------------|-------------|
+| `cursor` | `agent -p … --output-format text` | `cursor-agent login` | `CURSOR_API_KEY` |
+| `claude_cli` | `claude -p … --bare` | `claude /login`, or `CLAUDE_CODE_OAUTH_TOKEN` | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` |
+| `codex` | `codex exec …` | `codex login` | `CODEX_API_KEY` or `OPENAI_API_KEY` |
+
+```yaml
+# .agent_hubrc
+providers:
+  codex:      { type: codex }                  # uses your ChatGPT subscription
+  claude_api: { type: claude_cli, auth: api }  # bills ANTHROPIC_API_KEY
+```
+
+`ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` both override a Claude Pro/Max
+subscription when Claude Code sees them, so `auth: subscription` unsets both
+for the child rather than trusting them to be absent.
+
+**What the scrub covers, and what it does not.** The scrub removes its
+provider's API-key variables from the environment Riggs hands to the child
+process — the channel demonstrated in the spec's Motivation, and the only one
+Riggs controls. It does not reach credentials the CLI reads from its own
+configuration: Claude Code's `settings.json` `env` block and an
+`apiKeyHelper` hook can both supply a key independent of the process
+environment, and the cloud-provider gateway variables
+(`ANTHROPIC_AWS_API_KEY`, `ANTHROPIC_FOUNDRY_API_KEY`,
+`ANTHROPIC_FOUNDRY_AUTH_TOKEN`, `AWS_BEARER_TOKEN_BEDROCK`) are deliberately
+left unscrubbed. See "Known residual auth paths" in
+[`docs/specs/phase9-cli-subscription-auth.md`](docs/specs/phase9-cli-subscription-auth.md)
+for why.
 
 Cursor Cloud Agents (async REST — needs a repo):
 
