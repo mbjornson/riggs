@@ -253,8 +253,10 @@ class TestProviders < Minitest::Test
     ENV["CODEX_API_KEY"] = "sk-codex"
     env = env_handed_to_runner(Riggs::Providers::CodexCli, name: "codex")
 
-    assert_nil env["CODEX_API_KEY"]
-    assert_nil env["OPENAI_API_KEY"]
+    assert env.key?("CODEX_API_KEY"), "the key must be present in the hash so it can be unset"
+    assert_nil env["CODEX_API_KEY"], "and nil so the child does not receive it"
+    assert env.key?("OPENAI_API_KEY"), "the key must be present in the hash so it can be unset"
+    assert_nil env["OPENAI_API_KEY"], "and nil so the child does not receive it"
   ensure
     ENV.delete("OPENAI_API_KEY")
     ENV.delete("CODEX_API_KEY")
@@ -264,7 +266,8 @@ class TestProviders < Minitest::Test
     ENV["CURSOR_API_KEY"] = "sk-cursor"
     env = env_handed_to_runner(Riggs::Providers::CursorCli, name: "cursor")
 
-    assert_nil env["CURSOR_API_KEY"]
+    assert env.key?("CURSOR_API_KEY"), "the key must be present in the hash so it can be unset"
+    assert_nil env["CURSOR_API_KEY"], "and nil so the child does not receive it"
   ensure
     ENV.delete("CURSOR_API_KEY")
   end
