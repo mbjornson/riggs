@@ -158,6 +158,38 @@ line defeats the scrub.
 for the scrub; it is listed in the Motivation only because it also targets
 Cursor.
 
+## Known residual auth paths (out of scope)
+
+The scrub in R9.3 closes the inherited-environment channel: `CliRunner`
+builds the child environment as `ENV.to_h.merge(env)`, and that is the
+channel the Motivation section demonstrates the danger of. It is not a
+guarantee that no API key can reach the CLI by any path — the README is
+worded to say only what the scrub covers. Recorded here so the gap is a
+documented decision, not a later surprise:
+
+- **Claude Code's `settings.json` `env` block.** A user- or project-level
+  `settings.json` can declare `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`
+  directly; Claude Code reads it independent of the process environment
+  Riggs constructs. Riggs does not read, write, or validate that file — the
+  same "no credential store" boundary from the Non-goals applies to the
+  CLI's own configuration, not only to Riggs holding credentials itself.
+- **`apiKeyHelper`.** A configured helper script's stdout is a credential
+  source invoked by the CLI directly, outside any environment Riggs
+  constructs or inspects.
+- **Cloud-provider gateway variables** — `ANTHROPIC_AWS_API_KEY`,
+  `ANTHROPIC_FOUNDRY_API_KEY`, `ANTHROPIC_FOUNDRY_AUTH_TOKEN`,
+  `AWS_BEARER_TOKEN_BEDROCK`. These are deliberately left unscrubbed, not
+  merely unaddressed. Each only takes effect alongside a companion routing
+  flag (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, or the Foundry
+  equivalent). Scrubbing the credential while leaving that flag set would
+  not fall back to the subscription — it would route the CLI to a gateway
+  with no credential, a broken run rather than the intended fallback.
+  Scrubbing them safely would mean also unsetting the routing flags, which
+  is a larger behavior change than this phase makes.
+
+None of these are reachable through the channel `CliRunner` builds, so no
+test in R9.6 exercises them — they are documented here instead of asserted.
+
 ## R9.4 `AuthError`
 
 `Riggs::Providers::AuthError < Riggs::Providers::Error`, raised from
