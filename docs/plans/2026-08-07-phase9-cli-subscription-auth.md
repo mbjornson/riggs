@@ -17,7 +17,7 @@
 - Valid `auth:` values are exactly `"subscription"` and `"api"`. Default is `"subscription"`.
 - `subscription` scrubs, per adapter: `ClaudeCli` → `ANTHROPIC_API_KEY`; `CodexCli` → `CODEX_API_KEY` and `OPENAI_API_KEY`; `CursorCli` → `CURSOR_API_KEY`.
 - `CLAUDE_CODE_OAUTH_TOKEN` is **never** scrubbed — it is itself a subscription credential.
-- Do not modify `lib/riggs/providers/cli_runner.rb`. The `nil`-unsets-variable behavior it already has is the mechanism.
+- Do not change how `lib/riggs/providers/cli_runner.rb` builds the child environment. Its existing `ENV.to_h.merge(env)` is the scrub mechanism and needs nothing added. (Task 3 does add one branch to `raise_for_failure!` in that file — failure classification is separate from environment construction.)
 - Do not add columns to any database table. `riggs_provider_calls` has no migration path (`Storage#ensure_columns!` inspects only `riggs_sessions`), so a new column would silently skip existing databases.
 - **Never write a literal control character into a source file.** Regexes use `\e`-free notation; if a test needs an ESC byte, build it with `27.chr`. Raw control bytes in source make the file unreadable to tooling and break shell quoting.
 - Commit messages end with:
@@ -35,7 +35,7 @@
 | `lib/riggs/providers/codex_cli.rb` | Codex adapter. Gains scrub. |
 | `lib/riggs/providers/cursor_cli.rb` | Cursor adapter. Gains scrub + argv change. |
 | `lib/riggs/providers/base.rb` | Error classes. Gains `AuthError`. |
-| `lib/riggs/providers/cli_runner.rb` | **Unchanged.** Failure classification lives here and gains one branch. |
+| `lib/riggs/providers/cli_runner.rb` | Environment construction unchanged. Failure classification lives here and gains one branch (Task 3). |
 | `lib/riggs/providers/router.rb` | Gains `#auth_modes` for attribution. |
 | `lib/riggs/workflow/graph_engine.rb` | `workflow_start` payload gains `provider_auth_modes`. |
 | `test/test_providers.rb` | All provider tests. Two existing tests change (see Task 2). |
