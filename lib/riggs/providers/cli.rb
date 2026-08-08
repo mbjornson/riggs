@@ -31,7 +31,6 @@ module Riggs
       end
 
       def complete(messages:, system: nil, timeout: 60, tools: nil)
-        ensure_auth!
         prompt = build_prompt(messages: messages, system: system)
         command = options[:command] || default_command
         args = argv_for(prompt)
@@ -69,10 +68,6 @@ module Riggs
         stdout.to_s.strip
       end
 
-      def ensure_auth!
-        # optional override
-      end
-
       def child_env
         {}
       end
@@ -90,13 +85,6 @@ module Riggs
           parts << "#{role.to_s.capitalize}:\n#{content}"
         end
         parts.join("\n\n")
-      end
-
-      def require_env!(*keys)
-        present = keys.find { |k| ENV.fetch(k, nil) && !ENV[k].empty? }
-        return present if present
-
-        raise Error, "#{name} requires one of: #{keys.join(', ')}"
       end
     end
   end

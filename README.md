@@ -104,13 +104,28 @@ HTTP providers (direct API):
 | `openai` | OpenAI-compatible chat | `OPENAI_API_KEY` |
 | `ollama` | Local OpenAI-compatible | optional |
 
-CLI providers (shell out; binaries must be on `PATH`):
+CLI providers (shell out; binaries must be on `PATH`). These run against your
+**subscription** by default — Riggs removes the API-key variables from the
+child process so the CLI uses its own stored login (`codex login`,
+`claude /login`, `cursor-agent login`). Set `auth: api` on the provider to bill
+metered API credits instead.
 
-| Name | Command | Auth |
-|------|---------|------|
-| `cursor` | `agent -p … --output-format text` | `CURSOR_API_KEY` |
-| `claude_cli` | `claude -p … --bare` | `ANTHROPIC_API_KEY` |
-| `codex` | `codex exec …` | `CODEX_API_KEY` or `OPENAI_API_KEY` |
+| Name | Command | `auth: subscription` (default) | `auth: api` |
+|------|---------|-------------------------------|-------------|
+| `cursor` | `agent -p … --output-format text` | `cursor-agent login` | `CURSOR_API_KEY` |
+| `claude_cli` | `claude -p … --bare` | `claude /login`, or `CLAUDE_CODE_OAUTH_TOKEN` | `ANTHROPIC_API_KEY` |
+| `codex` | `codex exec …` | `codex login` | `CODEX_API_KEY` or `OPENAI_API_KEY` |
+
+```yaml
+# .agent_hubrc
+providers:
+  codex:      { type: codex }                  # uses your ChatGPT subscription
+  claude_api: { type: claude_cli, auth: api }  # bills ANTHROPIC_API_KEY
+```
+
+`ANTHROPIC_API_KEY` overrides a Claude Pro/Max subscription when Claude Code
+sees it, so `auth: subscription` unsets it for the child rather than trusting
+it to be absent.
 
 Cursor Cloud Agents (async REST — needs a repo):
 

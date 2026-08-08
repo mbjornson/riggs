@@ -136,7 +136,7 @@ class TestProviders < Minitest::Test
       assert_equal "sk-openai", env["CODEX_API_KEY"]
       Riggs::Providers::CliRunner::Result.new(stdout: "codex says hi", stderr: "", status: FakeStatus.new(true))
     })
-    provider = Riggs::Providers::CodexCli.new(name: "codex", options: { runner: runner })
+    provider = Riggs::Providers::CodexCli.new(name: "codex", options: { runner: runner, auth: "api" })
     result = provider.complete(messages: [{ role: "user", content: "hi" }])
     assert_equal "codex says hi", result[:content]
   ensure
@@ -174,14 +174,128 @@ class TestProviders < Minitest::Test
     assert_match(/api/, err.message)
   end
 
-  def test_cursor_cli_requires_api_key
+  # The regression this phase exists to fix: a CLI that is logged in via its
+  # own subscription must be usable, and Riggs refused to even spawn it.
+  def test_cursor_cli_runs_without_an_api_key
     ENV.delete("CURSOR_API_KEY")
-    provider = Riggs::Providers::CursorCli.new(name: "cursor", options: {
-                                                 runner: FakeRunner.new(->(**_) { raise "should not run" })
-                                               })
-    assert_raises(Riggs::Providers::Error) do
-      provider.complete(messages: [{ role: "user", content: "hi" }])
-    end
+    runner = FakeRunner.new(lambda { |**_|
+      Riggs::Providers::CliRunner::Result.new(stdout: "ok", stderr: "", status: FakeStatus.new(true))
+    })
+    provider = Riggs::Providers::CursorCli.new(name: "cursor", options: { runner: runner })
+
+    result = provider.complete(messages: [{ role: "user", content: "hi" }])
+
+    assert_equal "ok", result[:content]
+  end
+
+  def test_codex_cli_runs_without_an_api_key
+    ENV.delete("CODEX_API_KEY")
+    ENV.delete("OPENAI_API_KEY")
+    runner = FakeRunner.new(lambda { |**_|
+      Riggs::Providers::CliRunner::Result.new(stdout: "ok", stderr: "", status: FakeStatus.new(true))
+    })
+    provider = Riggs::Providers::CodexCli.new(name: "codex", options: { runner: runner })
+
+    assert_equal "ok", provider.complete(messages: [{ role: "user", content: "hi" }])[:content]
+  end
+
+  # Captures the env handed to the runner so the scrub can be asserted without
+  # spawning anything.
+  def env_handed_to_runner(klass, name:, options: {})
+    captured = nil
+    runner = FakeRunner.new(lambda { |env:, **_|
+      captured = env
+      Riggs::Providers::CliRunner::Result.new(stdout: "ok", stderr: "", status: FakeStatus.new(true))
+    })
+    klass.new(name: name, options: options.merge(runner: runner))
+         .complete(messages: [{ role: "user", content: "hi" }])
+    captured
+  end
+
+  # A nil value means "unset this variable in the child" (Process.spawn
+  # contract), which CliRunner's ENV.to_h.merge(env) carries through. This is
+  # what stops an exported ANTHROPIC_API_KEY from overriding a Max
+  # subscription -- documented Claude Code behavior, and the reason relaxing
+  # the pre-flight alone would have been unsafe.
+  def test_claude_cli_scrubs_the_api_key_under_subscription
+    ENV["ANTHROPIC_API_KEY"] = "sk-test"
+    env = env_handed_to_runner(Riggs::Providers::ClaudeCli, name: "claude_cli")
+
+    assert env.key?("ANTHROPIC_API_KEY"), "the key must be present in the hash so it can be unset"
+    assert_nil env["ANTHROPIC_API_KEY"], "and nil so the child does not receive it"
+  ensure
+    ENV.delete("ANTHROPIC_API_KEY")
+  end
+
+  def test_claude_cli_passes_the_api_key_under_api_mode
+    ENV["ANTHROPIC_API_KEY"] = "sk-test"
+    env = env_handed_to_runner(Riggs::Providers::ClaudeCli, name: "claude_cli", options: { auth: "api" })
+
+    assert_equal "sk-test", env["ANTHROPIC_API_KEY"]
+  ensure
+    ENV.delete("ANTHROPIC_API_KEY")
+  end
+
+  # CLAUDE_CODE_OAUTH_TOKEN is itself a subscription credential -- the
+  # documented path for non-interactive use -- so scrubbing it would defeat
+  # the mode that is meant to use it.
+  def test_claude_cli_keeps_the_oauth_token_under_subscription
+    ENV["CLAUDE_CODE_OAUTH_TOKEN"] = "oauth-test"
+    env = env_handed_to_runner(Riggs::Providers::ClaudeCli, name: "claude_cli")
+
+    assert_equal "oauth-test", env["CLAUDE_CODE_OAUTH_TOKEN"]
+  ensure
+    ENV.delete("CLAUDE_CODE_OAUTH_TOKEN")
+  end
+
+  def test_codex_cli_scrubs_both_key_variables_under_subscription
+    ENV["OPENAI_API_KEY"] = "sk-openai"
+    ENV["CODEX_API_KEY"] = "sk-codex"
+    env = env_handed_to_runner(Riggs::Providers::CodexCli, name: "codex")
+
+    assert_nil env["CODEX_API_KEY"]
+    assert_nil env["OPENAI_API_KEY"]
+  ensure
+    ENV.delete("OPENAI_API_KEY")
+    ENV.delete("CODEX_API_KEY")
+  end
+
+  def test_cursor_cli_scrubs_the_api_key_under_subscription
+    ENV["CURSOR_API_KEY"] = "sk-cursor"
+    env = env_handed_to_runner(Riggs::Providers::CursorCli, name: "cursor")
+
+    assert_nil env["CURSOR_API_KEY"]
+  ensure
+    ENV.delete("CURSOR_API_KEY")
+  end
+
+  # Passing the key as an argv flag would hand it to the CLI through a channel
+  # the env scrub cannot reach.
+  def test_cursor_cli_omits_the_api_key_flag_under_subscription
+    captured = nil
+    runner = FakeRunner.new(lambda { |args:, **_|
+      captured = args
+      Riggs::Providers::CliRunner::Result.new(stdout: "ok", stderr: "", status: FakeStatus.new(true))
+    })
+    Riggs::Providers::CursorCli.new(name: "cursor", options: { runner: runner, api_key: "sk-inline" })
+                               .complete(messages: [{ role: "user", content: "hi" }])
+
+    refute_includes captured, "--api-key"
+    refute_includes captured, "sk-inline"
+  end
+
+  def test_cursor_cli_includes_the_api_key_flag_under_api_mode
+    captured = nil
+    runner = FakeRunner.new(lambda { |args:, **_|
+      captured = args
+      Riggs::Providers::CliRunner::Result.new(stdout: "ok", stderr: "", status: FakeStatus.new(true))
+    })
+    Riggs::Providers::CursorCli.new(
+      name: "cursor", options: { runner: runner, api_key: "sk-inline", auth: "api" }
+    ).complete(messages: [{ role: "user", content: "hi" }])
+
+    assert_includes captured, "--api-key"
+    assert_includes captured, "sk-inline"
   end
 
   def test_cli_runner_missing_binary

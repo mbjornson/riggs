@@ -12,15 +12,23 @@ module Riggs
         "claude"
       end
 
-      def ensure_auth!
-        require_env!("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
-      end
-
       def child_env
-        {
-          "ANTHROPIC_API_KEY" => ENV.fetch("ANTHROPIC_API_KEY", nil),
-          "CLAUDE_CODE_OAUTH_TOKEN" => ENV.fetch("CLAUDE_CODE_OAUTH_TOKEN", nil)
-        }.compact
+        env = {}
+        # A subscription credential in its own right -- the documented path for
+        # non-interactive use -- so it survives both modes.
+        token = ENV.fetch("CLAUDE_CODE_OAUTH_TOKEN", nil)
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = token if token && !token.empty?
+
+        if auth_mode == "subscription"
+          # nil unsets it in the child. ANTHROPIC_API_KEY otherwise OVERRIDES a
+          # Pro/Max subscription (code.claude.com/docs/en/env-vars), so an
+          # exported key would silently bill the API account on every step.
+          env["ANTHROPIC_API_KEY"] = nil
+        else
+          key = ENV.fetch("ANTHROPIC_API_KEY", nil)
+          env["ANTHROPIC_API_KEY"] = key if key && !key.empty?
+        end
+        env
       end
 
       def argv_for(prompt)
