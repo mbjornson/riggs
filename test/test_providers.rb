@@ -174,6 +174,61 @@ class TestProviders < Minitest::Test
     assert_match(/api/, err.message)
   end
 
+  # Non-CLI providers have no CLI to defer to, so they are always "api".
+  def test_router_reports_auth_mode_per_configured_provider
+    router = Riggs::Providers::Router.new(
+      hub_providers: {
+        "codex" => { "type" => "codex" },
+        "claude_api" => { "type" => "claude_cli", "auth" => "api" },
+        "openai" => { "type" => "openai" }
+      }
+    )
+
+    assert_equal({ "claude_api" => "api", "codex" => "subscription", "openai" => "api" },
+                 router.auth_modes)
+  end
+
+  def test_router_auth_modes_sees_workflow_level_overrides
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "codex" => { "type" => "codex" } },
+      workflow_providers: { "codex" => { "auth" => "api" } }
+    )
+
+    assert_equal({ "codex" => "api" }, router.auth_modes)
+  end
+
+  # Spec R9.1: `auth:` on a non-CLI provider is ignored, not an error -- there
+  # is no CLI to defer to, so validating the value would reject a harmless
+  # stray key.
+  def test_auth_on_a_non_cli_provider_is_ignored_rather_than_validated
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "openai" => { "type" => "openai", "auth" => "nonsense" } }
+    )
+
+    assert_equal({ "openai" => "api" }, router.auth_modes)
+  end
+
+  # Deliberate deviation from the brief (see task-4-report.md): auth_modes is
+  # an observability field and must not be able to abort a run over a
+  # provider that field never dispatches. A CLI provider that is actually
+  # used still raises from Cli#auth_mode inside child_env -- untouched by
+  # this rescue -- so this gives up nothing on the money-safety axis Task 1
+  # built. The rescue is per provider name, so one bad entry must not blank
+  # out the others -- that's what the "codex" assertion below proves.
+  def test_router_auth_modes_marks_an_invalid_value_without_raising_or_dropping_the_rest
+    router = Riggs::Providers::Router.new(
+      hub_providers: {
+        "codex" => { "type" => "codex", "auth" => "api" },
+        "claude_cli" => { "type" => "claude_cli", "auth" => "subscribe" }
+      }
+    )
+
+    modes = router.auth_modes
+
+    assert_equal "api", modes["codex"], "a good entry must resolve normally, not be swallowed by a sibling's rescue"
+    assert_equal "invalid", modes["claude_cli"]
+  end
+
   # The regression this phase exists to fix: a CLI that is logged in via its
   # own subscription must be usable, and Riggs refused to even spawn it.
   def test_cursor_cli_runs_without_an_api_key

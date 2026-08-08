@@ -72,7 +72,8 @@ module Riggs
             timeout_seconds: @workflow[:timeout_seconds]
           }
         )
-        log_event("workflow_start", { workflow: @workflow[:name], user: @user_identity[:id] })
+        log_event("workflow_start", { workflow: @workflow[:name], user: @user_identity[:id],
+                                      provider_auth_modes: @router.auth_modes })
         io.puts "▶ Session #{@session_id}"
 
         run_steps(@workflow[:steps].first, io)
