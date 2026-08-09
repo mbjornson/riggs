@@ -150,9 +150,25 @@ Per-provider declarations:
 | `CursorCloud` | `api` | `api` | Requires `CURSOR_API_KEY` |
 | `Mock` | `none` | `none` | Bills nobody |
 
-`Cli::AUTH_MODES` and `Cli::DEFAULT_AUTH_MODE` keep their names and values, so
-Phase 9's `Cli.resolve_auth_mode(value, provider:)` call signature and error
-text for an unrecognized value are preserved. The method body moves to `Base`.
+`Cli::AUTH_MODES` and `Cli::DEFAULT_AUTH_MODE` keep their names and their
+location on `Cli`, and `Cli.resolve_auth_mode(value, provider:)` keeps its call
+signature, so every Phase 9 call site compiles unchanged. Two things do change,
+and both are intended:
+
+- `Cli::AUTH_MODES` gains `none`, per the table above. Phase 9's value was
+  `%w[subscription api]`.
+- The error text for an unrecognized value changes. Phase 9 raised
+  `"provider 'x': unknown auth mode "y" (expected one of: subscription, api)"`.
+  The `Base` implementation raises `"provider 'x': auth mode "y" is not
+  supported by Riggs::Providers::Anthropic (expected one of: api)"` — it has to
+  name the class, because the whole point is that the supported set now differs
+  per provider and "expected one of" alone no longer tells the operator which
+  provider's rules they hit.
+
+Phase 9's `test_an_unknown_auth_mode_raises_naming_the_provider_and_the_valid_values`
+asserts on the provider name and the valid values, not the exact sentence, so it
+survives. Confirmed by running its three `assert_match` patterns (`/codex/`,
+`/subscription/`, `/api/`) against the new message: all three still match.
 
 ## R10.2 Validation covers every dispatched provider
 
@@ -226,11 +242,19 @@ to the follow-on phase.
 
 - `test_auth_on_a_non_cli_provider_is_ignored_rather_than_validated` is replaced
   by its inverse.
-- Tests asserting `mock` reports `"api"` change to `"none"`. Known today:
-  `test_auth_modes_excludes_the_default_routing_alias_but_keeps_real_providers`
-  in `test/test_providers.rb` and the `workflow_start` attribution test in
-  `test/test_graph_engine.rb`. The implementer must re-check for others rather
-  than trusting this list.
+- Five existing tests change. This list was verified against the test files
+  during planning, not assembled from memory:
+  - `test_auth_modes_excludes_the_default_routing_alias_but_keeps_real_providers`
+    (`test/test_providers.rb`) — expects `mock => "none"` rather than `"api"`.
+  - `test_workflow_start_records_the_auth_mode_of_every_provider`
+    (`test/test_graph_engine.rb:89`) — same change.
+  - `test_auth_on_a_non_cli_provider_is_ignored_rather_than_validated` —
+    replaced by its inverse.
+  - `test_a_valid_chain_still_dispatches_with_the_auth_guard_in_place` — its
+    fixture declares a stray `auth:` on `mock`, which now raises.
+  - `test_router_auth_modes_marks_an_invalid_value_without_raising_or_dropping_the_rest`
+    — must stop asserting the `"invalid"` label for a provider whose mode is
+    now rejected outright.
 - An `.agent_hubrc` carrying any `auth:` on `anthropic` or `cursor_cloud` now
   raises when that provider is dispatched. Previously ignored. The failure is
   loud, happens before dispatch, and names both the provider and its supported
