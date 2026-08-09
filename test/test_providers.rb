@@ -226,13 +226,79 @@ class TestProviders < Minitest::Test
     assert_equal({ "openai" => "api" }, router.auth_modes)
   end
 
+  # A provider that is only ever named inside a relay_chain still gets
+  # dispatched -- #build resolves it from BUILTINS with no config entry of its
+  # own -- and riggs_provider_calls records it by name. Leaving it out of the
+  # map made the map EMPTY for the commonest workflow shape there is: a
+  # providers: block holding nothing but default.relay_chain. That is exactly
+  # when the join the map exists for is needed.
+  def test_auth_modes_covers_a_provider_named_only_in_a_relay_chain
+    router = Riggs::Providers::Router.new(
+      workflow_providers: { "default" => { "relay_chain" => ["codex"] } }
+    )
+
+    modes = router.auth_modes
+
+    assert_equal "subscription", modes["codex"], "a chain member with no config entry of its own still bills someone"
+    refute_includes modes.keys, "default", "the routing directive itself is still not a provider"
+  end
+
+  # The chain member and the configured entry are two different sources of
+  # names; a fix that reported chain members must not lose the explicit entry's
+  # own auth mode, so both halves are asserted here.
+  def test_auth_modes_keeps_explicit_entries_while_adding_chain_members
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "claude_api" => { "type" => "claude_cli", "auth" => "api" } },
+      workflow_providers: { "default" => { "relay_chain" => %w[codex claude_api] } }
+    )
+
+    modes = router.auth_modes
+
+    assert_equal "subscription", modes["codex"]
+    assert_equal "api", modes["claude_api"], "an explicit entry's declared mode must survive being named in a chain"
+  end
+
+  # Spec Decision 2: a typo like `auth: subscrption` must not silently fall
+  # back to something that spends money. It did. Cli#auth_mode raises
+  # Providers::Error from inside child_env, but #call's dispatch loop rescues
+  # Error and RELAYS -- so [claude_cli(typo), anthropic] answered on anthropic
+  # and billed ANTHROPIC_API_KEY. Validation has to happen outside that rescue.
+  def test_an_invalid_auth_mode_fails_the_run_instead_of_relaying_to_a_billed_provider
+    router = Riggs::Providers::Router.new(
+      hub_providers: {
+        "claude_cli" => { "type" => "claude_cli", "auth" => "subscrption" },
+        "mock" => { "type" => "mock" }
+      }
+    )
+
+    err = assert_raises(Riggs::Providers::Error) do
+      router.call(messages: [{ role: "user", content: "hi" }], chain: %w[claude_cli mock])
+    end
+
+    assert_match(/claude_cli/, err.message)
+    refute_match(/All providers in relay_chain failed/, err.message,
+                 "the run must fail on the bad config, not after burning the whole chain")
+  end
+
+  # The guard must not fire on a chain it has no business rejecting: a valid
+  # mode, and a non-CLI provider carrying a stray auth: (R9.1 says ignore it).
+  def test_a_valid_chain_still_dispatches_with_the_auth_guard_in_place
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "mock" => { "type" => "mock", "auth" => "nonsense" } }
+    )
+
+    result = router.call(messages: [{ role: "user", content: "hi" }], chain: ["mock"])
+
+    assert_equal "mock", result[:provider]
+  end
+
   # Deliberate deviation from the brief (see task-4-report.md): auth_modes is
   # an observability field and must not be able to abort a run over a
-  # provider that field never dispatches. A CLI provider that is actually
-  # used still raises from Cli#auth_mode inside child_env -- untouched by
-  # this rescue -- so this gives up nothing on the money-safety axis Task 1
-  # built. The rescue is per provider name, so one bad entry must not blank
-  # out the others -- that's what the "codex" assertion below proves.
+  # provider that field never dispatches. The money-safety guard is
+  # Router#call's pre-dispatch validation, which is outside the relay rescue;
+  # this rescue only keeps a never-dispatched typo from blanking the map. The
+  # rescue is per provider name, so one bad entry must not blank out the
+  # others -- that's what the "codex" assertion below proves.
   def test_router_auth_modes_marks_an_invalid_value_without_raising_or_dropping_the_rest
     router = Riggs::Providers::Router.new(
       hub_providers: {
