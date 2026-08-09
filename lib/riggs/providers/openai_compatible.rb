@@ -10,6 +10,8 @@ module Riggs
     # OpenAI-compatible chat completions (OpenAI, Ollama, LM Studio, etc.)
     class OpenAICompatible < Base
       DEFAULT_MODEL = "gpt-4o-mini"
+      AUTH_MODES = %w[api none].freeze
+      DEFAULT_AUTH_MODE = "api"
 
       def complete(messages:, system: nil, timeout: 60, tools: nil)
         api_key = options[:api_key] || ENV["OPENAI_API_KEY"] || ENV.fetch("OLLAMA_API_KEY", nil)

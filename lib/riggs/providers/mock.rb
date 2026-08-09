@@ -5,6 +5,9 @@ require_relative "base"
 module Riggs
   module Providers
     class Mock < Base
+      AUTH_MODES = %w[none].freeze
+      DEFAULT_AUTH_MODE = "none"
+
       def complete(messages:, system: nil, timeout: 60, tools: nil)
         user_text = messages.rfind { |m| m[:role].to_s == "user" }&.dig(:content).to_s
         # After tool results, prefer last user/tool message content

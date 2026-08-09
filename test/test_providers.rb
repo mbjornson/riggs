@@ -174,6 +174,50 @@ class TestProviders < Minitest::Test
     assert_match(/api/, err.message)
   end
 
+  def test_provider_classes_declare_their_own_auth_vocabularies_and_defaults
+    expectations = {
+      Riggs::Providers::Cli => [%w[subscription api none], "subscription"],
+      Riggs::Providers::OpenAICompatible => [%w[api none], "api"],
+      Riggs::Providers::Anthropic => [%w[api], "api"],
+      Riggs::Providers::CursorCloud => [%w[api], "api"],
+      Riggs::Providers::Mock => [%w[none], "none"]
+    }
+
+    expectations.each do |klass, (modes, default)|
+      assert_equal modes, klass.auth_modes, "#{klass} must publish only modes it can honor"
+      assert_equal default, klass.default_auth_mode
+    end
+  end
+
+  # const_set, NOT `AUTH_MODES = ...` inside the block. A constant assigned in
+  # a Class.new block binds to the block's LEXICAL scope -- Object -- not to the
+  # anonymous class. Verified: the anonymous class does not own the constant,
+  # `self::AUTH_MODES` then finds Base's copy, and this test fails with
+  # ["api"] against a CORRECT implementation while also leaking AUTH_MODES onto
+  # Object. const_set assigns on the receiver, so the subclass owns it and the
+  # bare-constant bug this test exists to catch still returns ["api"].
+  def test_base_reads_subclass_auth_constants_not_its_lexical_constants
+    local_only = Class.new(Riggs::Providers::Base) do
+      const_set(:AUTH_MODES, %w[none].freeze)
+      const_set(:DEFAULT_AUTH_MODE, "none")
+    end
+
+    assert_equal %w[none], local_only.auth_modes
+    assert_equal "none", local_only.default_auth_mode
+    assert_equal "none", local_only.resolve_auth_mode(nil, provider: "local")
+    assert_equal "none", local_only.resolve_auth_mode(" NONE ", provider: "local")
+    err = assert_raises(Riggs::Providers::Error) { local_only.resolve_auth_mode("api", provider: "local") }
+    assert_match(/local/, err.message)
+    assert_match(/none/, err.message)
+  end
+
+  def test_non_cli_instances_resolve_their_own_defaults
+    assert_equal "api", Riggs::Providers::OpenAICompatible.new(name: "openai", options: {}).auth_mode
+    assert_equal "api", Riggs::Providers::Anthropic.new(name: "anthropic", options: {}).auth_mode
+    assert_equal "api", Riggs::Providers::CursorCloud.new(name: "cursor_cloud", options: {}).auth_mode
+    assert_equal "none", Riggs::Providers::Mock.new(name: "mock", options: {}).auth_mode
+  end
+
   # Non-CLI providers have no CLI to defer to, so they are always "api".
   def test_router_reports_auth_mode_per_configured_provider
     router = Riggs::Providers::Router.new(
