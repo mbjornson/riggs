@@ -14,6 +14,8 @@ module Riggs
       # 2026-06-15, at which point every un-overridden call started failing.
       DEFAULT_MODEL = "claude-sonnet-5"
       API_URL = "https://api.anthropic.com/v1/messages"
+      AUTH_MODES = %w[api].freeze
+      DEFAULT_AUTH_MODE = "api"
 
       def complete(messages:, system: nil, timeout: 60, tools: nil)
         api_key = options[:api_key] || ENV.fetch("ANTHROPIC_API_KEY", nil)

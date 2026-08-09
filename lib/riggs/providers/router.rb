@@ -199,9 +199,10 @@ module Riggs
         names.each do |name|
           opts = provider_config(name)
           klass = provider_class_for(name, opts)
-          next unless klass && klass <= Cli
+          next unless klass
+          next unless klass.respond_to?(:resolve_auth_mode)
 
-          Cli.resolve_auth_mode(opts[:auth], provider: name)
+          klass.resolve_auth_mode(opts[:auth], provider: name)
         end
       end
 
@@ -253,9 +254,10 @@ module Riggs
         return nil if opts[:relay_chain]
 
         klass = provider_class_for(name, opts)
-        return "api" unless klass && klass <= Cli
+        return nil unless klass
+        return nil unless klass.respond_to?(:resolve_auth_mode)
 
-        Cli.resolve_auth_mode(opts[:auth], provider: name)
+        klass.resolve_auth_mode(opts[:auth], provider: name)
       rescue Error
         "invalid"
       end

@@ -12,6 +12,8 @@ module Riggs
       DEFAULT_BASE = "https://api.cursor.com"
       TERMINAL = %w[FINISHED ERROR CANCELLED EXPIRED].freeze
       SUCCESS = "FINISHED"
+      AUTH_MODES = %w[api].freeze
+      DEFAULT_AUTH_MODE = "api"
 
       def complete(messages:, system: nil, timeout: 60, tools: nil)
         api_key = options[:api_key] || ENV.fetch("CURSOR_API_KEY", nil)

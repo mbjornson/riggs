@@ -15,12 +15,37 @@ module Riggs
     class AuthError < Error; end
 
     class Base
+      AUTH_MODES = %w[api].freeze
+      DEFAULT_AUTH_MODE = "api"
+
+      def self.auth_modes = self::AUTH_MODES
+      def self.default_auth_mode = self::DEFAULT_AUTH_MODE
+
+      def self.resolved_default_auth_mode
+        default = default_auth_mode
+        return default if auth_modes.include?(default)
+
+        raise Error, "#{name} declares DEFAULT_AUTH_MODE #{default.inspect} " \
+                     "outside AUTH_MODES #{auth_modes.inspect}"
+      end
+
+      def self.resolve_auth_mode(value, provider:)
+        mode = value.to_s.strip.downcase
+        return resolved_default_auth_mode if mode.empty?
+        return mode if auth_modes.include?(mode)
+
+        raise Error, "provider '#{provider}': auth mode #{value.inspect} is not " \
+                     "supported by #{name} (expected one of: #{auth_modes.join(', ')})"
+      end
+
       attr_reader :name, :options
 
       def initialize(name:, options: {})
         @name = name.to_s
         @options = options || {}
       end
+
+      def auth_mode = self.class.resolve_auth_mode(options[:auth], provider: name)
 
       # Returns { provider:, model:, content:, tool_calls: [], usage:, raw: }
       def complete(messages:, system: nil, timeout: 60, tools: nil)

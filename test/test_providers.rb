@@ -2,6 +2,7 @@
 
 require "test_helper"
 require "rbconfig"
+require "socket"
 
 class TestProviders < Minitest::Test
   FakeRunner = Struct.new(:handler) do
@@ -174,6 +175,81 @@ class TestProviders < Minitest::Test
     assert_match(/api/, err.message)
   end
 
+  def test_provider_classes_declare_their_own_auth_vocabularies_and_defaults
+    expectations = {
+      Riggs::Providers::Cli => [%w[subscription api], "subscription"],
+      Riggs::Providers::OpenAICompatible => [%w[api none], "api"],
+      Riggs::Providers::Anthropic => [%w[api], "api"],
+      Riggs::Providers::CursorCloud => [%w[api], "api"],
+      Riggs::Providers::Mock => [%w[none], "none"]
+    }
+
+    expectations.each do |klass, (modes, default)|
+      assert_equal modes, klass.auth_modes, "#{klass} must publish only modes it can honor"
+      assert_equal default, klass.default_auth_mode
+    end
+  end
+
+  # const_set, NOT `AUTH_MODES = ...` inside the block. A constant assigned in
+  # a Class.new block binds to the block's LEXICAL scope -- Object -- not to the
+  # anonymous class. Verified: the anonymous class does not own the constant,
+  # `self::AUTH_MODES` then finds Base's copy, and this test fails with
+  # ["api"] against a CORRECT implementation while also leaking AUTH_MODES onto
+  # Object. const_set assigns on the receiver, so the subclass owns it and the
+  # bare-constant bug this test exists to catch still returns ["api"].
+  def test_base_reads_subclass_auth_constants_not_its_lexical_constants
+    local_only = Class.new(Riggs::Providers::Base) do
+      const_set(:AUTH_MODES, %w[none].freeze)
+      const_set(:DEFAULT_AUTH_MODE, "none")
+    end
+
+    assert_equal %w[none], local_only.auth_modes
+    assert_equal "none", local_only.default_auth_mode
+    assert_equal "none", local_only.resolve_auth_mode(nil, provider: "local")
+    assert_equal "none", local_only.resolve_auth_mode(" NONE ", provider: "local")
+    err = assert_raises(Riggs::Providers::Error) { local_only.resolve_auth_mode("api", provider: "local") }
+    assert_match(/local/, err.message)
+    assert_match(/none/, err.message)
+  end
+
+  def test_subclass_without_default_auth_mode_raises_on_omitted_auth
+    klass = Class.new(Riggs::Providers::Base) do
+      const_set(:AUTH_MODES, %w[none].freeze)
+    end
+
+    err = assert_raises(Riggs::Providers::Error) { klass.resolve_auth_mode(nil, provider: "local") }
+    assert_match(/DEFAULT_AUTH_MODE/, err.message)
+    assert_match(/AUTH_MODES/, err.message)
+    refute_match(/provider 'local'/, err.message,
+                 "a bad default is a class bug, not an operator typo")
+  end
+
+  def test_every_real_provider_resolves_its_default_auth_mode
+    classes = [
+      Riggs::Providers::Cli,
+      Riggs::Providers::OpenAICompatible,
+      Riggs::Providers::Anthropic,
+      Riggs::Providers::CursorCloud,
+      Riggs::Providers::Mock,
+      Riggs::Providers::ClaudeCli,
+      Riggs::Providers::CodexCli,
+      Riggs::Providers::CursorCli
+    ]
+
+    classes.each do |klass|
+      assert klass.auth_modes.include?(klass.default_auth_mode),
+             "#{klass} default must be in its AUTH_MODES"
+      assert_equal klass.default_auth_mode, klass.resolve_auth_mode(nil, provider: "test")
+    end
+  end
+
+  def test_non_cli_instances_resolve_their_own_defaults
+    assert_equal "api", Riggs::Providers::OpenAICompatible.new(name: "openai", options: {}).auth_mode
+    assert_equal "api", Riggs::Providers::Anthropic.new(name: "anthropic", options: {}).auth_mode
+    assert_equal "api", Riggs::Providers::CursorCloud.new(name: "cursor_cloud", options: {}).auth_mode
+    assert_equal "none", Riggs::Providers::Mock.new(name: "mock", options: {}).auth_mode
+  end
+
   # Non-CLI providers have no CLI to defer to, so they are always "api".
   def test_router_reports_auth_mode_per_configured_provider
     router = Riggs::Providers::Router.new(
@@ -212,18 +288,58 @@ class TestProviders < Minitest::Test
     modes = router.auth_modes
 
     refute_includes modes.keys, "default", "providers.default is a routing directive, not a provider"
-    assert_equal "api", modes["mock"], "a real provider in the same providers: block must still be reported"
+    assert_equal "none", modes["mock"], "a real provider in the same providers: block must still be reported"
   end
 
-  # Spec R9.1: `auth:` on a non-CLI provider is ignored, not an error -- there
-  # is no CLI to defer to, so validating the value would reject a harmless
-  # stray key.
-  def test_auth_on_a_non_cli_provider_is_ignored_rather_than_validated
+  def test_registry_entry_without_resolve_auth_mode_is_skipped_by_auth_modes_and_dispatches
+    custom = Class.new do
+      define_method(:initialize) do |name:, options: {}|
+        @name = name.to_s
+        @options = options || {}
+      end
+      attr_reader :name, :options
+
+      define_method(:complete) do |**_|
+        { provider: name, content: "custom-ok", usage: {} }
+      end
+    end
+
     router = Riggs::Providers::Router.new(
-      hub_providers: { "openai" => { "type" => "openai", "auth" => "nonsense" } }
+      hub_providers: { "custom" => { "type" => "custom" } },
+      registry: { "custom" => custom }
     )
 
-    assert_equal({ "openai" => "api" }, router.auth_modes)
+    modes = router.auth_modes
+    refute_includes modes.keys, "custom", "custom providers have no auth vocabulary to report"
+
+    result = router.call(chain: ["custom"], messages: [{ role: "user", content: "hi" }])
+    assert_equal "custom", result[:provider]
+    assert_equal "custom-ok", result[:content]
+  end
+
+  def test_an_unsupported_auth_mode_on_openai_compatible_fails_before_relaying
+    fallback_called = false
+    fallback = Class.new(Riggs::Providers::Base) do
+      define_method(:complete) do |**_|
+        fallback_called = true
+        { provider: name, content: "unexpected", usage: {} }
+      end
+    end
+    router = Riggs::Providers::Router.new(
+      hub_providers: {
+        "local" => { "type" => "openai", "auth" => "subscription" },
+        "fallback" => { "type" => "fallback" }
+      },
+      registry: { "openai" => Riggs::Providers::OpenAICompatible, "fallback" => fallback }
+    )
+
+    err = assert_raises(Riggs::Providers::Error) do
+      router.call(messages: [{ role: "user", content: "hi" }], chain: %w[local fallback])
+    end
+
+    assert_match(/local/, err.message)
+    assert_match(/api, none/, err.message)
+    refute fallback_called, "bad auth must fail before any relay provider dispatches"
   end
 
   # A provider that is only ever named inside a relay_chain still gets
@@ -303,11 +419,9 @@ class TestProviders < Minitest::Test
     assert_match(/weird/, err.message)
   end
 
-  # The guard must not fire on a chain it has no business rejecting: a valid
-  # mode, and a non-CLI provider carrying a stray auth: (R9.1 says ignore it).
-  def test_a_valid_chain_still_dispatches_with_the_auth_guard_in_place
+  def test_a_valid_none_mode_still_dispatches_with_the_auth_guard_in_place
     router = Riggs::Providers::Router.new(
-      hub_providers: { "mock" => { "type" => "mock", "auth" => "nonsense" } }
+      hub_providers: { "mock" => { "type" => "mock", "auth" => "none" } }
     )
 
     result = router.call(messages: [{ role: "user", content: "hi" }], chain: ["mock"])
@@ -315,14 +429,7 @@ class TestProviders < Minitest::Test
     assert_equal "mock", result[:provider]
   end
 
-  # Deliberate deviation from the brief (see task-4-report.md): auth_modes is
-  # an observability field and must not be able to abort a run over a
-  # provider that field never dispatches. The money-safety guard is
-  # Router#call's pre-dispatch validation, which is outside the relay rescue;
-  # this rescue only keeps a never-dispatched typo from blanking the map. The
-  # rescue is per provider name, so one bad entry must not blank out the
-  # others -- that's what the "codex" assertion below proves.
-  def test_router_auth_modes_marks_an_invalid_value_without_raising_or_dropping_the_rest
+  def test_router_auth_modes_rejects_a_configured_invalid_value
     router = Riggs::Providers::Router.new(
       hub_providers: {
         "codex" => { "type" => "codex", "auth" => "api" },
@@ -332,8 +439,44 @@ class TestProviders < Minitest::Test
 
     modes = router.auth_modes
 
-    assert_equal "api", modes["codex"], "a good entry must resolve normally, not be swallowed by a sibling's rescue"
+    assert_equal "api", modes["codex"]
     assert_equal "invalid", modes["claude_cli"]
+  end
+
+  def test_a_dormant_misconfigured_provider_does_not_abort_dispatch_on_an_unrelated_chain
+    router = Riggs::Providers::Router.new(
+      hub_providers: {
+        "mock" => { "type" => "mock", "auth" => "none" },
+        "anthropic" => { "type" => "anthropic", "auth" => "none" }
+      }
+    )
+
+    result = router.call(messages: [{ role: "user", content: "hi" }], chain: ["mock"])
+
+    assert_equal "mock", result[:provider]
+  end
+
+  def test_anthropic_and_cursor_cloud_reject_none_with_their_own_supported_modes
+    { "anthropic" => "anthropic", "cursor_cloud" => "cursor_cloud" }.each do |name, type|
+      router = Riggs::Providers::Router.new(
+        hub_providers: { name => { "type" => type, "auth" => "none" } }
+      )
+
+      err = assert_raises(Riggs::Providers::Error) do
+        router.call(messages: [{ role: "user", content: "hi" }], chain: [name])
+      end
+
+      assert_match(/#{name}/, err.message)
+      assert_match(/api/, err.message)
+    end
+  end
+
+  def test_provider_auth_modes_omits_a_name_that_resolves_to_no_class
+    router = Riggs::Providers::Router.new(
+      workflow_providers: { "default" => { "relay_chain" => ["does_not_exist"] } }
+    )
+
+    assert_equal({}, router.auth_modes)
   end
 
   # The regression this phase exists to fix: a CLI that is logged in via its
@@ -390,6 +533,91 @@ class TestProviders < Minitest::Test
     stdout.each_line.to_h do |line|
       key, status = line.strip.split("=", 2)
       [key, status]
+    end
+  end
+
+  def with_capturing_openai_server
+    server = TCPServer.new("127.0.0.1", 0)
+    headers_seen = Queue.new
+    thread = Thread.new do
+      client = server.accept
+      request = +""
+      request << client.readpartial(1024) until request.include?("\r\n\r\n")
+      headers, body = request.split("\r\n\r\n", 2)
+      content_length = headers[/^Content-Length:\s*(\d+)/i, 1].to_i
+      body ||= ""
+      body << client.readpartial(1024) while body.bytesize < content_length
+
+      response_body = JSON.generate(
+        "model" => "local-test",
+        "choices" => [{ "message" => { "content" => "ok" } }],
+        "usage" => {}
+      )
+      client.write(
+        "HTTP/1.1 200 OK\r\n" \
+        "Content-Type: application/json\r\n" \
+        "Content-Length: #{response_body.bytesize}\r\n" \
+        "Connection: close\r\n\r\n" \
+        + response_body
+      )
+      headers_seen << headers
+    ensure
+      client&.close
+    end
+
+    yield "http://127.0.0.1:#{server.addr[1]}/v1", headers_seen
+  ensure
+    server&.close
+    thread&.join
+  end
+
+  def test_openai_compatible_none_sends_no_authorization_header_to_a_real_local_server
+    with_saved_env("OPENAI_API_KEY" => "sk-parent-key", "OLLAMA_API_KEY" => "sk-ollama-key") do
+      with_capturing_openai_server do |base_url, headers_seen|
+        provider = Riggs::Providers::OpenAICompatible.new(
+          name: "local",
+          options: {
+            base_url: base_url,
+            model: "local-test",
+            auth: "none",
+            api_key: "sk-inline-key"
+          }
+        )
+
+        assert_equal "ok", provider.complete(messages: [{ role: "user", content: "hi" }])[:content]
+        refute_match(/^Authorization:/i, headers_seen.pop,
+                     "auth: none must keep every credential source off the wire")
+      end
+    end
+  end
+
+  def test_openai_compatible_api_still_sends_the_parent_key_to_a_real_local_server
+    with_saved_env("OPENAI_API_KEY" => "sk-parent-key") do
+      with_capturing_openai_server do |base_url, headers_seen|
+        provider = Riggs::Providers::OpenAICompatible.new(
+          name: "local", options: { base_url: base_url, model: "local-test", auth: "api" }
+        )
+        provider.complete(messages: [{ role: "user", content: "hi" }])
+
+        assert_includes headers_seen.pop.lines.map(&:strip), "Authorization: Bearer sk-parent-key"
+      end
+    end
+  end
+
+  def test_auth_none_on_cli_adapters_raises_naming_the_provider_and_supported_modes
+    cases = [
+      [Riggs::Providers::ClaudeCli, "claude_cli"],
+      [Riggs::Providers::CodexCli, "codex"],
+      [Riggs::Providers::CursorCli, "cursor"]
+    ]
+
+    cases.each do |klass, name|
+      err = assert_raises(Riggs::Providers::Error) do
+        klass.new(name: name, options: { auth: "none" }).auth_mode
+      end
+      assert_match(/#{name}/, err.message, "the error must name which provider is misconfigured")
+      assert_match(/subscription/, err.message, "and list the values that would have worked")
+      assert_match(/api/, err.message)
     end
   end
 

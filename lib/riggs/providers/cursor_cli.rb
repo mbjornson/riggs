@@ -13,7 +13,7 @@ module Riggs
       end
 
       def child_env
-        return { "CURSOR_API_KEY" => nil } if auth_mode == "subscription"
+        return { "CURSOR_API_KEY" => nil } if auth_mode != "api"
 
         key = ENV.fetch("CURSOR_API_KEY", nil)
         key.nil? || key.empty? ? {} : { "CURSOR_API_KEY" => key }
@@ -24,7 +24,7 @@ module Riggs
         model = options[:model]
         args += ["--model", model.to_s] if model && !model.to_s.empty?
         # An argv flag would route the key past the env scrub entirely.
-        return args if auth_mode == "subscription"
+        return args if auth_mode != "api"
 
         api_key = options[:api_key]
         args = ["--api-key", api_key.to_s] + args if api_key && !api_key.to_s.empty?
