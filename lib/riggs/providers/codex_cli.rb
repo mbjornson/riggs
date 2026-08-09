@@ -12,14 +12,15 @@ module Riggs
         "codex"
       end
 
-      def ensure_auth!
-        require_env!("CODEX_API_KEY", "OPENAI_API_KEY")
-      end
-
       def child_env
+        # Codex prefers its stored ChatGPT auth over an env key today, so this
+        # is belt-and-braces -- but a precedence rule inside someone else's CLI
+        # is not something Riggs should depend on staying put.
+        return { "CODEX_API_KEY" => nil, "OPENAI_API_KEY" => nil } if auth_mode == "subscription"
+
         key = ENV.fetch("CODEX_API_KEY", nil)
         key = ENV.fetch("OPENAI_API_KEY", nil) if key.nil? || key.empty?
-        { "CODEX_API_KEY" => key }.compact
+        key.nil? || key.empty? ? {} : { "CODEX_API_KEY" => key }
       end
 
       def argv_for(prompt)

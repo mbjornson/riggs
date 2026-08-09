@@ -10,6 +10,8 @@ module Riggs
 
       Result = Struct.new(:stdout, :stderr, :status, keyword_init: true)
 
+      AUTH_FAILURE = /not logged in|unauthorized|401|authentication|please (run )?login|no credentials/i
+
       def run(command:, args: [], env: {}, timeout: 60, stdin_data: nil)
         raise Error, "CLI command is blank" if command.nil? || command.to_s.strip.empty?
 
@@ -77,6 +79,8 @@ module Riggs
         if combined.match?(/rate.?limit|429|too many requests/i)
           raise RateLimitError, "CLI rate limited: #{argv.first}: #{result.stderr[0, 200]}"
         end
+
+        raise AuthError, "CLI not authenticated: #{argv.first}: #{result.stderr[0, 200]}" if combined.match?(AUTH_FAILURE)
 
         code = result.status&.exitstatus || "unknown"
         raise Error, "CLI failed (exit #{code}): #{argv.join(' ')}\n#{result.stderr[0, 400]}"

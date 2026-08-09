@@ -136,21 +136,463 @@ class TestProviders < Minitest::Test
       assert_equal "sk-openai", env["CODEX_API_KEY"]
       Riggs::Providers::CliRunner::Result.new(stdout: "codex says hi", stderr: "", status: FakeStatus.new(true))
     })
-    provider = Riggs::Providers::CodexCli.new(name: "codex", options: { runner: runner })
+    provider = Riggs::Providers::CodexCli.new(name: "codex", options: { runner: runner, auth: "api" })
     result = provider.complete(messages: [{ role: "user", content: "hi" }])
     assert_equal "codex says hi", result[:content]
   ensure
     ENV.delete("OPENAI_API_KEY")
   end
 
-  def test_cursor_cli_requires_api_key
-    ENV.delete("CURSOR_API_KEY")
-    provider = Riggs::Providers::CursorCli.new(name: "cursor", options: {
-                                                 runner: FakeRunner.new(->(**_) { raise "should not run" })
-                                               })
-    assert_raises(Riggs::Providers::Error) do
-      provider.complete(messages: [{ role: "user", content: "hi" }])
+  # auth_mode decides whether Riggs scrubs API keys before handing control to
+  # the CLI. An unrecognized value must not fall back to a default, because
+  # both defaults spend money -- one from the wrong account.
+  def auth_provider(value)
+    Riggs::Providers::CodexCli.new(name: "codex", options: { auth: value })
+  end
+
+  def test_auth_mode_defaults_to_subscription
+    assert_equal "subscription", Riggs::Providers::CodexCli.new(name: "codex", options: {}).auth_mode
+    assert_equal "subscription", auth_provider(nil).auth_mode
+    assert_equal "subscription", auth_provider("").auth_mode
+    assert_equal "subscription", auth_provider("   ").auth_mode
+  end
+
+  def test_auth_mode_accepts_api
+    assert_equal "api", auth_provider("api").auth_mode
+  end
+
+  def test_auth_mode_is_case_insensitive_and_trims
+    assert_equal "api", auth_provider("  API  ").auth_mode
+    assert_equal "subscription", auth_provider("Subscription").auth_mode
+  end
+
+  def test_an_unknown_auth_mode_raises_naming_the_provider_and_the_valid_values
+    err = assert_raises(Riggs::Providers::Error) { auth_provider("subscribe").auth_mode }
+
+    assert_match(/codex/, err.message, "the error must name which provider is misconfigured")
+    assert_match(/subscription/, err.message, "and list the values that would have worked")
+    assert_match(/api/, err.message)
+  end
+
+  # Non-CLI providers have no CLI to defer to, so they are always "api".
+  def test_router_reports_auth_mode_per_configured_provider
+    router = Riggs::Providers::Router.new(
+      hub_providers: {
+        "codex" => { "type" => "codex" },
+        "claude_api" => { "type" => "claude_cli", "auth" => "api" },
+        "openai" => { "type" => "openai" }
+      }
+    )
+
+    assert_equal({ "claude_api" => "api", "codex" => "subscription", "openai" => "api" },
+                 router.auth_modes)
+  end
+
+  def test_router_auth_modes_sees_workflow_level_overrides
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "codex" => { "type" => "codex" } },
+      workflow_providers: { "codex" => { "auth" => "api" } }
+    )
+
+    assert_equal({ "codex" => "api" }, router.auth_modes)
+  end
+
+  # R9.5 fix (see task-4-report.md): providers.default is the documented way
+  # to declare a workflow's relay chain, not a provider -- #chain_for never
+  # dispatches it, only unpacks its relay_chain into other providers' names,
+  # so it never appears in riggs_provider_calls.provider and does not belong
+  # in this map. Both halves matter: absence alone would pass if the filter
+  # were too aggressive and dropped real entries along with the routing key.
+  def test_auth_modes_excludes_the_default_routing_alias_but_keeps_real_providers
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "mock" => { "type" => "mock" } },
+      workflow_providers: { "default" => { "relay_chain" => ["mock"] } }
+    )
+
+    modes = router.auth_modes
+
+    refute_includes modes.keys, "default", "providers.default is a routing directive, not a provider"
+    assert_equal "api", modes["mock"], "a real provider in the same providers: block must still be reported"
+  end
+
+  # Spec R9.1: `auth:` on a non-CLI provider is ignored, not an error -- there
+  # is no CLI to defer to, so validating the value would reject a harmless
+  # stray key.
+  def test_auth_on_a_non_cli_provider_is_ignored_rather_than_validated
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "openai" => { "type" => "openai", "auth" => "nonsense" } }
+    )
+
+    assert_equal({ "openai" => "api" }, router.auth_modes)
+  end
+
+  # A provider that is only ever named inside a relay_chain still gets
+  # dispatched -- #build resolves it from BUILTINS with no config entry of its
+  # own -- and riggs_provider_calls records it by name. Leaving it out of the
+  # map made the map EMPTY for the commonest workflow shape there is: a
+  # providers: block holding nothing but default.relay_chain. That is exactly
+  # when the join the map exists for is needed.
+  def test_auth_modes_covers_a_provider_named_only_in_a_relay_chain
+    router = Riggs::Providers::Router.new(
+      workflow_providers: { "default" => { "relay_chain" => ["codex"] } }
+    )
+
+    modes = router.auth_modes
+
+    assert_equal "subscription", modes["codex"], "a chain member with no config entry of its own still bills someone"
+    refute_includes modes.keys, "default", "the routing directive itself is still not a provider"
+  end
+
+  # The chain member and the configured entry are two different sources of
+  # names; a fix that reported chain members must not lose the explicit entry's
+  # own auth mode, so both halves are asserted here.
+  def test_auth_modes_keeps_explicit_entries_while_adding_chain_members
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "claude_api" => { "type" => "claude_cli", "auth" => "api" } },
+      workflow_providers: { "default" => { "relay_chain" => %w[codex claude_api] } }
+    )
+
+    modes = router.auth_modes
+
+    assert_equal "subscription", modes["codex"]
+    assert_equal "api", modes["claude_api"], "an explicit entry's declared mode must survive being named in a chain"
+  end
+
+  # Spec Decision 2: a typo like `auth: subscrption` must not silently fall
+  # back to something that spends money. It did. Cli#auth_mode raises
+  # Providers::Error from inside child_env, but #call's dispatch loop rescues
+  # Error and RELAYS -- so [claude_cli(typo), anthropic] answered on anthropic
+  # and billed ANTHROPIC_API_KEY. Validation has to happen outside that rescue.
+  def test_an_invalid_auth_mode_fails_the_run_instead_of_relaying_to_a_billed_provider
+    router = Riggs::Providers::Router.new(
+      hub_providers: {
+        "claude_cli" => { "type" => "claude_cli", "auth" => "subscrption" },
+        "mock" => { "type" => "mock" }
+      }
+    )
+
+    err = assert_raises(Riggs::Providers::Error) do
+      router.call(messages: [{ role: "user", content: "hi" }], chain: %w[claude_cli mock])
     end
+
+    assert_match(/claude_cli/, err.message)
+    refute_match(/All providers in relay_chain failed/, err.message,
+                 "the run must fail on the bad config, not after burning the whole chain")
+  end
+
+  # Every name #call is handed is a name it will hand to #build, so a
+  # `relay_chain` key on that entry does not make it a routing directive here
+  # -- it is still dispatched. Skipping validation for it reopened the exact
+  # relay-on-typo hole the guard exists to close: reproduced answering on the
+  # next provider at attempt 2. The relay_chain skip belongs in
+  # #provider_auth_mode, which enumerates config and must tell directives from
+  # providers; it does not belong in the guard, where every name is by
+  # definition dispatchable.
+  def test_an_invalid_auth_mode_is_caught_even_when_the_entry_also_carries_a_relay_chain
+    router = Riggs::Providers::Router.new(
+      hub_providers: {
+        "weird" => { "type" => "claude_cli", "auth" => "subscrption", "relay_chain" => ["mock"] },
+        "mock" => { "type" => "mock" }
+      }
+    )
+
+    err = assert_raises(Riggs::Providers::Error) do
+      router.call(messages: [{ role: "user", content: "hi" }], chain: %w[weird mock])
+    end
+
+    assert_match(/weird/, err.message)
+  end
+
+  # The guard must not fire on a chain it has no business rejecting: a valid
+  # mode, and a non-CLI provider carrying a stray auth: (R9.1 says ignore it).
+  def test_a_valid_chain_still_dispatches_with_the_auth_guard_in_place
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "mock" => { "type" => "mock", "auth" => "nonsense" } }
+    )
+
+    result = router.call(messages: [{ role: "user", content: "hi" }], chain: ["mock"])
+
+    assert_equal "mock", result[:provider]
+  end
+
+  # Deliberate deviation from the brief (see task-4-report.md): auth_modes is
+  # an observability field and must not be able to abort a run over a
+  # provider that field never dispatches. The money-safety guard is
+  # Router#call's pre-dispatch validation, which is outside the relay rescue;
+  # this rescue only keeps a never-dispatched typo from blanking the map. The
+  # rescue is per provider name, so one bad entry must not blank out the
+  # others -- that's what the "codex" assertion below proves.
+  def test_router_auth_modes_marks_an_invalid_value_without_raising_or_dropping_the_rest
+    router = Riggs::Providers::Router.new(
+      hub_providers: {
+        "codex" => { "type" => "codex", "auth" => "api" },
+        "claude_cli" => { "type" => "claude_cli", "auth" => "subscribe" }
+      }
+    )
+
+    modes = router.auth_modes
+
+    assert_equal "api", modes["codex"], "a good entry must resolve normally, not be swallowed by a sibling's rescue"
+    assert_equal "invalid", modes["claude_cli"]
+  end
+
+  # The regression this phase exists to fix: a CLI that is logged in via its
+  # own subscription must be usable, and Riggs refused to even spawn it.
+  def test_cursor_cli_runs_without_an_api_key
+    ENV.delete("CURSOR_API_KEY")
+    runner = FakeRunner.new(lambda { |**_|
+      Riggs::Providers::CliRunner::Result.new(stdout: "ok", stderr: "", status: FakeStatus.new(true))
+    })
+    provider = Riggs::Providers::CursorCli.new(name: "cursor", options: { runner: runner })
+
+    result = provider.complete(messages: [{ role: "user", content: "hi" }])
+
+    assert_equal "ok", result[:content]
+  end
+
+  def test_codex_cli_runs_without_an_api_key
+    ENV.delete("CODEX_API_KEY")
+    ENV.delete("OPENAI_API_KEY")
+    runner = FakeRunner.new(lambda { |**_|
+      Riggs::Providers::CliRunner::Result.new(stdout: "ok", stderr: "", status: FakeStatus.new(true))
+    })
+    provider = Riggs::Providers::CodexCli.new(name: "codex", options: { runner: runner })
+
+    assert_equal "ok", provider.complete(messages: [{ role: "user", content: "hi" }])[:content]
+  end
+
+  # Restores parent ENV after setting test values, including when assertions fail.
+  def with_saved_env(vars)
+    saved = {}
+    vars.each do |key, value|
+      saved[key] = ENV[key] if ENV.key?(key)
+      ENV[key] = value
+    end
+    yield
+  ensure
+    vars.each_key do |key|
+      if saved.key?(key)
+        ENV[key] = saved[key]
+      else
+        ENV.delete(key)
+      end
+    end
+  end
+
+  # Shell probe that reports presence without printing secret values.
+  def subscription_env_probe_script(var_names)
+    Array(var_names).map do |var|
+      "if [ -n \"${#{var}+set}\" ]; then echo #{var}=present; else echo #{var}=absent; fi"
+    end.join("\n")
+  end
+
+  def parse_env_probe(stdout)
+    stdout.each_line.to_h do |line|
+      key, status = line.strip.split("=", 2)
+      [key, status]
+    end
+  end
+
+  # Uses the adapter's real child_env and CliRunner.run to spawn a child that
+  # reports which variables survived the merge/unset contract.
+  def env_seen_by_spawned_child(klass, name:, parent_env:, probe_vars:, options: {})
+    with_saved_env(parent_env) do
+      provider = klass.new(name: name, options: options)
+      child_env = provider.send(:child_env)
+
+      result = Riggs::Providers::CliRunner.run(
+        command: "sh",
+        args: ["-c", subscription_env_probe_script(probe_vars)],
+        env: child_env,
+        timeout: 5
+      )
+      parse_env_probe(result.stdout)
+    end
+  end
+
+  # Captures the env handed to the runner so the scrub can be asserted without
+  # spawning anything.
+  def env_handed_to_runner(klass, name:, options: {})
+    captured = nil
+    runner = FakeRunner.new(lambda { |env:, **_|
+      captured = env
+      Riggs::Providers::CliRunner::Result.new(stdout: "ok", stderr: "", status: FakeStatus.new(true))
+    })
+    klass.new(name: name, options: options.merge(runner: runner))
+         .complete(messages: [{ role: "user", content: "hi" }])
+    captured
+  end
+
+  # A nil value means "unset this variable in the child" (Process.spawn
+  # contract), which CliRunner's ENV.to_h.merge(env) carries through. This is
+  # what stops an exported ANTHROPIC_API_KEY from overriding a Max
+  # subscription -- documented Claude Code behavior, and the reason relaxing
+  # the pre-flight alone would have been unsafe.
+  def test_claude_cli_scrubs_the_api_key_under_subscription
+    ENV["ANTHROPIC_API_KEY"] = "sk-test"
+    env = env_handed_to_runner(Riggs::Providers::ClaudeCli, name: "claude_cli")
+
+    assert env.key?("ANTHROPIC_API_KEY"), "the key must be present in the hash so it can be unset"
+    assert_nil env["ANTHROPIC_API_KEY"], "and nil so the child does not receive it"
+  ensure
+    ENV.delete("ANTHROPIC_API_KEY")
+  end
+
+  def test_claude_cli_passes_the_api_key_under_api_mode
+    ENV["ANTHROPIC_API_KEY"] = "sk-test"
+    env = env_handed_to_runner(Riggs::Providers::ClaudeCli, name: "claude_cli", options: { auth: "api" })
+
+    assert_equal "sk-test", env["ANTHROPIC_API_KEY"]
+  ensure
+    ENV.delete("ANTHROPIC_API_KEY")
+  end
+
+  # ANTHROPIC_AUTH_TOKEN outranks ANTHROPIC_API_KEY in Claude Code's own
+  # authentication precedence and is the documented variable for a corporate
+  # Anthropic-compatible gateway (code.claude.com/docs/en/llm-gateway-connect),
+  # so leaving it unscrubbed would let a gateway operator bypass the
+  # subscription through a sibling variable -- exactly the failure this phase
+  # exists to close, reached one variable over.
+  def test_claude_cli_scrubs_the_auth_token_under_subscription
+    ENV["ANTHROPIC_AUTH_TOKEN"] = "sk-auth-token-test"
+    env = env_handed_to_runner(Riggs::Providers::ClaudeCli, name: "claude_cli")
+
+    assert env.key?("ANTHROPIC_AUTH_TOKEN"), "the key must be present in the hash so it can be unset"
+    assert_nil env["ANTHROPIC_AUTH_TOKEN"], "and nil so the child does not receive it"
+  ensure
+    ENV.delete("ANTHROPIC_AUTH_TOKEN")
+  end
+
+  def test_claude_cli_passes_the_auth_token_under_api_mode
+    ENV["ANTHROPIC_AUTH_TOKEN"] = "sk-auth-token-test"
+    env = env_handed_to_runner(Riggs::Providers::ClaudeCli, name: "claude_cli", options: { auth: "api" })
+
+    assert_equal "sk-auth-token-test", env["ANTHROPIC_AUTH_TOKEN"]
+  ensure
+    ENV.delete("ANTHROPIC_AUTH_TOKEN")
+  end
+
+  # CLAUDE_CODE_OAUTH_TOKEN is itself a subscription credential -- the
+  # documented path for non-interactive use -- so scrubbing it would defeat
+  # the mode that is meant to use it.
+  def test_claude_cli_keeps_the_oauth_token_under_subscription
+    ENV["CLAUDE_CODE_OAUTH_TOKEN"] = "oauth-test"
+    env = env_handed_to_runner(Riggs::Providers::ClaudeCli, name: "claude_cli")
+
+    assert_equal "oauth-test", env["CLAUDE_CODE_OAUTH_TOKEN"]
+  ensure
+    ENV.delete("CLAUDE_CODE_OAUTH_TOKEN")
+  end
+
+  def test_codex_cli_scrubs_both_key_variables_under_subscription
+    ENV["OPENAI_API_KEY"] = "sk-openai"
+    ENV["CODEX_API_KEY"] = "sk-codex"
+    env = env_handed_to_runner(Riggs::Providers::CodexCli, name: "codex")
+
+    assert env.key?("CODEX_API_KEY"), "the key must be present in the hash so it can be unset"
+    assert_nil env["CODEX_API_KEY"], "and nil so the child does not receive it"
+    assert env.key?("OPENAI_API_KEY"), "the key must be present in the hash so it can be unset"
+    assert_nil env["OPENAI_API_KEY"], "and nil so the child does not receive it"
+  ensure
+    ENV.delete("OPENAI_API_KEY")
+    ENV.delete("CODEX_API_KEY")
+  end
+
+  def test_cursor_cli_scrubs_the_api_key_under_subscription
+    ENV["CURSOR_API_KEY"] = "sk-cursor"
+    env = env_handed_to_runner(Riggs::Providers::CursorCli, name: "cursor")
+
+    assert env.key?("CURSOR_API_KEY"), "the key must be present in the hash so it can be unset"
+    assert_nil env["CURSOR_API_KEY"], "and nil so the child does not receive it"
+  ensure
+    ENV.delete("CURSOR_API_KEY")
+  end
+
+  # Stubbed-runner scrub tests only assert on the hash handed to the runner.
+  # If CliRunner stopped honoring nil (e.g. merge(..., env.compact)), every
+  # parent API key would still reach the CLI and those tests would keep passing.
+  def test_claude_cli_subscription_scrub_reaches_spawned_child
+    fake = "sk-parent-should-not-reach-child"
+    report = env_seen_by_spawned_child(
+      Riggs::Providers::ClaudeCli,
+      name: "claude_cli",
+      parent_env: {
+        "ANTHROPIC_API_KEY" => fake,
+        "ANTHROPIC_AUTH_TOKEN" => fake,
+        "CLAUDE_CODE_OAUTH_TOKEN" => "oauth-parent-should-reach-child"
+      },
+      probe_vars: %w[ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN]
+    )
+
+    assert_equal "absent", report["ANTHROPIC_API_KEY"],
+                 "subscription mode must unset ANTHROPIC_API_KEY in the spawned child"
+    assert_equal "absent", report["ANTHROPIC_AUTH_TOKEN"],
+                 "subscription mode must unset ANTHROPIC_AUTH_TOKEN in the spawned child"
+    assert_equal "present", report["CLAUDE_CODE_OAUTH_TOKEN"],
+                 "subscription credentials that are meant to survive must still reach the child"
+    # Scope of that last assertion, checked by mutation: adding
+    # CLAUDE_CODE_OAUTH_TOKEN to the scrub set DOES fail it, which is the
+    # regression worth guarding. Deleting ClaudeCli's explicit forwarding of it
+    # does NOT, because the child inherits the parent's copy through
+    # ENV.to_h regardless -- so this proves "nothing scrubs it", not "the
+    # adapter forwards it". The forwarding is belt-and-braces either way.
+  end
+
+  def test_codex_cli_subscription_scrub_reaches_spawned_child
+    fake = "sk-parent-should-not-reach-child"
+    report = env_seen_by_spawned_child(
+      Riggs::Providers::CodexCli,
+      name: "codex",
+      parent_env: {
+        "CODEX_API_KEY" => fake,
+        "OPENAI_API_KEY" => fake
+      },
+      probe_vars: %w[CODEX_API_KEY OPENAI_API_KEY]
+    )
+
+    assert_equal "absent", report["CODEX_API_KEY"]
+    assert_equal "absent", report["OPENAI_API_KEY"]
+  end
+
+  def test_cursor_cli_subscription_scrub_reaches_spawned_child
+    fake = "sk-parent-should-not-reach-child"
+    report = env_seen_by_spawned_child(
+      Riggs::Providers::CursorCli,
+      name: "cursor",
+      parent_env: { "CURSOR_API_KEY" => fake },
+      probe_vars: %w[CURSOR_API_KEY]
+    )
+
+    assert_equal "absent", report["CURSOR_API_KEY"]
+  end
+
+  # Passing the key as an argv flag would hand it to the CLI through a channel
+  # the env scrub cannot reach.
+  def test_cursor_cli_omits_the_api_key_flag_under_subscription
+    captured = nil
+    runner = FakeRunner.new(lambda { |args:, **_|
+      captured = args
+      Riggs::Providers::CliRunner::Result.new(stdout: "ok", stderr: "", status: FakeStatus.new(true))
+    })
+    Riggs::Providers::CursorCli.new(name: "cursor", options: { runner: runner, api_key: "sk-inline" })
+                               .complete(messages: [{ role: "user", content: "hi" }])
+
+    refute_includes captured, "--api-key"
+    refute_includes captured, "sk-inline"
+  end
+
+  def test_cursor_cli_includes_the_api_key_flag_under_api_mode
+    captured = nil
+    runner = FakeRunner.new(lambda { |args:, **_|
+      captured = args
+      Riggs::Providers::CliRunner::Result.new(stdout: "ok", stderr: "", status: FakeStatus.new(true))
+    })
+    Riggs::Providers::CursorCli.new(
+      name: "cursor", options: { runner: runner, api_key: "sk-inline", auth: "api" }
+    ).complete(messages: [{ role: "user", content: "hi" }])
+
+    assert_includes captured, "--api-key"
+    assert_includes captured, "sk-inline"
   end
 
   def test_cli_runner_missing_binary
@@ -184,6 +626,62 @@ class TestProviders < Minitest::Test
       end
       assert dead, "child process #{pid} still running after timeout"
     end
+  end
+
+  # "Not logged in" is the error an operator will hit most often now that the
+  # pre-flight is gone. It gets its own class so a failed run says which
+  # problem it was, rather than looking like a crash.
+  def test_cli_runner_raises_auth_error_on_a_not_logged_in_failure
+    err = assert_raises(Riggs::Providers::AuthError) do
+      Riggs::Providers::CliRunner.run(
+        command: "sh", args: ["-c", "echo 'Not logged in. Run codex login.' >&2; exit 1"]
+      )
+    end
+
+    assert_match(/Not logged in/, err.message, "the CLI's own words must survive")
+  end
+
+  # AuthError must stay a subclass of Error: Router rescues
+  # `RateLimitError, TimeoutError, Error` in one clause and relays to the next
+  # provider. A sibling class would propagate and kill the run instead.
+  def test_auth_error_is_an_error_so_the_relay_chain_still_falls_through
+    assert_operator Riggs::Providers::AuthError, :<, Riggs::Providers::Error
+  end
+
+  def test_a_rate_limited_failure_is_still_a_rate_limit_error
+    assert_raises(Riggs::Providers::RateLimitError) do
+      Riggs::Providers::CliRunner.run(
+        command: "sh", args: ["-c", "echo '429 too many requests' >&2; exit 1"]
+      )
+    end
+  end
+
+  def test_an_ordinary_failure_is_still_a_plain_error
+    err = assert_raises(Riggs::Providers::Error) do
+      Riggs::Providers::CliRunner.run(command: "sh", args: ["-c", "echo 'segfault' >&2; exit 3"])
+    end
+
+    refute_instance_of Riggs::Providers::AuthError, err
+    refute_instance_of Riggs::Providers::RateLimitError, err
+  end
+
+  # The subclassing above is only meaningful if the relay actually falls
+  # through, so assert the behavior and not just the class hierarchy.
+  def test_router_relays_past_a_provider_that_is_not_authenticated
+    unauthenticated = Class.new(Riggs::Providers::Base) do
+      def complete(**)
+        raise Riggs::Providers::AuthError, "CLI not authenticated: codex: Not logged in"
+      end
+    end
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "broken" => { "type" => "broken" }, "mock" => { "type" => "mock" } },
+      registry: { "broken" => unauthenticated, "mock" => Riggs::Providers::Mock }
+    )
+
+    result = router.call(chain: %w[broken mock], messages: [{ role: "user", content: "hi" }])
+
+    assert_equal "mock", result[:provider], "an unauthenticated provider must fail over, not kill the run"
+    assert_equal 2, result[:relay_attempt]
   end
 
   def test_cursor_cloud_create_and_poll
