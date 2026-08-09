@@ -361,6 +361,55 @@ class TestProviders < Minitest::Test
     assert_equal "ok", provider.complete(messages: [{ role: "user", content: "hi" }])[:content]
   end
 
+  # Restores parent ENV after setting test values, including when assertions fail.
+  def with_saved_env(vars)
+    saved = {}
+    vars.each do |key, value|
+      saved[key] = ENV[key] if ENV.key?(key)
+      ENV[key] = value
+    end
+    yield
+  ensure
+    vars.each_key do |key|
+      if saved.key?(key)
+        ENV[key] = saved[key]
+      else
+        ENV.delete(key)
+      end
+    end
+  end
+
+  # Shell probe that reports presence without printing secret values.
+  def subscription_env_probe_script(var_names)
+    Array(var_names).map do |var|
+      "if [ -n \"${#{var}+set}\" ]; then echo #{var}=present; else echo #{var}=absent; fi"
+    end.join("\n")
+  end
+
+  def parse_env_probe(stdout)
+    stdout.each_line.to_h do |line|
+      key, status = line.strip.split("=", 2)
+      [key, status]
+    end
+  end
+
+  # Uses the adapter's real child_env and CliRunner.run to spawn a child that
+  # reports which variables survived the merge/unset contract.
+  def env_seen_by_spawned_child(klass, name:, parent_env:, probe_vars:, options: {})
+    with_saved_env(parent_env) do
+      provider = klass.new(name: name, options: options)
+      child_env = provider.send(:child_env)
+
+      result = Riggs::Providers::CliRunner.run(
+        command: "sh",
+        args: ["-c", subscription_env_probe_script(probe_vars)],
+        env: child_env,
+        timeout: 5
+      )
+      parse_env_probe(result.stdout)
+    end
+  end
+
   # Captures the env handed to the runner so the scrub can be asserted without
   # spawning anything.
   def env_handed_to_runner(klass, name:, options: {})
@@ -457,6 +506,64 @@ class TestProviders < Minitest::Test
     assert_nil env["CURSOR_API_KEY"], "and nil so the child does not receive it"
   ensure
     ENV.delete("CURSOR_API_KEY")
+  end
+
+  # Stubbed-runner scrub tests only assert on the hash handed to the runner.
+  # If CliRunner stopped honoring nil (e.g. merge(..., env.compact)), every
+  # parent API key would still reach the CLI and those tests would keep passing.
+  def test_claude_cli_subscription_scrub_reaches_spawned_child
+    fake = "sk-parent-should-not-reach-child"
+    report = env_seen_by_spawned_child(
+      Riggs::Providers::ClaudeCli,
+      name: "claude_cli",
+      parent_env: {
+        "ANTHROPIC_API_KEY" => fake,
+        "ANTHROPIC_AUTH_TOKEN" => fake,
+        "CLAUDE_CODE_OAUTH_TOKEN" => "oauth-parent-should-reach-child"
+      },
+      probe_vars: %w[ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN]
+    )
+
+    assert_equal "absent", report["ANTHROPIC_API_KEY"],
+                 "subscription mode must unset ANTHROPIC_API_KEY in the spawned child"
+    assert_equal "absent", report["ANTHROPIC_AUTH_TOKEN"],
+                 "subscription mode must unset ANTHROPIC_AUTH_TOKEN in the spawned child"
+    assert_equal "present", report["CLAUDE_CODE_OAUTH_TOKEN"],
+                 "subscription credentials that are meant to survive must still reach the child"
+    # Scope of that last assertion, checked by mutation: adding
+    # CLAUDE_CODE_OAUTH_TOKEN to the scrub set DOES fail it, which is the
+    # regression worth guarding. Deleting ClaudeCli's explicit forwarding of it
+    # does NOT, because the child inherits the parent's copy through
+    # ENV.to_h regardless -- so this proves "nothing scrubs it", not "the
+    # adapter forwards it". The forwarding is belt-and-braces either way.
+  end
+
+  def test_codex_cli_subscription_scrub_reaches_spawned_child
+    fake = "sk-parent-should-not-reach-child"
+    report = env_seen_by_spawned_child(
+      Riggs::Providers::CodexCli,
+      name: "codex",
+      parent_env: {
+        "CODEX_API_KEY" => fake,
+        "OPENAI_API_KEY" => fake
+      },
+      probe_vars: %w[CODEX_API_KEY OPENAI_API_KEY]
+    )
+
+    assert_equal "absent", report["CODEX_API_KEY"]
+    assert_equal "absent", report["OPENAI_API_KEY"]
+  end
+
+  def test_cursor_cli_subscription_scrub_reaches_spawned_child
+    fake = "sk-parent-should-not-reach-child"
+    report = env_seen_by_spawned_child(
+      Riggs::Providers::CursorCli,
+      name: "cursor",
+      parent_env: { "CURSOR_API_KEY" => fake },
+      probe_vars: %w[CURSOR_API_KEY]
+    )
+
+    assert_equal "absent", report["CURSOR_API_KEY"]
   end
 
   # Passing the key as an argv flag would hand it to the CLI through a channel
