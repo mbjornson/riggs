@@ -7,16 +7,16 @@ module Riggs
   module Providers
     # Base for providers that shell out to a local agent CLI.
     class Cli < Base
-      AUTH_MODES = %w[subscription api none].freeze
-      DEFAULT_AUTH_MODE = "subscription"
-
       # Which account a CLI provider bills. `subscription` scrubs that
       # provider's API-key variables from the child so the CLI falls back to
-      # its own stored login; `api` passes them through.
+      # its own stored login; `api` passes them through; `none` withholds
+      # credentials entirely.
       #
       # An unrecognized value raises rather than defaulting: both defaults
       # spend money, and silently picking one when the operator wrote
       # something else is how a typo becomes a bill against the wrong account.
+      AUTH_MODES = %w[subscription api none].freeze
+      DEFAULT_AUTH_MODE = "subscription"
 
       def complete(messages:, system: nil, timeout: 60, tools: nil)
         prompt = build_prompt(messages: messages, system: system)

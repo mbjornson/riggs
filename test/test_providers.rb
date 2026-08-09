@@ -256,18 +256,32 @@ class TestProviders < Minitest::Test
     modes = router.auth_modes
 
     refute_includes modes.keys, "default", "providers.default is a routing directive, not a provider"
-    assert_equal "api", modes["mock"], "a real provider in the same providers: block must still be reported"
+    assert_equal "none", modes["mock"], "a real provider in the same providers: block must still be reported"
   end
 
-  # Spec R9.1: `auth:` on a non-CLI provider is ignored, not an error -- there
-  # is no CLI to defer to, so validating the value would reject a harmless
-  # stray key.
-  def test_auth_on_a_non_cli_provider_is_ignored_rather_than_validated
+  def test_an_unsupported_auth_mode_on_openai_compatible_fails_before_relaying
+    fallback_called = false
+    fallback = Class.new(Riggs::Providers::Base) do
+      define_method(:complete) do |**_|
+        fallback_called = true
+        { provider: name, content: "unexpected", usage: {} }
+      end
+    end
     router = Riggs::Providers::Router.new(
-      hub_providers: { "openai" => { "type" => "openai", "auth" => "nonsense" } }
+      hub_providers: {
+        "local" => { "type" => "openai", "auth" => "subscription" },
+        "fallback" => { "type" => "fallback" }
+      },
+      registry: { "openai" => Riggs::Providers::OpenAICompatible, "fallback" => fallback }
     )
 
-    assert_equal({ "openai" => "api" }, router.auth_modes)
+    err = assert_raises(Riggs::Providers::Error) do
+      router.call(messages: [{ role: "user", content: "hi" }], chain: %w[local fallback])
+    end
+
+    assert_match(/local/, err.message)
+    assert_match(/api, none/, err.message)
+    refute fallback_called, "bad auth must fail before any relay provider dispatches"
   end
 
   # A provider that is only ever named inside a relay_chain still gets
@@ -347,11 +361,9 @@ class TestProviders < Minitest::Test
     assert_match(/weird/, err.message)
   end
 
-  # The guard must not fire on a chain it has no business rejecting: a valid
-  # mode, and a non-CLI provider carrying a stray auth: (R9.1 says ignore it).
-  def test_a_valid_chain_still_dispatches_with_the_auth_guard_in_place
+  def test_a_valid_none_mode_still_dispatches_with_the_auth_guard_in_place
     router = Riggs::Providers::Router.new(
-      hub_providers: { "mock" => { "type" => "mock", "auth" => "nonsense" } }
+      hub_providers: { "mock" => { "type" => "mock", "auth" => "none" } }
     )
 
     result = router.call(messages: [{ role: "user", content: "hi" }], chain: ["mock"])
@@ -359,14 +371,7 @@ class TestProviders < Minitest::Test
     assert_equal "mock", result[:provider]
   end
 
-  # Deliberate deviation from the brief (see task-4-report.md): auth_modes is
-  # an observability field and must not be able to abort a run over a
-  # provider that field never dispatches. The money-safety guard is
-  # Router#call's pre-dispatch validation, which is outside the relay rescue;
-  # this rescue only keeps a never-dispatched typo from blanking the map. The
-  # rescue is per provider name, so one bad entry must not blank out the
-  # others -- that's what the "codex" assertion below proves.
-  def test_router_auth_modes_marks_an_invalid_value_without_raising_or_dropping_the_rest
+  def test_router_auth_modes_rejects_a_configured_invalid_value
     router = Riggs::Providers::Router.new(
       hub_providers: {
         "codex" => { "type" => "codex", "auth" => "api" },
@@ -374,10 +379,33 @@ class TestProviders < Minitest::Test
       }
     )
 
-    modes = router.auth_modes
+    err = assert_raises(Riggs::Providers::Error) { router.auth_modes }
 
-    assert_equal "api", modes["codex"], "a good entry must resolve normally, not be swallowed by a sibling's rescue"
-    assert_equal "invalid", modes["claude_cli"]
+    assert_match(/claude_cli/, err.message)
+    assert_match(/subscription, api, none/, err.message)
+  end
+
+  def test_anthropic_and_cursor_cloud_reject_none_with_their_own_supported_modes
+    { "anthropic" => "anthropic", "cursor_cloud" => "cursor_cloud" }.each do |name, type|
+      router = Riggs::Providers::Router.new(
+        hub_providers: { name => { "type" => type, "auth" => "none" } }
+      )
+
+      err = assert_raises(Riggs::Providers::Error) do
+        router.call(messages: [{ role: "user", content: "hi" }], chain: [name])
+      end
+
+      assert_match(/#{name}/, err.message)
+      assert_match(/api/, err.message)
+    end
+  end
+
+  def test_provider_auth_modes_omits_a_name_that_resolves_to_no_class
+    router = Riggs::Providers::Router.new(
+      workflow_providers: { "default" => { "relay_chain" => ["does_not_exist"] } }
+    )
+
+    assert_equal({}, router.auth_modes)
   end
 
   # The regression this phase exists to fix: a CLI that is logged in via its

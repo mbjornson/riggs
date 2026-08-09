@@ -86,8 +86,8 @@ class TestGraphEngine < Minitest::Test
       modes = start[:payload][:provider_auth_modes] || start[:payload]["provider_auth_modes"]
 
       refute_nil modes, "workflow_start must carry provider_auth_modes"
-      assert_equal "api", modes["mock"] || modes[:mock],
-                   "a non-CLI provider bills its API key by definition"
+      assert_equal "none", modes["mock"] || modes[:mock],
+                   "mock bills nobody and must be recorded as none"
     end
   end
 
