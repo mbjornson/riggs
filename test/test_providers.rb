@@ -177,7 +177,7 @@ class TestProviders < Minitest::Test
 
   def test_provider_classes_declare_their_own_auth_vocabularies_and_defaults
     expectations = {
-      Riggs::Providers::Cli => [%w[subscription api none], "subscription"],
+      Riggs::Providers::Cli => [%w[subscription api], "subscription"],
       Riggs::Providers::OpenAICompatible => [%w[api none], "api"],
       Riggs::Providers::Anthropic => [%w[api], "api"],
       Riggs::Providers::CursorCloud => [%w[api], "api"],
@@ -541,48 +541,21 @@ class TestProviders < Minitest::Test
     end
   end
 
-  def test_none_uses_the_same_cli_scrub_sets_as_subscription
+  def test_auth_none_on_cli_adapters_raises_naming_the_provider_and_supported_modes
     cases = [
-      [Riggs::Providers::ClaudeCli, "claude_cli",
-       { "ANTHROPIC_API_KEY" => "sk-a", "ANTHROPIC_AUTH_TOKEN" => "sk-t" },
-       %w[ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN]],
-      [Riggs::Providers::CodexCli, "codex",
-       { "CODEX_API_KEY" => "sk-c", "OPENAI_API_KEY" => "sk-o" }, %w[CODEX_API_KEY OPENAI_API_KEY]],
-      [Riggs::Providers::CursorCli, "cursor", { "CURSOR_API_KEY" => "sk-cursor" }, %w[CURSOR_API_KEY]]
+      [Riggs::Providers::ClaudeCli, "claude_cli"],
+      [Riggs::Providers::CodexCli, "codex"],
+      [Riggs::Providers::CursorCli, "cursor"]
     ]
 
-    cases.each do |klass, name, parent_env, keys|
-      with_saved_env(parent_env) do
-        subscription = env_handed_to_runner(klass, name: name, options: { auth: "subscription" })
-        none = env_handed_to_runner(klass, name: name, options: { auth: "none" })
-        keys.each do |key|
-          assert_nil subscription[key], "subscription must scrub #{key}"
-          assert_nil none[key], "none must scrub #{key} exactly as subscription does"
-        end
+    cases.each do |klass, name|
+      err = assert_raises(Riggs::Providers::Error) do
+        klass.new(name: name, options: { auth: "none" }).auth_mode
       end
+      assert_match(/#{name}/, err.message, "the error must name which provider is misconfigured")
+      assert_match(/subscription/, err.message, "and list the values that would have worked")
+      assert_match(/api/, err.message)
     end
-  end
-
-  def test_claude_code_oauth_token_survives_under_none
-    with_saved_env("CLAUDE_CODE_OAUTH_TOKEN" => "oauth-test") do
-      env = env_handed_to_runner(Riggs::Providers::ClaudeCli, name: "claude_cli", options: { auth: "none" })
-
-      assert_equal "oauth-test", env["CLAUDE_CODE_OAUTH_TOKEN"]
-    end
-  end
-
-  def test_cursor_cli_omits_the_api_key_flag_under_none
-    captured = nil
-    runner = FakeRunner.new(lambda { |args:, **_|
-      captured = args
-      Riggs::Providers::CliRunner::Result.new(stdout: "ok", stderr: "", status: FakeStatus.new(true))
-    })
-    Riggs::Providers::CursorCli.new(
-      name: "cursor", options: { runner: runner, api_key: "sk-inline", auth: "none" }
-    ).complete(messages: [{ role: "user", content: "hi" }])
-
-    refute_includes captured, "--api-key"
-    refute_includes captured, "sk-inline"
   end
 
   # Uses the adapter's real child_env and CliRunner.run to spawn a child that
