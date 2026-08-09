@@ -19,7 +19,12 @@ module Riggs
         token = ENV.fetch("CLAUDE_CODE_OAUTH_TOKEN", nil)
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token if token && !token.empty?
 
-        if auth_mode == "subscription"
+        if auth_mode == "api"
+          key = ENV.fetch("ANTHROPIC_API_KEY", nil)
+          env["ANTHROPIC_API_KEY"] = key if key && !key.empty?
+          token = ENV.fetch("ANTHROPIC_AUTH_TOKEN", nil)
+          env["ANTHROPIC_AUTH_TOKEN"] = token if token && !token.empty?
+        else
           # nil unsets it in the child. ANTHROPIC_API_KEY otherwise OVERRIDES a
           # Pro/Max subscription (code.claude.com/docs/en/env-vars), so an
           # exported key would silently bill the API account on every step.
@@ -31,11 +36,6 @@ module Riggs
           # subscription through a sibling variable.
           env["ANTHROPIC_API_KEY"] = nil
           env["ANTHROPIC_AUTH_TOKEN"] = nil
-        else
-          key = ENV.fetch("ANTHROPIC_API_KEY", nil)
-          env["ANTHROPIC_API_KEY"] = key if key && !key.empty?
-          token = ENV.fetch("ANTHROPIC_AUTH_TOKEN", nil)
-          env["ANTHROPIC_AUTH_TOKEN"] = token if token && !token.empty?
         end
         env
       end

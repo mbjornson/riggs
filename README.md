@@ -97,22 +97,21 @@ Web: `/triggers` and `GET /api/triggers/match?q=…` (requires `read_workflow`).
 
 HTTP providers (direct API):
 
-| Name | Backend | Auth |
-|------|---------|------|
-| `mock` | Deterministic offline | — |
-| `claude` / `anthropic` | Anthropic Messages API | `ANTHROPIC_API_KEY` |
-| `openai` | OpenAI-compatible chat | `OPENAI_API_KEY` |
-| `ollama` | Local OpenAI-compatible | optional |
+| Name | Backend | auth: modes |
+|------|---------|-------------|
+| `mock` | Deterministic offline | none (default and only mode) |
+| `claude` / `anthropic` | Anthropic Messages API | api (default and only mode; ANTHROPIC_API_KEY) |
+| `openai` | OpenAI-compatible chat | api (default), none (withholds Authorization) |
+| `ollama` | Local OpenAI-compatible | api (default), none (withholds Authorization) |
 
-CLI providers (shell out; binaries must be on `PATH`). These run against your
-**subscription** by default — Riggs removes the API-key variables from the
-*inherited environment* before spawning the child, so an exported key in your
-shell cannot reach the CLI and override its own stored login (`codex login`,
-`claude /login`, `cursor-agent login`). Set `auth: api` on the provider to bill
-metered API credits instead.
+CLI providers (shell out; binaries must be on `PATH`). They accept auth:
+subscription (default), api, or none. Both subscription and none remove API-key
+variables from the inherited environment, so an exported key cannot override a
+stored CLI login. none is for an intentional non-API credential; api passes the
+documented key variables.
 
-| Name | Command | `auth: subscription` (default) | `auth: api` |
-|------|---------|-------------------------------|-------------|
+| Name | Command | auth: subscription / none | auth: api |
+|------|---------|---------------------------|-----------|
 | `cursor` | `agent -p … --output-format text` | `cursor-agent login` | `CURSOR_API_KEY` |
 | `claude_cli` | `claude -p … --bare` | `claude /login`, or `CLAUDE_CODE_OAUTH_TOKEN` | `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` |
 | `codex` | `codex exec …` | `codex login` | `CODEX_API_KEY` or `OPENAI_API_KEY` |
@@ -143,9 +142,9 @@ for why.
 
 Cursor Cloud Agents (async REST — needs a repo):
 
-| Name | API | Auth |
-|------|-----|------|
-| `cursor_cloud` | `POST https://api.cursor.com/v1/agents` + poll run | `CURSOR_API_KEY` |
+| Name | API | auth: modes |
+|------|-----|-------------|
+| `cursor_cloud` | `POST https://api.cursor.com/v1/agents` + poll run | api (default and only mode; CURSOR_API_KEY) |
 
 ```yaml
 # playbook
