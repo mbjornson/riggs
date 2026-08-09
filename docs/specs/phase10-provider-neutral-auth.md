@@ -188,6 +188,24 @@ Decision 2 exists to prevent.
 that resolves to no class it returns `nil` and is omitted from the map, rather
 than reporting `"api"` for something that can never be dispatched.
 
+**It keeps its per-provider `rescue`, recording `"invalid"`.** This is not an
+oversight carried from Phase 9 — it is load-bearing, and removing it is a
+regression. `auth_modes` enumerates *every configured provider*, not just the
+chain being dispatched, and `GraphEngine` calls it inline while building the
+`workflow_start` payload, before `run_steps`. Since `hub_providers` is shared
+across every workflow in the hub, letting it raise means one typo on a dormant
+provider aborts every run in the hub, including runs that never touch it.
+Verified: a hub with a valid `mock` and a dormant `anthropic` carrying
+`auth: none` raises out of `auth_modes` while the `mock` chain itself dispatches
+fine.
+
+The rescue gives up nothing on money safety. `validate_auth_modes!` covers every
+name in the chain about to be dispatched, raises there, and runs outside the
+relay rescue — so a provider that actually runs with a bad mode still fails the
+run closed. `"invalid"` can therefore only ever appear for a provider that was
+configured and never dispatched, which is exactly what an operator needs to see
+in the audit trail rather than a failed run.
+
 ## R10.3 `none` withholds the credential
 
 `OpenAICompatible#complete` sends no `Authorization` header when
