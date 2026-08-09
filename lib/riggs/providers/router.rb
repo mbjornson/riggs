@@ -200,6 +200,7 @@ module Riggs
           opts = provider_config(name)
           klass = provider_class_for(name, opts)
           next unless klass
+          next unless klass.respond_to?(:resolve_auth_mode)
 
           klass.resolve_auth_mode(opts[:auth], provider: name)
         end
@@ -254,6 +255,7 @@ module Riggs
 
         klass = provider_class_for(name, opts)
         return nil unless klass
+        return nil unless klass.respond_to?(:resolve_auth_mode)
 
         klass.resolve_auth_mode(opts[:auth], provider: name)
       rescue Error

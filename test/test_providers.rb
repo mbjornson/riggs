@@ -291,6 +291,32 @@ class TestProviders < Minitest::Test
     assert_equal "none", modes["mock"], "a real provider in the same providers: block must still be reported"
   end
 
+  def test_registry_entry_without_resolve_auth_mode_is_skipped_by_auth_modes_and_dispatches
+    custom = Class.new do
+      define_method(:initialize) do |name:, options: {}|
+        @name = name.to_s
+        @options = options || {}
+      end
+      attr_reader :name, :options
+
+      define_method(:complete) do |**_|
+        { provider: name, content: "custom-ok", usage: {} }
+      end
+    end
+
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "custom" => { "type" => "custom" } },
+      registry: { "custom" => custom }
+    )
+
+    modes = router.auth_modes
+    refute_includes modes.keys, "custom", "custom providers have no auth vocabulary to report"
+
+    result = router.call(chain: ["custom"], messages: [{ role: "user", content: "hi" }])
+    assert_equal "custom", result[:provider]
+    assert_equal "custom-ok", result[:content]
+  end
+
   def test_an_unsupported_auth_mode_on_openai_compatible_fails_before_relaying
     fallback_called = false
     fallback = Class.new(Riggs::Providers::Base) do
