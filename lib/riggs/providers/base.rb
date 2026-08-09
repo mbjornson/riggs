@@ -21,9 +21,17 @@ module Riggs
       def self.auth_modes = self::AUTH_MODES
       def self.default_auth_mode = self::DEFAULT_AUTH_MODE
 
+      def self.resolved_default_auth_mode
+        default = default_auth_mode
+        return default if auth_modes.include?(default)
+
+        raise Error, "#{name} declares DEFAULT_AUTH_MODE #{default.inspect} " \
+                     "outside AUTH_MODES #{auth_modes.inspect}"
+      end
+
       def self.resolve_auth_mode(value, provider:)
         mode = value.to_s.strip.downcase
-        return default_auth_mode if mode.empty?
+        return resolved_default_auth_mode if mode.empty?
         return mode if auth_modes.include?(mode)
 
         raise Error, "provider '#{provider}': auth mode #{value.inspect} is not " \

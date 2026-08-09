@@ -212,6 +212,37 @@ class TestProviders < Minitest::Test
     assert_match(/none/, err.message)
   end
 
+  def test_subclass_without_default_auth_mode_raises_on_omitted_auth
+    klass = Class.new(Riggs::Providers::Base) do
+      const_set(:AUTH_MODES, %w[none].freeze)
+    end
+
+    err = assert_raises(Riggs::Providers::Error) { klass.resolve_auth_mode(nil, provider: "local") }
+    assert_match(/DEFAULT_AUTH_MODE/, err.message)
+    assert_match(/AUTH_MODES/, err.message)
+    refute_match(/provider 'local'/, err.message,
+                 "a bad default is a class bug, not an operator typo")
+  end
+
+  def test_every_real_provider_resolves_its_default_auth_mode
+    classes = [
+      Riggs::Providers::Cli,
+      Riggs::Providers::OpenAICompatible,
+      Riggs::Providers::Anthropic,
+      Riggs::Providers::CursorCloud,
+      Riggs::Providers::Mock,
+      Riggs::Providers::ClaudeCli,
+      Riggs::Providers::CodexCli,
+      Riggs::Providers::CursorCli
+    ]
+
+    classes.each do |klass|
+      assert klass.auth_modes.include?(klass.default_auth_mode),
+             "#{klass} default must be in its AUTH_MODES"
+      assert_equal klass.default_auth_mode, klass.resolve_auth_mode(nil, provider: "test")
+    end
+  end
+
   def test_non_cli_instances_resolve_their_own_defaults
     assert_equal "api", Riggs::Providers::OpenAICompatible.new(name: "openai", options: {}).auth_mode
     assert_equal "api", Riggs::Providers::Anthropic.new(name: "anthropic", options: {}).auth_mode
