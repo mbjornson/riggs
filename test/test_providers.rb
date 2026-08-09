@@ -379,10 +379,23 @@ class TestProviders < Minitest::Test
       }
     )
 
-    err = assert_raises(Riggs::Providers::Error) { router.auth_modes }
+    modes = router.auth_modes
 
-    assert_match(/claude_cli/, err.message)
-    assert_match(/subscription, api, none/, err.message)
+    assert_equal "api", modes["codex"]
+    assert_equal "invalid", modes["claude_cli"]
+  end
+
+  def test_a_dormant_misconfigured_provider_does_not_abort_dispatch_on_an_unrelated_chain
+    router = Riggs::Providers::Router.new(
+      hub_providers: {
+        "mock" => { "type" => "mock", "auth" => "none" },
+        "anthropic" => { "type" => "anthropic", "auth" => "none" }
+      }
+    )
+
+    result = router.call(messages: [{ role: "user", content: "hi" }], chain: ["mock"])
+
+    assert_equal "mock", result[:provider]
   end
 
   def test_anthropic_and_cursor_cloud_reject_none_with_their_own_supported_modes

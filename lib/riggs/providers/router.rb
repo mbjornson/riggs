@@ -256,6 +256,8 @@ module Riggs
         return nil unless klass
 
         klass.resolve_auth_mode(opts[:auth], provider: name)
+      rescue Error
+        "invalid"
       end
 
       # Normalizes vendor usage and prices it. Only Router resolves provider
