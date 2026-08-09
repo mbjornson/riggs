@@ -127,12 +127,13 @@ def self.default_auth_mode = self::DEFAULT_AUTH_MODE
 
 def self.resolve_auth_mode(value, provider:)
   mode = value.to_s.strip.downcase
-  return default_auth_mode if mode.empty?
+  return resolved_default_auth_mode if mode.empty?
   return mode if auth_modes.include?(mode)
 
   raise Error, "provider '#{provider}': auth mode #{value.inspect} is not " \
                "supported by #{name} (expected one of: #{auth_modes.join(', ')})"
 end
+
 
 def auth_mode = self.class.resolve_auth_mode(options[:auth], provider: name)
 ```
@@ -144,7 +145,7 @@ Per-provider declarations:
 
 | Provider | `AUTH_MODES` | `DEFAULT_AUTH_MODE` | Why |
 |---|---|---|---|
-| `Cli` (and its three adapters) | `subscription api none` | `subscription` | Phase 9 R9.1, unchanged |
+| `Cli` (and its three adapters) | `subscription api` | `subscription` | Phase 9 R9.1, unchanged |
 | `OpenAICompatible` | `api none` | `api` | Sends a key only if one exists, so it can withhold one |
 | `Anthropic` | `api` | `api` | Raises without a key and always sends `x-api-key` |
 | `CursorCloud` | `api` | `api` | Requires `CURSOR_API_KEY` |
@@ -152,11 +153,12 @@ Per-provider declarations:
 
 `Cli::AUTH_MODES` and `Cli::DEFAULT_AUTH_MODE` keep their names and their
 location on `Cli`, and `Cli.resolve_auth_mode(value, provider:)` keeps its call
-signature, so every Phase 9 call site compiles unchanged. Two things do change,
-and both are intended:
+signature, so every Phase 9 call site compiles unchanged. Its **value** is
+unchanged too — `%w[subscription api]`, exactly as Phase 9 had it, for the
+reason in "Why `none` is not a CLI mode" below.
 
-- `Cli::AUTH_MODES` gains `none`, per the table above. Phase 9's value was
-  `%w[subscription api]`.
+One thing does change, and it is intended:
+
 - The error text for an unrecognized value changes. Phase 9 raised
   `"provider 'x': unknown auth mode "y" (expected one of: subscription, api)"`.
   The `Base` implementation raises `"provider 'x': auth mode "y" is not
@@ -212,13 +214,37 @@ in the audit trail rather than a failed run.
 `auth_mode == "none"`, and does not read `options[:api_key]`,
 `OPENAI_API_KEY`, or `OLLAMA_API_KEY` at all in that case.
 
-The three `Cli` adapters scrub whenever the mode is not `api`, rather than only
-when it is `subscription` — so `none` gets the same treatment `subscription`
-already has. Concretely, each adapter's `child_env` branch condition changes
-from `auth_mode == "subscription"` to `auth_mode != "api"`, and
-`CursorCli#argv_for` omits `--api-key` under the same condition. Phase 9's
-scrub sets are otherwise unchanged, and `CLAUDE_CODE_OAUTH_TOKEN` is still never
-scrubbed.
+The `Cli` adapters are unchanged from Phase 9: they scrub under `subscription`
+and pass keys through under `api`. `none` is not one of their modes, for the
+reason given in R10.1, so there is no third branch. `CLAUDE_CODE_OAUTH_TOKEN` is
+still never scrubbed.
+
+### `resolve_auth_mode` validates its own default
+
+`resolved_default_auth_mode` returns `default_auth_mode` after checking it is in
+`auth_modes`, so the membership check applies to the default too, not only to an
+operator-supplied value. A subclass that declares `AUTH_MODES` without `DEFAULT_AUTH_MODE`
+inherits `Base`'s `"api"`, which may not be in its own vocabulary — verified: a
+subclass declaring `AUTH_MODES = %w[none]` resolved an omitted `auth:` to
+`"api"`, a mode it does not support.
+
+The two failures are reported differently because they have different authors. An
+unsupported operator value names the provider *instance* and what it supports. A
+default outside the class's own `AUTH_MODES` is a bug in the provider class, not
+in anyone's config, and says so — naming the class and both constants.
+
+### Registry entries that are not `Base` subclasses
+
+`registry:` is a public constructor argument, and an entry may be any class that
+implements `new` and `complete`. Such a class has no auth vocabulary Riggs can
+reason about, so both `validate_auth_modes!` and `provider_auth_mode` skip any
+class that does not respond to `resolve_auth_mode` — the latter returning `nil`
+so the name is omitted from the map.
+
+Without this, a custom provider raised `NoMethodError`, which escapes the
+`rescue Error` in `provider_auth_mode` and aborts `workflow_start` — the same
+availability failure that rescue exists to prevent, through a different door.
+Verified before fixing.
 
 ## R10.4 Attribution
 
@@ -230,6 +256,25 @@ Phase 9 R9.5's payload shape is unchanged.
 its cost exactly as it does today, which for a model with no pricing entry is
 `nil` — "unknown", not "free". Making it `0.0` is deferred, with its reasoning,
 to the follow-on phase.
+
+## Known residual paths (out of scope)
+
+Recorded so nobody later reads the guarantee as wider than it is. Both were
+raised by an adversarial review and deliberately left.
+
+- **Direct construction bypasses validation.** `Anthropic.new(options: { auth:
+  "none" }).complete(...)` sends the key: only `Router#call` runs
+  `validate_auth_modes!`. Every path inside Riggs — `ToolLoop`, `Compactor`, the
+  web app, `providers:ping` — goes through `Router#call`, so this affects a
+  library consumer who constructs a provider directly. `Router` is the
+  enforcement point by design; moving the check into every `complete` would
+  duplicate it across providers for a case Riggs itself never takes.
+- **Proxy credentials still leave the process.** `OpenAICompatible` uses
+  `Net::HTTP`'s default proxy-from-environment behavior, so `HTTP_PROXY` or
+  `HTTPS_PROXY` containing userinfo causes Ruby to send `Proxy-Authorization` to
+  that proxy even under `auth: none`. The API bearer token is absent, which is
+  what `none` promises, but a credential still reaches the proxy. Suppressing it
+  means disabling proxy support, which is a larger decision than this phase.
 
 ## R10.5 Tests
 
@@ -244,13 +289,20 @@ to the follow-on phase.
   `test_auth_on_a_non_cli_provider_is_ignored_rather_than_validated`
 - `auth: none` on an OpenAI-compatible provider sends **no** `Authorization`
   header, asserted against a **real local HTTP server that records the request
-  it received**, with `OPENAI_API_KEY` exported in the parent — not a stubbed
-  client. Same discipline as Phase 9's spawn test: assert on what crossed the
+  it received** — not a stubbed client. The parent must carry *every* credential
+  source the provider reads: `OPENAI_API_KEY`, `OLLAMA_API_KEY`, **and**
+  `options[:api_key]`. Exporting only one leaves a regression in either of the
+  others invisible. Same discipline as Phase 9's spawn test: assert on what crossed the
   boundary, not on the arguments handed to a fake.
 - `auth: api` on the same provider still sends the key
-- each CLI adapter under `none` scrubs exactly what it scrubs under
-  `subscription`, and `CursorCli` omits `--api-key`
-- `CLAUDE_CODE_OAUTH_TOKEN` still survives under `none`
+- `auth: none` on each of the three CLI adapters raises, naming the provider and
+  listing `subscription, api`
+- the CLI adapters' `subscription` and `api` behavior is unchanged from Phase 9,
+  including `CLAUDE_CODE_OAUTH_TOKEN` surviving under `subscription`
+- a subclass declaring `AUTH_MODES` but not `DEFAULT_AUTH_MODE` raises on an
+  omitted `auth:`, with a message naming the class rather than blaming config
+- a registry entry that is not a `Base` subclass is skipped by validation and
+  omitted from `auth_modes`, rather than raising `NoMethodError`
 - a chain containing a provider with an unsupported mode fails before any
   provider is dispatched, rather than relaying to the next one
 - `provider_auth_modes` reports `"none"` for a local provider and omits a name
