@@ -572,15 +572,21 @@ class TestProviders < Minitest::Test
   end
 
   def test_openai_compatible_none_sends_no_authorization_header_to_a_real_local_server
-    with_saved_env("OPENAI_API_KEY" => "sk-parent-key") do
+    with_saved_env("OPENAI_API_KEY" => "sk-parent-key", "OLLAMA_API_KEY" => "sk-ollama-key") do
       with_capturing_openai_server do |base_url, headers_seen|
         provider = Riggs::Providers::OpenAICompatible.new(
-          name: "local", options: { base_url: base_url, model: "local-test", auth: "none" }
+          name: "local",
+          options: {
+            base_url: base_url,
+            model: "local-test",
+            auth: "none",
+            api_key: "sk-inline-key"
+          }
         )
 
         assert_equal "ok", provider.complete(messages: [{ role: "user", content: "hi" }])[:content]
         refute_match(/^Authorization:/i, headers_seen.pop,
-                     "auth: none must keep the exported parent key off the wire")
+                     "auth: none must keep every credential source off the wire")
       end
     end
   end
