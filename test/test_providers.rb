@@ -280,6 +280,29 @@ class TestProviders < Minitest::Test
                  "the run must fail on the bad config, not after burning the whole chain")
   end
 
+  # Every name #call is handed is a name it will hand to #build, so a
+  # `relay_chain` key on that entry does not make it a routing directive here
+  # -- it is still dispatched. Skipping validation for it reopened the exact
+  # relay-on-typo hole the guard exists to close: reproduced answering on the
+  # next provider at attempt 2. The relay_chain skip belongs in
+  # #provider_auth_mode, which enumerates config and must tell directives from
+  # providers; it does not belong in the guard, where every name is by
+  # definition dispatchable.
+  def test_an_invalid_auth_mode_is_caught_even_when_the_entry_also_carries_a_relay_chain
+    router = Riggs::Providers::Router.new(
+      hub_providers: {
+        "weird" => { "type" => "claude_cli", "auth" => "subscrption", "relay_chain" => ["mock"] },
+        "mock" => { "type" => "mock" }
+      }
+    )
+
+    err = assert_raises(Riggs::Providers::Error) do
+      router.call(messages: [{ role: "user", content: "hi" }], chain: %w[weird mock])
+    end
+
+    assert_match(/weird/, err.message)
+  end
+
   # The guard must not fire on a chain it has no business rejecting: a valid
   # mode, and a non-CLI provider carrying a stray auth: (R9.1 says ignore it).
   def test_a_valid_chain_still_dispatches_with_the_auth_guard_in_place

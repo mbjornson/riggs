@@ -189,11 +189,15 @@ module Riggs
       # billed ANTHROPIC_API_KEY, reporting nothing. Every name in the chain is
       # validated up front, not lazily per attempt, because a fallback that is
       # only reached when the primary fails is exactly when nobody is watching.
+      # No relay_chain skip here, deliberately. Every name this receives is a
+      # name #call is about to hand to #build, so it is dispatchable by
+      # definition -- a relay_chain key on it does not make it a routing
+      # directive the way it does in #provider_auth_mode, which enumerates
+      # config rather than a chain. Skipping on it reopened the hole this guard
+      # exists to close.
       def validate_auth_modes!(names)
         names.each do |name|
           opts = provider_config(name)
-          next if opts[:relay_chain]
-
           klass = provider_class_for(name, opts)
           next unless klass && klass <= Cli
 
@@ -248,7 +252,7 @@ module Riggs
         opts = provider_config(name)
         return nil if opts[:relay_chain]
 
-        klass = @registry[name] || @registry[opts[:type]&.to_s || name]
+        klass = provider_class_for(name, opts)
         return "api" unless klass && klass <= Cli
 
         Cli.resolve_auth_mode(opts[:auth], provider: name)
