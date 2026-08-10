@@ -28,6 +28,7 @@ end
 
 require_relative "riggs/version"
 require_relative "riggs/identity"
+require_relative "riggs/config/merge"
 require_relative "riggs/trust"
 require_relative "riggs/config/resolver"
 require_relative "riggs/config_store"
