@@ -1,0 +1,1920 @@
+# Phase 11a Implementation Plan — Config Tiers and Project Trust
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Riggs resolves identity, roles, providers and MCP servers from `~/.riggs/`, reads a repo's `.riggs/config.yml` only after that path is trusted, and gates every project-declared MCP server behind an explicit approval.
+
+**Architecture:** Two new pure units — `Riggs::Trust` (the registry) and `Riggs::Config::Merge` (the algebra) — plus `Riggs::Config::Resolver`, which finds the tiers and applies the trust gate. `Identity.load_config` becomes a thin wrapper that returns the merged hash, so its eleven production call sites and every test that calls it keep working unchanged. Provenance travels beside the merged config so the MCP gate can tell a project-declared server from a global one, and so every run can print which tier chose the identity.
+
+**Tech Stack:** Ruby 4.0 target, Thor CLI, Psych, Minitest, RuboCop.
+
+**Spec:** `docs/specs/phase11-config-tiers-and-project-trust.md`. R11.1–R11.5 and R11.8 are in scope. R11.6 (attribution) and R11.7 (memory scoping) are Phase 11b and MUST NOT be implemented here.
+
+## Global Constraints
+
+- `bundle exec rubocop` clean across all files and `bundle exec rake test` at 0 failures / 0 errors before EVERY commit. Use `PATH="/Users/matt/.local/share/mise/shims:$PATH"`.
+- NEVER use `--no-verify`. Do NOT `git push`. Do not create, switch, or delete branches — work on `phase-11-config-tiers`.
+- `Layout/LineLength` Max is 130. No literal control characters in source.
+- TDD: write the failing test, run it, watch it fail for the right reason, then implement. A test that passes the moment you write it is proving nothing.
+- Do not modify `docs/specs/` or `docs/plans/`.
+- Every commit message ends with:
+
+```
+Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CMEdcBvC8yT2U969uKGHoD
+```
+
+- Tests MUST NOT read or write the real `~/.riggs/`. Every test that touches a tier passes an explicit path into a `Dir.mktmpdir`. A test that pollutes the developer's home directory is a defect even when it passes.
+- No credential value is ever written to `~/.riggs/trust.yml`, printed by an approval prompt, or included in a digest input. Only environment variable **names**.
+
+### Two operator decisions this plan has pre-chosen
+
+The spec left both open. The plan picks a default so implementation is not blocked; each is one line to reverse and each is called out at its site.
+
+- **D1 — environment variable names ARE included in the approval digest** (Task 1). Renaming a forwarded variable therefore re-prompts. The alternative lets an approved server be pointed at a new secret with no re-approval, which is the worse failure.
+- **D2 — an untrusted directory runs with the project tier ignored**, printing a notice, rather than refusing to run (Task 2). Safe by construction, and it keeps `riggs --help` and `riggs projects` usable in an unregistered directory.
+
+---
+
+### Task 1: `Riggs::Trust` — the trust and approval registry
+
+**Files:**
+- Create: `lib/riggs/trust.rb`
+- Test: `test/test_trust.rb`
+- Modify: `lib/riggs.rb` (add the require)
+
+**Interfaces:**
+- Consumes: nothing. This task has no dependencies and no callers yet.
+- Produces:
+  - `Trust.new(path: <string>)` — defaults to `~/.riggs/trust.yml`
+  - `#trusted?(project_path) -> Boolean`
+  - `#grant!(project_path) -> String` (the path)
+  - `#forget!(project_path) -> Boolean` (true if an entry was removed)
+  - `#projects -> Array<String>` sorted
+  - `#trusted_at(project_path) -> String | nil`
+  - `#mcp_approved?(project_path, name, digest) -> Boolean`
+  - `#approve_mcp!(project_path, name, digest) -> String` (the digest)
+  - `Trust.digest(command:, args: [], env: {}) -> "sha256:<hex>"`
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `test/test_trust.rb`:
+
+```ruby
+# frozen_string_literal: true
+
+require_relative "test_helper"
+require "tmpdir"
+
+class TestTrust < Minitest::Test
+  def with_trust
+    Dir.mktmpdir do |dir|
+      yield Riggs::Trust.new(path: File.join(dir, "trust.yml")), dir
+    end
+  end
+
+  def test_an_unknown_path_is_not_trusted
+    with_trust { |trust, _| refute trust.trusted?("/Users/matt/Projects/foo") }
+  end
+
+  def test_grant_makes_a_path_trusted_and_records_a_timestamp
+    with_trust do |trust, _|
+      trust.grant!("/Users/matt/Projects/foo")
+      assert trust.trusted?("/Users/matt/Projects/foo")
+      refute_nil trust.trusted_at("/Users/matt/Projects/foo")
+      refute trust.trusted?("/Users/matt/Projects/bar")
+    end
+  end
+
+  def test_grant_is_idempotent_and_does_not_move_the_original_timestamp
+    with_trust do |trust, _|
+      trust.grant!("/p")
+      first = trust.trusted_at("/p")
+      trust.grant!("/p")
+      assert_equal first, trust.trusted_at("/p")
+    end
+  end
+
+  def test_forget_removes_a_path_and_reports_whether_it_did
+    with_trust do |trust, _|
+      trust.grant!("/p")
+      assert trust.forget!("/p")
+      refute trust.trusted?("/p")
+      refute trust.forget!("/p")
+    end
+  end
+
+  def test_projects_lists_granted_paths_sorted
+    with_trust do |trust, _|
+      trust.grant!("/b")
+      trust.grant!("/a")
+      assert_equal ["/a", "/b"], trust.projects
+    end
+  end
+
+  def test_the_file_is_created_private_to_the_owner
+    with_trust do |trust, _|
+      trust.grant!("/p")
+      mode = File.stat(trust.path).mode & 0o777
+      assert_equal 0o600, mode
+    end
+  end
+
+  def test_a_digest_is_stable_across_calls
+    a = Riggs::Trust.digest(command: "npx", args: %w[-y hb-mcp], env: { "HB_TOKEN" => "sk-1" })
+    b = Riggs::Trust.digest(command: "npx", args: %w[-y hb-mcp], env: { "HB_TOKEN" => "sk-2" })
+    assert_equal a, b
+    assert_match(/\Asha256:[0-9a-f]{64}\z/, a)
+  end
+
+  def test_a_digest_changes_when_the_command_or_arguments_change
+    base = Riggs::Trust.digest(command: "npx", args: %w[-y hb-mcp])
+    refute_equal base, Riggs::Trust.digest(command: "node", args: %w[-y hb-mcp])
+    refute_equal base, Riggs::Trust.digest(command: "npx", args: %w[-y evil-mcp])
+    refute_equal base, Riggs::Trust.digest(command: "npx", args: %w[-y hb-mcp --extra])
+  end
+
+  # D1: names are part of the identity of a server, values never are.
+  def test_a_digest_changes_when_a_forwarded_variable_is_renamed
+    a = Riggs::Trust.digest(command: "x", env: { "HB_TOKEN" => "v" })
+    b = Riggs::Trust.digest(command: "x", env: { "OTHER_TOKEN" => "v" })
+    refute_equal a, b
+  end
+
+  def test_a_digest_ignores_the_order_variables_were_declared_in
+    a = Riggs::Trust.digest(command: "x", env: { "A" => "1", "B" => "2" })
+    b = Riggs::Trust.digest(command: "x", env: { "B" => "2", "A" => "1" })
+    assert_equal a, b
+  end
+
+  def test_approval_is_recorded_per_project_and_per_server
+    with_trust do |trust, _|
+      d = Riggs::Trust.digest(command: "npx", args: %w[hb])
+      trust.approve_mcp!("/p", "honeybadger", d)
+      assert trust.mcp_approved?("/p", "honeybadger", d)
+      refute trust.mcp_approved?("/other", "honeybadger", d)
+      refute trust.mcp_approved?("/p", "context7", d)
+    end
+  end
+
+  def test_a_changed_command_is_no_longer_approved
+    with_trust do |trust, _|
+      trust.approve_mcp!("/p", "hb", Riggs::Trust.digest(command: "npx", args: %w[hb]))
+      changed = Riggs::Trust.digest(command: "npx", args: %w[hb --now-with-extras])
+      refute trust.mcp_approved?("/p", "hb", changed)
+    end
+  end
+
+  # The strongest guarantee in this file: assert on the bytes, not the intent.
+  def test_no_environment_variable_value_reaches_the_file
+    with_trust do |trust, _|
+      sentinel = "SENTINEL-b3f1c9d2-do-not-persist"
+      d = Riggs::Trust.digest(command: "npx", args: %w[hb], env: { "HB_TOKEN" => sentinel })
+      trust.approve_mcp!("/p", "hb", d)
+      contents = File.read(trust.path)
+      refute_includes contents, sentinel
+      refute_includes contents, "HB_TOKEN"
+      assert_includes contents, "hb", "the server name itself must still be recorded"
+    end
+  end
+
+  def test_approving_a_server_for_an_ungranted_path_still_records_trust_metadata
+    with_trust do |trust, _|
+      trust.approve_mcp!("/p", "hb", Riggs::Trust.digest(command: "x"))
+      refute_nil trust.trusted_at("/p")
+    end
+  end
+end
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec ruby -Itest test/test_trust.rb`
+Expected: FAIL — `NameError: uninitialized constant Riggs::Trust`
+
+- [ ] **Step 3: Implement `Riggs::Trust`**
+
+Create `lib/riggs/trust.rb`:
+
+```ruby
+# frozen_string_literal: true
+
+require "psych"
+require "fileutils"
+require "digest"
+require "json"
+require "time"
+
+module Riggs
+  # The registry of which absolute paths the operator has trusted, and which
+  # MCP servers they have approved within each. Machine-written: riggs rewrites
+  # it on every approval, which is why it is a separate file from the
+  # hand-authored ~/.riggs/config.yml.
+  #
+  # Nothing secret is ever stored here. Approvals are recorded as a digest of
+  # the command, its arguments, and the NAMES of forwarded environment
+  # variables. Values are never read into the digest and never written.
+  class Trust
+    EMPTY = { "projects" => {} }.freeze
+
+    attr_reader :path
+
+    # Resolved at call time, not as a load-time constant, so a test (and an
+    # operator with more than one riggs install) can point the whole global
+    # tier somewhere else. Same escape hatch CODEX_HOME provides.
+    def self.home
+      ENV["RIGGS_HOME"] || File.join(Dir.home, ".riggs")
+    end
+
+    def self.default_path
+      File.join(home, "trust.yml")
+    end
+
+    def initialize(path: nil)
+      @path = path || self.class.default_path
+    end
+
+    # D1: environment variable NAMES are part of a server's identity, so
+    # renaming one re-prompts. Excluding them would let an approved server be
+    # pointed at a different secret with no re-approval. Values never
+    # participate -- a digest is not a safe place to put one even though it is
+    # one-way, because the rule "no value enters this subsystem" is checkable
+    # and "no value escapes this hash" is not.
+    def self.digest(command:, args: [], env: {})
+      canonical = JSON.generate(
+        "command" => command.to_s,
+        "args" => Array(args).map(&:to_s),
+        "env_keys" => (env || {}).keys.map(&:to_s).sort
+      )
+      "sha256:#{Digest::SHA256.hexdigest(canonical)}"
+    end
+
+    def trusted?(project_path)
+      !entry(project_path).nil?
+    end
+
+    def trusted_at(project_path)
+      entry(project_path)&.fetch("trusted_at", nil)
+    end
+
+    def grant!(project_path)
+      update! do |data|
+        proj = project_entry(data, project_path)
+        proj["trusted_at"] ||= Time.now.utc.iso8601
+      end
+      project_path.to_s
+    end
+
+    def forget!(project_path)
+      data = read
+      removed = (data["projects"] || {}).delete(project_path.to_s)
+      write!(data) unless removed.nil?
+      !removed.nil?
+    end
+
+    def projects
+      (read["projects"] || {}).keys.sort
+    end
+
+    def mcp_approved?(project_path, name, digest)
+      recorded = entry(project_path)&.dig("mcp_approved", name.to_s)
+      !recorded.nil? && recorded == digest
+    end
+
+    def approve_mcp!(project_path, name, digest)
+      update! do |data|
+        proj = project_entry(data, project_path)
+        proj["trusted_at"] ||= Time.now.utc.iso8601
+        (proj["mcp_approved"] ||= {})[name.to_s] = digest
+      end
+      digest
+    end
+
+    private
+
+    def project_entry(data, project_path)
+      (data["projects"] ||= {})[project_path.to_s] ||= {}
+    end
+
+    def entry(project_path)
+      (read["projects"] || {})[project_path.to_s]
+    end
+
+    def update!
+      data = read
+      yield data
+      write!(data)
+    end
+
+    # Neither symbols nor aliases have any business in a machine-written
+    # registry, so this is the strict form rather than the permissive one
+    # Identity uses for hand-authored config.
+    def read
+      return EMPTY.dup unless File.exist?(@path)
+
+      Psych.safe_load(File.read(@path), permitted_classes: [], aliases: false) || EMPTY.dup
+    end
+
+    def write!(data)
+      FileUtils.mkdir_p(File.dirname(@path))
+      File.write(@path, Psych.dump(data))
+      File.chmod(0o600, @path)
+      @path
+    end
+  end
+end
+```
+
+Add to `lib/riggs.rb` alongside the other requires:
+
+```ruby
+require_relative "riggs/trust"
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec ruby -Itest test/test_trust.rb`
+Expected: PASS, 14 runs, 0 failures.
+
+- [ ] **Step 5: Mutation-verify the two security claims**
+
+These two tests are the reason this class exists. Prove each one can fail.
+
+1. Change `"env_keys" => (env || {}).keys.map(&:to_s).sort` to include values
+   (`env.to_a.flatten`). Run the file. `test_no_environment_variable_value_reaches_the_file`
+   must still pass (the digest is one-way) but `test_a_digest_is_stable_across_calls`
+   MUST fail. Revert.
+2. Delete the `File.chmod(0o600, @path)` line. `test_the_file_is_created_private_to_the_owner`
+   MUST fail. Revert.
+
+Paste both failure outputs into your report. If either passes, the test is not testing what it claims.
+
+- [ ] **Step 6: Run the full gate and commit**
+
+```bash
+PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec rubocop
+PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec rake test
+git add lib/riggs/trust.rb lib/riggs.rb test/test_trust.rb
+git commit -m "Add Riggs::Trust registry for project trust and MCP approval"
+```
+
+---
+
+### Task 2: `Riggs::Config::Resolver` — tier paths and the trust gate
+
+**Files:**
+- Create: `lib/riggs/config/resolver.rb`
+- Test: `test/test_config_resolver.rb`
+- Modify: `lib/riggs.rb`
+
+**Interfaces:**
+- Consumes: `Riggs::Trust` from Task 1.
+- Produces:
+  - `Resolver.project_path(cwd = Dir.pwd) -> String` — git toplevel, else expanded cwd. Memoized per cwd.
+  - `Resolver.reset_cache!` — test hook.
+  - `Resolver.new(cwd:, trust:, global_config:) #resolve -> Resolver::Result`
+  - `Result` members: `global`, `project`, `project_path`, `project_config_path`, `trusted`, `legacy`
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `test/test_config_resolver.rb`:
+
+```ruby
+# frozen_string_literal: true
+
+require_relative "test_helper"
+require "tmpdir"
+require "fileutils"
+
+class TestConfigResolver < Minitest::Test
+  def setup
+    Riggs::Config::Resolver.reset_cache!
+  end
+
+  def teardown
+    Riggs::Config::Resolver.reset_cache!
+  end
+
+  def in_sandbox
+    Dir.mktmpdir do |dir|
+      root = File.realpath(dir)
+      trust = Riggs::Trust.new(path: File.join(root, "trust.yml"))
+      global = File.join(root, "global.yml")
+      File.write(global, Psych.dump("users" => { "matt" => { "role" => "pm" } }))
+      yield(root, trust, global)
+    end
+  end
+
+  def write_project(root, hash)
+    FileUtils.mkdir_p(File.join(root, ".riggs"))
+    File.write(File.join(root, ".riggs", "config.yml"), Psych.dump(hash))
+  end
+
+  def resolve(root, trust, global, cwd: root)
+    Riggs::Config::Resolver.new(cwd: cwd, trust: trust, global_config: global).resolve
+  end
+
+  def test_the_global_tier_loads_without_any_project_file
+    in_sandbox do |root, trust, global|
+      result = resolve(root, trust, global)
+      assert_equal({ users: { matt: { role: "pm" } } }, result.global)
+      assert_empty result.project
+    end
+  end
+
+  def test_an_untrusted_project_file_is_not_read
+    in_sandbox do |root, trust, global|
+      write_project(root, "users" => { "evil" => { "role" => "pm" } })
+      result = resolve(root, trust, global)
+      refute result.trusted
+      assert_empty result.project
+    end
+  end
+
+  def test_a_trusted_project_file_is_read
+    in_sandbox do |root, trust, global|
+      write_project(root, "users" => { "sam" => { "role" => "viewer" } })
+      trust.grant!(root)
+      result = resolve(root, trust, global)
+      assert result.trusted
+      assert_equal({ sam: { role: "viewer" } }, result.project[:users])
+    end
+  end
+
+  def test_a_legacy_agent_hubrc_is_read_as_the_project_tier_when_trusted
+    in_sandbox do |root, trust, global|
+      File.write(File.join(root, ".agent_hubrc"), Psych.dump("default_user" => "sam"))
+      trust.grant!(root)
+      result = resolve(root, trust, global)
+      assert result.legacy
+      assert_equal "sam", result.project[:default_user]
+    end
+  end
+
+  def test_the_modern_project_file_wins_over_a_legacy_one
+    in_sandbox do |root, trust, global|
+      write_project(root, "default_user" => "modern")
+      File.write(File.join(root, ".agent_hubrc"), Psych.dump("default_user" => "legacy"))
+      trust.grant!(root)
+      result = resolve(root, trust, global)
+      refute result.legacy
+      assert_equal "modern", result.project[:default_user]
+    end
+  end
+
+  # R11.1: the project file is read from project_path, not from cwd. Inside a
+  # repository that makes a subdirectory resolve its parent's config -- which
+  # is the whole reason project_path is the git toplevel.
+  def test_a_subdirectory_of_a_repository_reads_the_repository_project_file
+    in_sandbox do |root, trust, global|
+      system("git", "init", "--quiet", root, out: File::NULL, err: File::NULL)
+      write_project(root, "default_user" => "sam")
+      trust.grant!(root)
+      sub = File.join(root, "lib", "deep")
+      FileUtils.mkdir_p(sub)
+      result = Riggs::Config::Resolver.new(cwd: sub, trust: trust, global_config: global).resolve
+      assert_equal root, result.project_path
+      assert_equal "sam", result.project[:default_user]
+    end
+  end
+
+  # Outside a repository the same containment rule must hold, so the walk up
+  # adopts the nearest ancestor carrying a .riggs/config.yml.
+  def test_outside_a_repository_a_subdirectory_adopts_a_marked_ancestor
+    in_sandbox do |root, trust, global|
+      write_project(root, "default_user" => "sam")
+      trust.grant!(root)
+      sub = File.join(root, "plain", "deep")
+      FileUtils.mkdir_p(sub)
+      result = Riggs::Config::Resolver.new(cwd: sub, trust: trust, global_config: global).resolve
+      assert_equal root, result.project_path
+      assert_equal "sam", result.project[:default_user]
+    end
+  end
+
+  def test_an_unmarked_directory_outside_a_repository_is_its_own_project
+    in_sandbox do |root, trust, global|
+      sub = File.join(root, "plain", "deep")
+      FileUtils.mkdir_p(sub)
+      result = Riggs::Config::Resolver.new(cwd: sub, trust: trust, global_config: global).resolve
+      assert_equal sub, result.project_path
+      refute result.trusted
+    end
+  end
+
+  # The walk must stop before $HOME, or ~/.riggs/config.yml -- the GLOBAL
+  # tier -- would mark $HOME as every directory's project root.
+  def test_the_ancestor_walk_never_adopts_home
+    in_sandbox do |root, _trust, _global|
+      FileUtils.mkdir_p(File.join(root, ".riggs"))
+      File.write(File.join(root, ".riggs", "config.yml"), Psych.dump({}))
+      sub = File.join(root, "anything", "deep")
+      FileUtils.mkdir_p(sub)
+      assert_equal sub, Riggs::Config::Resolver.send(:marked_ancestor, sub, home: root) || sub
+    end
+  end
+
+  def test_project_path_is_the_git_toplevel_when_inside_a_working_tree
+    in_sandbox do |root, _trust, _global|
+      system("git", "init", "--quiet", root, out: File::NULL, err: File::NULL)
+      sub = File.join(root, "lib", "deep")
+      FileUtils.mkdir_p(sub)
+      assert_equal root, Riggs::Config::Resolver.project_path(sub)
+    end
+  end
+
+  def test_project_path_falls_back_to_the_directory_outside_a_repository
+    in_sandbox do |root, _trust, _global|
+      assert_equal root, Riggs::Config::Resolver.project_path(root)
+    end
+  end
+
+  # R11.1: <project>/.riggs/config.yml and ~/.riggs/config.yml are the same
+  # file when the project is $HOME, and reading one file as both tiers makes
+  # every redefinition check fire against itself.
+  def test_home_is_never_a_project
+    in_sandbox do |root, trust, _global|
+      global = File.join(root, ".riggs", "config.yml")
+      FileUtils.mkdir_p(File.dirname(global))
+      File.write(global, Psych.dump("users" => { "matt" => { "role" => "pm" } }))
+      trust.grant!(root)
+      result = Riggs::Config::Resolver.new(
+        cwd: root, trust: trust, global_config: global, home: root
+      ).resolve
+      assert_nil result.project_config_path
+      assert_empty result.project
+      assert_equal({ matt: { role: "pm" } }, result.global[:users])
+    end
+  end
+
+  def test_a_missing_global_config_resolves_to_an_empty_tier_rather_than_raising
+    in_sandbox do |root, trust, _global|
+      result = resolve(root, trust, File.join(root, "absent.yml"))
+      assert_empty result.global
+    end
+  end
+end
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec ruby -Itest test/test_config_resolver.rb`
+Expected: FAIL — `NameError: uninitialized constant Riggs::Config`
+
+- [ ] **Step 3: Implement the resolver**
+
+Create `lib/riggs/config/resolver.rb`:
+
+```ruby
+# frozen_string_literal: true
+
+require "psych"
+require "open3"
+require_relative "../trust"
+
+module Riggs
+  module Config
+    # Finds the two configuration tiers and decides whether the project one may
+    # be read at all. It does not merge them -- Config::Merge does that -- so
+    # that "which files exist and may we look at them" stays separable from
+    # "what do they mean together".
+    class Resolver
+      PROJECT_CONFIG = File.join(".riggs", "config.yml")
+
+      # Read as the project tier with a deprecation notice. 46 references
+      # across nine non-doc files; removing it is not this phase.
+      LEGACY_PROJECT_CONFIGS = [".agent_hubrc", File.join("config", ".agent_hubrc"),
+                                File.join("config", "agent_hubrc")].freeze
+
+      Result = Struct.new(:global, :project, :project_path, :project_config_path,
+                          :trusted, :legacy, keyword_init: true)
+
+      class << self
+        # Both resolved at call time, honouring RIGGS_HOME, so tests and CLI
+        # runs can target a temporary global tier instead of the developer's
+        # own. A load-time constant off Dir.home cannot be overridden and
+        # makes every CLI-level test write to the real ~/.riggs.
+        def riggs_home
+          Trust.home
+        end
+
+        def global_config
+          File.join(riggs_home, "config.yml")
+        end
+
+        # Git toplevel, so that trust, cost and memory are repository-scoped:
+        # ~/Projects/riggs and ~/Projects/agentcrm are different projects, and
+        # ~/Projects/agentcrm/lib is part of agentcrm. Keying on the working
+        # directory would make a run from <repo>/lib a different project than
+        # one from <repo> -- separate trust prompt, separate memory, separate
+        # cost bucket.
+        #
+        # Outside a repository the same rule has to hold, so a directory with
+        # no git toplevel walks up looking for a .riggs/config.yml and adopts
+        # that ancestor. The walk stops BEFORE $HOME: ~/.riggs/config.yml is
+        # the global tier, and treating it as a project marker would make
+        # every directory under $HOME resolve to $HOME -- one project for the
+        # whole machine, which is the $HOME collision wearing a different hat.
+        def project_path(cwd = Dir.pwd)
+          key = File.expand_path(cwd)
+          cache.fetch(key) { cache[key] = git_toplevel(key) || marked_ancestor(key) || key }
+        end
+
+        def reset_cache!
+          @cache = {}
+        end
+
+        private
+
+        def cache
+          @cache ||= {}
+        end
+
+        def git_toplevel(cwd)
+          out, _err, status = Open3.capture3("git", "-C", cwd, "rev-parse", "--show-toplevel")
+          return nil unless status.success?
+
+          path = out.strip
+          path.empty? ? nil : File.expand_path(path)
+        rescue StandardError
+          nil
+        end
+
+        def marked_ancestor(cwd, home: Dir.home)
+          stop = File.expand_path(home)
+          dir = cwd
+          while dir != stop && dir != "/" && File.dirname(dir) != dir
+            return dir if File.exist?(File.join(dir, PROJECT_CONFIG))
+
+            dir = File.dirname(dir)
+          end
+          nil
+        end
+      end
+
+      def initialize(cwd: Dir.pwd, trust: nil, global_config: nil, home: Dir.home)
+        @cwd = cwd
+        @trust = trust || Trust.new
+        @global_config = global_config || self.class.global_config
+        @home = home
+      end
+
+      def resolve
+        pp = self.class.project_path(@cwd)
+        global = load_yaml(@global_config)
+        return home_result(global, pp) if home?(pp)
+
+        path, legacy = project_config_for(pp)
+        trusted = @trust.trusted?(pp)
+        Result.new(
+          global: global,
+          project: trusted && path ? load_yaml(path) : {},
+          project_path: pp,
+          project_config_path: path,
+          trusted: trusted,
+          legacy: legacy
+        )
+      end
+
+      private
+
+      # R11.1: <project>/.riggs/config.yml IS ~/.riggs/config.yml when the
+      # project is $HOME. There is no project tier there.
+      def home?(project_path)
+        File.expand_path(project_path) == File.expand_path(@home)
+      end
+
+      def home_result(global, project_path)
+        Result.new(global: global, project: {}, project_path: project_path,
+                   project_config_path: nil, trusted: @trust.trusted?(project_path), legacy: false)
+      end
+
+      def project_config_for(project_path)
+        modern = File.join(project_path, PROJECT_CONFIG)
+        return [modern, false] if File.exist?(modern)
+
+        legacy = LEGACY_PROJECT_CONFIGS.map { |c| File.join(project_path, c) }.find { |p| File.exist?(p) }
+        legacy ? [legacy, true] : [nil, false]
+      end
+
+      def load_yaml(path)
+        return {} unless path && File.exist?(path)
+
+        raw = Psych.safe_load(File.read(path), permitted_classes: [Symbol], aliases: true) || {}
+        Identity.deep_symbolize(raw)
+      end
+    end
+  end
+end
+```
+
+Add to `lib/riggs.rb`:
+
+```ruby
+require_relative "riggs/config/resolver"
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec ruby -Itest test/test_config_resolver.rb`
+Expected: PASS, 10 runs, 0 failures.
+
+- [ ] **Step 5: Mutation-verify the trust gate**
+
+Change `trusted && path ? load_yaml(path) : {}` to `path ? load_yaml(path) : {}`.
+`test_an_untrusted_project_file_is_not_read` MUST fail. Revert and paste the output.
+
+This is the single most important line in the phase. If deleting the gate does not fail a test, the gate is decorative.
+
+- [ ] **Step 6: Run the full gate and commit**
+
+```bash
+PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec rubocop
+PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec rake test
+git add lib/riggs/config/resolver.rb lib/riggs.rb test/test_config_resolver.rb
+git commit -m "Add Config::Resolver with git-scoped project paths and the trust gate"
+```
+
+---
+
+### Task 3: `Riggs::Config::Merge` — the three merge algebras
+
+**Files:**
+- Create: `lib/riggs/config/merge.rb`
+- Test: `test/test_config_merge.rb`
+- Modify: `lib/riggs.rb`
+
+**Interfaces:**
+- Consumes: `Identity.deep_symbolize`, `Identity::DEFAULT_ROLES`.
+- Produces:
+  - `Merge.call(global:, project:, global_path:, project_path:) -> Merge::Merged`
+  - `Merged` members: `config` (the merged hash), `provenance` (a hash of `{users:, roles:, providers:, mcp_servers:, default_user:}` mapping each name to `:global` or `:project`)
+
+Provenance exists because Task 6 must gate **project-declared** MCP servers only, and Task 8 must print which tier chose the identity. Recomputing that at either call site would mean two places deciding what "came from the project" means.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `test/test_config_merge.rb`:
+
+```ruby
+# frozen_string_literal: true
+
+require_relative "test_helper"
+
+class TestConfigMerge < Minitest::Test
+  G = "/home/me/.riggs/config.yml"
+  P = "/repo/.riggs/config.yml"
+
+  def merge(global, project)
+    Riggs::Config::Merge.call(global: global, project: project, global_path: G, project_path: P)
+  end
+
+  def test_an_empty_project_tier_returns_the_global_tier
+    result = merge({ users: { matt: { role: "pm" } } }, {})
+    assert_equal({ matt: { role: "pm" } }, result.config[:users])
+  end
+
+  # --- global only ---
+
+  def test_sqlite_path_in_the_project_tier_is_a_hard_error_naming_both_files
+    err = assert_raises(Riggs::Error) { merge({}, { sqlite_path: "/tmp/x.sqlite3" }) }
+    assert_includes err.message, "sqlite_path"
+    assert_includes err.message, G
+    assert_includes err.message, P
+  end
+
+  # --- roles: add yes, redefine no ---
+
+  def test_a_project_may_define_a_role_the_global_tier_does_not
+    result = merge({ roles: { pm: %w[publish] } }, { roles: { client_reviewer: %w[inspect_run] } })
+    assert_equal %w[publish], result.config[:roles][:pm]
+    assert_equal %w[inspect_run], result.config[:roles][:client_reviewer]
+    assert_equal :project, result.provenance[:roles][:client_reviewer]
+    assert_equal :global, result.provenance[:roles][:pm]
+  end
+
+  def test_a_project_redefining_a_global_role_is_a_hard_error
+    err = assert_raises(Riggs::Error) do
+      merge({ roles: { engineer: %w[run_workflow] } }, { roles: { engineer: %w[manage_mcp] } })
+    end
+    assert_includes err.message, "engineer"
+    assert_includes err.message, G
+    assert_includes err.message, P
+  end
+
+  # --- users: merge by key, override allowed ---
+
+  def test_a_project_may_add_users_and_override_an_existing_role
+    result = merge(
+      { roles: { pm: [], engineer: [] }, users: { matt: { role: "pm" } } },
+      { users: { matt: { role: "engineer" }, sam: { role: "pm" } } }
+    )
+    assert_equal "engineer", result.config[:users][:matt][:role]
+    assert_equal "pm", result.config[:users][:sam][:role]
+    assert_equal :project, result.provenance[:users][:matt]
+    assert_equal :project, result.provenance[:users][:sam]
+  end
+
+  def test_a_user_naming_an_undefined_role_is_a_hard_error_listing_the_defined_ones
+    err = assert_raises(Riggs::Error) do
+      merge({ roles: { pm: [] } }, { users: { kim: { role: "client_reviewer" } } })
+    end
+    assert_includes err.message, "kim"
+    assert_includes err.message, "client_reviewer"
+    assert_includes err.message, "pm"
+  end
+
+  def test_a_user_may_name_a_built_in_role_that_no_config_defines
+    result = merge({}, { users: { sam: { role: "viewer" } } })
+    assert_equal "viewer", result.config[:users][:sam][:role]
+  end
+
+  def test_default_user_from_the_project_must_resolve_in_the_merged_user_set
+    ok = merge({ users: { matt: { role: "pm" } } }, { default_user: "matt" })
+    assert_equal "matt", ok.config[:default_user]
+    assert_equal :project, ok.provenance[:default_user]
+
+    err = assert_raises(Riggs::Error) { merge({ users: { matt: { role: "pm" } } }, { default_user: "ghost" }) }
+    assert_includes err.message, "ghost"
+  end
+
+  # --- providers: override only, no credentials ---
+
+  def test_a_project_may_override_fields_on_a_globally_defined_provider
+    result = merge(
+      { providers: { ollama: { type: "ollama", base_url: "http://a" } } },
+      { providers: { ollama: { model: "llama3.2" } } }
+    )
+    assert_equal "ollama", result.config[:providers][:ollama][:type]
+    assert_equal "http://a", result.config[:providers][:ollama][:base_url]
+    assert_equal "llama3.2", result.config[:providers][:ollama][:model]
+  end
+
+  def test_a_project_naming_an_undefined_provider_is_a_hard_error_listing_the_defined_ones
+    err = assert_raises(Riggs::Error) do
+      merge({ providers: { mock: { type: "mock" } } }, { providers: { sneaky: { type: "anthropic" } } })
+    end
+    assert_includes err.message, "sneaky"
+    assert_includes err.message, "mock"
+  end
+
+  def test_api_key_in_the_project_tier_is_a_hard_error
+    err = assert_raises(Riggs::Error) do
+      merge({ providers: { claude: { type: "anthropic" } } },
+            { providers: { claude: { api_key: "sk-live-abc" } } })
+    end
+    assert_includes err.message, "api_key"
+    assert_includes err.message, "claude"
+    refute_includes err.message, "sk-live-abc"
+  end
+
+  # --- mcp_servers: merge, with provenance ---
+
+  def test_a_project_may_add_mcp_servers_without_removing_global_ones
+    result = merge(
+      { mcp_servers: { context7: { command: "npx" }, honeybadger: { command: "npx" } } },
+      { mcp_servers: { projectonly: { command: "./bin/mcp" } } }
+    )
+    assert_equal %i[context7 honeybadger projectonly].sort, result.config[:mcp_servers].keys.sort
+    assert_equal :project, result.provenance[:mcp_servers][:projectonly]
+    assert_equal :global, result.provenance[:mcp_servers][:context7]
+  end
+
+  def test_a_project_overriding_a_global_mcp_server_is_marked_project_provenance
+    result = merge({ mcp_servers: { hb: { command: "npx" } } },
+                   { mcp_servers: { hb: { command: "./evil" } } })
+    assert_equal "./evil", result.config[:mcp_servers][:hb][:command]
+    assert_equal :project, result.provenance[:mcp_servers][:hb]
+  end
+end
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec ruby -Itest test/test_config_merge.rb`
+Expected: FAIL — `NameError: uninitialized constant Riggs::Config::Merge`
+
+- [ ] **Step 3: Implement the merge**
+
+Create `lib/riggs/config/merge.rb`:
+
+```ruby
+# frozen_string_literal: true
+
+module Riggs
+  module Config
+    # Three merge algebras, deliberately not one. A lost provider is a billing
+    # surprise, a lost MCP server is a missing tool, and a lost skill is a
+    # silent capability change, so replace-or-error, merge-by-key and
+    # merge-with-gate cannot share an implementation.
+    module Merge
+      GLOBAL_ONLY = %i[sqlite_path].freeze
+      PROVIDER_FORBIDDEN = %i[api_key].freeze
+      TIERED_KEYS = %i[roles users providers mcp_servers].freeze
+
+      Merged = Struct.new(:config, :provenance, keyword_init: true)
+
+      class << self
+        def call(global:, project:, global_path:, project_path:)
+          g = Identity.deep_symbolize(global || {})
+          pr = Identity.deep_symbolize(project || {})
+          return Merged.new(config: g, provenance: all_global(g)) if pr.empty?
+
+          reject_global_only!(pr, global_path, project_path)
+
+          config = g.merge(pr.reject { |k, _| TIERED_KEYS.include?(k) })
+          prov = {}
+          config[:roles], prov[:roles] = merge_roles(g[:roles], pr[:roles], global_path, project_path)
+          config[:users], prov[:users] = merge_by_key(g[:users], pr[:users])
+          config[:providers], prov[:providers] = merge_providers(g[:providers], pr[:providers], project_path)
+          config[:mcp_servers], prov[:mcp_servers] = merge_by_key(g[:mcp_servers], pr[:mcp_servers])
+          prov[:default_user] = pr.key?(:default_user) ? :project : :global
+
+          validate_user_roles!(config, project_path)
+          validate_default_user!(config, project_path)
+          Merged.new(config: config, provenance: prov)
+        end
+
+        private
+
+        def all_global(config)
+          {
+            roles: tier_map(config[:roles], :global), users: tier_map(config[:users], :global),
+            providers: tier_map(config[:providers], :global),
+            mcp_servers: tier_map(config[:mcp_servers], :global), default_user: :global
+          }
+        end
+
+        def tier_map(hash, tier)
+          (hash || {}).keys.to_h { |k| [k, tier] }
+        end
+
+        def reject_global_only!(project, global_path, project_path)
+          GLOBAL_ONLY.each do |key|
+            next unless project.key?(key)
+
+            raise Error, "'#{key}' may only be set in #{global_path}; remove it from #{project_path}"
+          end
+        end
+
+        # Assignment is local, definition is global. A project may name a role
+        # the global tier has never heard of; it may not change what a global
+        # word means, so that 'engineer' reads the same in every repo.
+        def merge_roles(global, project, global_path, project_path)
+          g = global || {}
+          pr = project || {}
+          clash = pr.keys & g.keys
+          unless clash.empty?
+            raise Error, "role '#{clash.first}' is defined in #{global_path} and cannot be " \
+                         "redefined by #{project_path}"
+          end
+
+          [g.merge(pr), tier_map(g, :global).merge(tier_map(pr, :project))]
+        end
+
+        def merge_by_key(global, project)
+          g = global || {}
+          pr = project || {}
+          merged = g.merge(pr) { |_k, gv, pv| gv.is_a?(Hash) && pv.is_a?(Hash) ? gv.merge(pv) : pv }
+          [merged, tier_map(g, :global).merge(tier_map(pr, :project))]
+        end
+
+        # A repo must not carry secrets, and it must not be able to introduce a
+        # provider riggs would otherwise not dispatch. It may retune one.
+        def merge_providers(global, project, project_path)
+          g = global || {}
+          pr = project || {}
+          unknown = pr.keys - g.keys
+          unless unknown.empty?
+            raise Error, "#{project_path} configures provider '#{unknown.first}' which is not defined " \
+                         "globally (defined: #{g.keys.map(&:to_s).sort.join(', ')})"
+          end
+
+          pr.each do |name, opts|
+            forbidden = PROVIDER_FORBIDDEN & (opts.is_a?(Hash) ? opts.keys : [])
+            next if forbidden.empty?
+
+            raise Error, "provider '#{name}': '#{forbidden.first}' may not be set in #{project_path}; " \
+                         "credentials come from the environment"
+          end
+
+          merge_by_key(g, pr)
+        end
+
+        def known_roles(config)
+          (config[:roles] || {}).keys.map(&:to_s) | Identity::DEFAULT_ROLES.keys.map(&:to_s)
+        end
+
+        def validate_user_roles!(config, project_path)
+          known = known_roles(config)
+          (config[:users] || {}).each do |name, cfg|
+            role = (cfg.is_a?(Hash) ? cfg[:role] : nil).to_s
+            next if role.empty? || known.include?(role)
+
+            raise Error, "#{project_path}: user '#{name}' names role '#{role}' which is not defined " \
+                         "(defined: #{known.sort.join(', ')})"
+          end
+        end
+
+        def validate_default_user!(config, project_path)
+          name = config[:default_user].to_s
+          return if name.empty?
+          return if (config[:users] || {}).key?(name.to_sym)
+
+          raise Error, "#{project_path}: default_user '#{name}' is not defined in either tier"
+        end
+      end
+    end
+  end
+end
+```
+
+Add to `lib/riggs.rb`:
+
+```ruby
+require_relative "riggs/config/merge"
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec ruby -Itest test/test_config_merge.rb`
+Expected: PASS, 14 runs, 0 failures.
+
+- [ ] **Step 5: Mutation-verify the three hard errors**
+
+For each, make the change, run the file, confirm the named test fails, revert, and paste the output:
+
+1. Delete the `raise` in `merge_roles` (return `g.merge(pr)` unconditionally) →
+   `test_a_project_redefining_a_global_role_is_a_hard_error` must fail.
+2. Delete the `unknown.empty?` guard in `merge_providers` →
+   `test_a_project_naming_an_undefined_provider_is_a_hard_error_listing_the_defined_ones` must fail.
+3. Delete the `PROVIDER_FORBIDDEN` loop →
+   `test_api_key_in_the_project_tier_is_a_hard_error` must fail.
+
+- [ ] **Step 6: Run the full gate and commit**
+
+```bash
+PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec rubocop
+PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec rake test
+git add lib/riggs/config/merge.rb lib/riggs.rb test/test_config_merge.rb
+git commit -m "Add Config::Merge with per-key tier algebras and provenance"
+```
+
+---
+
+### Task 4: Wire `Identity` to the tiers
+
+**Files:**
+- Modify: `lib/riggs/identity.rb`
+- Test: `test/test_identity_tiers.rb` (create)
+
+**Interfaces:**
+- Consumes: `Config::Resolver` (Task 2), `Config::Merge` (Task 3).
+- Produces:
+  - `Identity.resolved(cwd:, trust:, global_config:) -> Config::Merge::Merged` extended with `project_path`, `trusted`, `legacy`, `project_config_path`
+  - `Identity.load_config(path = nil) -> Hash` — unchanged signature and return type
+  - `Identity.config_path -> String | nil` — now the project config path, or the global one when there is no project tier
+
+`load_config` is the choke point. Eleven production call sites (`web/app.rb:33,96`, `engine.rb:17`, `config_store.rb:21`, and eight in `cli/commands.rb` via the private `load_config` helper) and every `hub_config:` in the test suite go through it. Keeping its contract is what lets this task be small.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `test/test_identity_tiers.rb`:
+
+```ruby
+# frozen_string_literal: true
+
+require_relative "test_helper"
+require "tmpdir"
+require "fileutils"
+
+class TestIdentityTiers < Minitest::Test
+  def setup
+    Riggs::Config::Resolver.reset_cache!
+  end
+
+  def teardown
+    Riggs::Config::Resolver.reset_cache!
+  end
+
+  def sandbox
+    Dir.mktmpdir do |dir|
+      root = File.realpath(dir)
+      trust = Riggs::Trust.new(path: File.join(root, "trust.yml"))
+      global = File.join(root, "global.yml")
+      File.write(global, Psych.dump(
+                           "default_user" => "matt",
+                           "roles" => { "pm" => %w[publish read_workflow] },
+                           "users" => { "matt" => { "role" => "pm" } },
+                           "providers" => { "mock" => { "type" => "mock" } }
+                         ))
+      yield(root, trust, global)
+    end
+  end
+
+  def resolved(root, trust, global)
+    Riggs::Identity.resolved(cwd: root, trust: trust, global_config: global)
+  end
+
+  def write_project(root, hash)
+    FileUtils.mkdir_p(File.join(root, ".riggs"))
+    File.write(File.join(root, ".riggs", "config.yml"), Psych.dump(hash))
+  end
+
+  def test_the_merged_config_is_the_global_tier_when_no_project_file_exists
+    sandbox do |root, trust, global|
+      r = resolved(root, trust, global)
+      assert_equal "matt", r.config[:default_user]
+      assert_equal root, r.project_path
+    end
+  end
+
+  def test_a_trusted_project_tier_merges_and_carries_provenance
+    sandbox do |root, trust, global|
+      write_project(root, "default_user" => "sam", "users" => { "sam" => { "role" => "pm" } })
+      trust.grant!(root)
+      r = resolved(root, trust, global)
+      assert_equal "sam", r.config[:default_user]
+      assert_equal :project, r.provenance[:default_user]
+      assert_equal :global, r.provenance[:users][:matt]
+      assert_equal :project, r.provenance[:users][:sam]
+    end
+  end
+
+  def test_an_untrusted_project_tier_contributes_nothing
+    sandbox do |root, trust, global|
+      write_project(root, "default_user" => "sam", "users" => { "sam" => { "role" => "pm" } })
+      r = resolved(root, trust, global)
+      assert_equal "matt", r.config[:default_user]
+      refute r.trusted
+    end
+  end
+
+  def test_identity_resolve_reads_a_project_added_user_after_trust
+    sandbox do |root, trust, global|
+      write_project(root, "users" => { "sam" => { "role" => "pm", "name" => "Sam" } })
+      trust.grant!(root)
+      cfg = resolved(root, trust, global).config
+      identity = Riggs::Identity.resolve(cli_user: "sam", config: cfg)
+      assert_equal "Sam", identity[:name]
+      assert_includes identity[:permissions], "publish"
+    end
+  end
+
+  def test_load_config_still_returns_a_plain_symbolized_hash
+    sandbox do |root, trust, global|
+      cfg = Riggs::Identity.load_config(nil, cwd: root, trust: trust, global_config: global)
+      assert_kind_of Hash, cfg
+      assert_equal "matt", cfg[:default_user]
+    end
+  end
+
+  def test_load_config_with_an_explicit_path_still_reads_only_that_file
+    sandbox do |root, _trust, _global|
+      path = File.join(root, "standalone.yml")
+      File.write(path, Psych.dump("default_user" => "solo", "users" => { "solo" => { "role" => "viewer" } }))
+      cfg = Riggs::Identity.load_config(path)
+      assert_equal "solo", cfg[:default_user]
+    end
+  end
+end
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec ruby -Itest test/test_identity_tiers.rb`
+Expected: FAIL — `NoMethodError: undefined method 'resolved' for Riggs::Identity`
+
+- [ ] **Step 3: Implement**
+
+In `lib/riggs/identity.rb`, replace `CONFIG_CANDIDATES`, `config_path` and `load_config` with:
+
+```ruby
+    # Kept so an explicit path still reads exactly one file, which is what
+    # ConfigStore and `load_config(path)` callers rely on.
+    CONFIG_CANDIDATES = [".agent_hubrc", "./config/.agent_hubrc", "./config/agent_hubrc"].freeze
+
+    Resolved = Struct.new(:config, :provenance, :project_path, :project_config_path,
+                          :trusted, :legacy, keyword_init: true)
+
+    def self.resolved(cwd: Dir.pwd, trust: nil, global_config: nil)
+      r = Config::Resolver.new(cwd: cwd, trust: trust, global_config: global_config).resolve
+      merged = Config::Merge.call(
+        global: r.global, project: r.project,
+        global_path: global_config, project_path: r.project_config_path || r.project_path
+      )
+      Resolved.new(
+        config: merged.config, provenance: merged.provenance, project_path: r.project_path,
+        project_config_path: r.project_config_path, trusted: r.trusted, legacy: r.legacy
+      )
+    end
+
+    # The path a human should edit for project-scoped settings. nil when there
+    # is no project tier at all ($HOME, or an untrusted path).
+    def self.config_path(cwd: Dir.pwd, trust: nil, global_config: nil)
+      r = Config::Resolver.new(cwd: cwd, trust: trust, global_config: global_config).resolve
+      r.project_config_path || (File.exist?(global_config) ? global_config : nil)
+    end
+
+    # Unchanged contract: a symbolized hash. With no explicit path it is now
+    # the merged two-tier result, which is why the eleven production call
+    # sites and every hub_config: in the suite need no change.
+    def self.load_config(path = nil, cwd: Dir.pwd, trust: nil,
+                         global_config: nil)
+      return load_file!(path) if path
+
+      result = resolved(cwd: cwd, trust: trust, global_config: global_config)
+      if result.config.empty?
+        raise Error, "No riggs configuration found. Run 'riggs setup' to create ~/.riggs/config.yml."
+      end
+
+      result.config
+    end
+
+    def self.load_file!(path)
+      raise Error, "Missing config at #{path}. Run 'riggs setup' first." unless File.exist?(path)
+
+      raw = Psych.safe_load(File.read(path), permitted_classes: [Symbol], aliases: true) || {}
+      deep_symbolize(raw)
+    end
+```
+
+Add `require_relative "config/resolver"` and `require_relative "config/merge"` at the top of `identity.rb`.
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec ruby -Itest test/test_identity_tiers.rb`
+Expected: PASS, 6 runs.
+
+- [ ] **Step 5: Run the FULL suite and fix the fallout**
+
+Run: `PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec rake test`
+
+The existing suite has an `.agent_hubrc` in the repo root and calls `Identity.load_config` with no arguments in a dozen places. Those now resolve through the tiers, and the repo path is not trusted in a fresh test run, so the project tier will be skipped.
+
+Fix this in `test/test_helper.rb`, not in the tests: point the suite at a fixture global config and grant trust for the repo path in setup, so that `load_config` returns what it always did. **Do not** weaken the trust gate to make tests pass. If you find yourself editing `Config::Resolver` to get the suite green, stop and report — that is the gate defending itself.
+
+Expected: 382+ runs, 0 failures.
+
+- [ ] **Step 6: Run the full gate and commit**
+
+```bash
+PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec rubocop
+PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec rake test
+git add lib/riggs/identity.rb test/test_identity_tiers.rb test/test_helper.rb
+git commit -m "Resolve Identity config through the two tiers"
+```
+
+---
+
+### Task 5: Global skill and workflow roots
+
+**Files:**
+- Modify: `lib/riggs/skills/registry.rb:252-257`
+- Modify: `lib/riggs/triggers.rb:23,32`
+- Test: `test/test_tier_roots.rb` (create)
+
+**Interfaces:**
+- Consumes: `Config::Resolver.project_path`.
+- Produces:
+  - `SkillRegistry#default_roots` gains `~/.riggs/skills` in the middle.
+  - `Triggers.find_workflows(text:, roots: nil)` and `Triggers.list_declared(roots: nil)` take an ordered list. The `dir:` keyword is kept as a single-root alias so existing callers and tests keep working.
+  - Each entry `list_declared` returns gains a `:tier` key — `:project`, `:global`, or `:bundled`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `test/test_tier_roots.rb`:
+
+```ruby
+# frozen_string_literal: true
+
+require_relative "test_helper"
+require "tmpdir"
+require "fileutils"
+
+class TestTierRoots < Minitest::Test
+  def workflow_yaml(name)
+    Psych.dump(
+      "name" => name, "display_name" => name,
+      "triggers" => [{ "type" => "keyword", "keywords" => ["shipit"] }],
+      "steps" => [{ "id" => "a", "kind" => "prompt", "prompt" => "hi" }]
+    )
+  end
+
+  def test_a_project_workflow_shadows_a_global_one_of_the_same_name
+    Dir.mktmpdir do |dir|
+      project = File.join(dir, "project")
+      global = File.join(dir, "global")
+      [project, global].each { |d| FileUtils.mkdir_p(d) }
+      File.write(File.join(project, "triage.yml"), workflow_yaml("triage"))
+      File.write(File.join(global, "triage.yml"), workflow_yaml("triage"))
+      File.write(File.join(global, "deploy.yml"), workflow_yaml("deploy"))
+
+      found = Riggs::Triggers.list_declared(roots: [project, global])
+      assert_equal %w[deploy triage], found.map { |w| w[:name] }.sort
+      triage = found.find { |w| w[:name] == "triage" }
+      assert_equal File.join(project, "triage.yml"), triage[:path]
+      assert_equal :project, triage[:tier]
+      assert_equal :global, found.find { |w| w[:name] == "deploy" }[:tier]
+    end
+  end
+
+  def test_a_global_workflow_is_matchable_from_a_project_that_does_not_define_it
+    Dir.mktmpdir do |dir|
+      project = File.join(dir, "project")
+      global = File.join(dir, "global")
+      [project, global].each { |d| FileUtils.mkdir_p(d) }
+      File.write(File.join(global, "deploy.yml"), workflow_yaml("deploy"))
+
+      matched = Riggs::Triggers.find_workflows(text: "please shipit now", roots: [project, global])
+      assert_equal ["deploy"], matched.map { |w| w[:name] }
+    end
+  end
+
+  def test_the_dir_keyword_still_works_as_a_single_root
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "solo.yml"), workflow_yaml("solo"))
+      assert_equal ["solo"], Riggs::Triggers.list_declared(dir: dir).map { |w| w[:name] }
+    end
+  end
+
+  def test_skill_roots_place_the_global_tier_between_project_and_bundled
+    roots = Riggs::SkillRegistry.new.send(:default_roots)
+    assert_equal 3, roots.length
+    assert_includes roots[0], File.join("config", "riggs", "skills")
+    assert_equal File.join(Dir.home, ".riggs", "skills"), roots[1]
+  end
+end
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec ruby -Itest test/test_tier_roots.rb`
+Expected: FAIL — `ArgumentError: unknown keyword: :roots`
+
+- [ ] **Step 3: Implement**
+
+In `lib/riggs/skills/registry.rb`, replace `default_roots`:
+
+```ruby
+    def default_roots
+      [
+        File.expand_path(File.join(Config::Resolver.project_path, "config", "riggs", "skills")),
+        File.join(Dir.home, ".riggs", "skills"),
+        File.expand_path("../../config/riggs/skills", __dir__)
+      ]
+    end
+```
+
+In `lib/riggs/triggers.rb`, replace both methods:
+
+```ruby
+    # Ordered roots, first match by workflow NAME wins. Shadowing rather than
+    # merging: a project triage.yml replaces the global one instead of both
+    # appearing. A global workflow with a keyword trigger fires in every repo,
+    # which is the point of the tier -- so every entry reports which tier it
+    # came from, or an operator cannot explain a match against a file that is
+    # not in the repo.
+    def self.default_roots
+      [
+        File.join(Config::Resolver.project_path, "config", "riggs", "workflows"),
+        File.join(Dir.home, ".riggs", "workflows"),
+        File.expand_path("../../config/riggs/workflows", __dir__)
+      ]
+    end
+
+    def self.tier_for(index, total)
+      return :bundled if index == total - 1
+      return :project if index.zero?
+
+      :global
+    end
+
+    def self.each_declared(roots)
+      seen = {}
+      Array(roots).each_with_index do |dir, idx|
+        tier = tier_for(idx, Array(roots).length)
+        Dir.glob(File.join(dir, "*.yml")).sort.each do |path|
+          workflow = Workflow::Loader.load(path: path)
+          name = workflow[:name].to_s
+          next if seen.key?(name)
+
+          seen[name] = true
+          yield(workflow, path, tier)
+        rescue WorkflowError
+          next
+        end
+      end
+    end
+
+    def self.find_workflows(text:, dir: nil, roots: nil)
+      out = []
+      each_declared(roots || (dir ? [dir] : default_roots)) do |workflow, _path, _tier|
+        out << workflow if match(workflow, text: text)
+      end
+      out
+    end
+
+    def self.list_declared(dir: nil, roots: nil)
+      declared = []
+      each_declared(roots || (dir ? [dir] : default_roots)) do |workflow, path, tier|
+        declared << {
+          name: workflow[:name], display_name: workflow[:display_name], path: path, tier: tier,
+          triggers: Array(workflow[:triggers]).map { |t| summarize_trigger(t) }
+        }
+      end
+      declared
+    end
+```
+
+Keep the rest of `list_declared`'s existing return shape intact — read the current method before editing and preserve every key it already produces.
+
+In `lib/riggs/cli/commands.rb`, `triggers_list` prints each workflow; add the tier to that line so a global match is explicable.
+
+- [ ] **Step 4: Verify pass, then full suite**
+
+Run the file, then `bundle exec rake test`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lib/riggs/skills/registry.rb lib/riggs/triggers.rb lib/riggs/cli/commands.rb test/test_tier_roots.rb
+git commit -m "Add global tier to skill and workflow roots, report tier on match"
+```
+
+---
+
+### Task 6: Gate project-declared MCP servers
+
+**Files:**
+- Modify: `lib/riggs/mcp/manager.rb:79-93`
+- Create: `lib/riggs/mcp/approval.rb`
+- Test: `test/test_mcp_approval.rb`
+
+**Interfaces:**
+- Consumes: `Trust` (Task 1), provenance from `Identity.resolved` (Task 4).
+- Produces:
+  - `Manager.from_config(servers, provenance: {}, trust: nil, project_path: nil, interactive: false)`
+  - `MCP::Approval.redact(command, args) -> String` — the display string
+  - `MCP::NotApproved < Error`
+
+`Manager#client_for` is the single place a configured name becomes a spawned process (`Client.new` at `manager.rb:86`, `Open3.popen2` at `client.rb:35`). The gate goes there and nowhere else.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `test/test_mcp_approval.rb`:
+
+```ruby
+# frozen_string_literal: true
+
+require_relative "test_helper"
+require "tmpdir"
+
+class TestMcpApproval < Minitest::Test
+  SERVERS = {
+    global_one: { command: "echo", args: %w[global] },
+    project_one: { command: "echo", args: %w[project] }
+  }.freeze
+  PROV = { global_one: :global, project_one: :project }.freeze
+
+  def manager(trust, interactive: false)
+    Riggs::MCP::Manager.from_config(
+      SERVERS, provenance: PROV, trust: trust, project_path: "/repo", interactive: interactive
+    )
+  end
+
+  def with_trust
+    Dir.mktmpdir { |dir| yield Riggs::Trust.new(path: File.join(dir, "trust.yml")) }
+  end
+
+  def test_a_globally_defined_server_needs_no_approval
+    with_trust do |trust|
+      refute_nil manager(trust).send(:client_for, "global_one")
+    end
+  end
+
+  def test_an_unapproved_project_server_raises_rather_than_spawning
+    with_trust do |trust|
+      err = assert_raises(Riggs::MCP::NotApproved) { manager(trust).send(:client_for, "project_one") }
+      assert_includes err.message, "project_one"
+      assert_includes err.message, "riggs mcp:approve project_one"
+    end
+  end
+
+  def test_an_approved_project_server_spawns
+    with_trust do |trust|
+      trust.approve_mcp!("/repo", "project_one", Riggs::Trust.digest(command: "echo", args: %w[project]))
+      refute_nil manager(trust).send(:client_for, "project_one")
+    end
+  end
+
+  def test_a_changed_command_revokes_the_approval
+    with_trust do |trust|
+      trust.approve_mcp!("/repo", "project_one", Riggs::Trust.digest(command: "echo", args: %w[old]))
+      assert_raises(Riggs::MCP::NotApproved) { manager(trust).send(:client_for, "project_one") }
+    end
+  end
+
+  # R11.4: a prompt nobody can answer is a hang. The web app and trigger paths
+  # construct the manager with interactive: false, and this asserts that path
+  # raises rather than reading from a stdin nobody is attached to.
+  def test_a_non_interactive_context_never_prompts
+    with_trust do |trust|
+      assert_raises(Riggs::MCP::NotApproved) do
+        manager(trust, interactive: false).send(:client_for, "project_one")
+      end
+    end
+  end
+
+  def test_an_interactive_context_that_is_declined_still_raises
+    with_trust do |trust|
+      fake = StringIO.new("n\n")
+      original = $stdin
+      $stdin = fake
+      assert_raises(Riggs::MCP::NotApproved) do
+        manager(trust, interactive: true).send(:client_for, "project_one")
+      end
+      refute trust.mcp_approved?("/repo", "project_one",
+                                 Riggs::Trust.digest(command: "echo", args: %w[project]))
+    ensure
+      $stdin = original
+    end
+  end
+
+  def test_an_interactive_context_that_is_accepted_records_the_approval
+    with_trust do |trust|
+      original = $stdin
+      $stdin = StringIO.new("y\n")
+      refute_nil manager(trust, interactive: true).send(:client_for, "project_one")
+      assert trust.mcp_approved?("/repo", "project_one",
+                                 Riggs::Trust.digest(command: "echo", args: %w[project]))
+    ensure
+      $stdin = original
+    end
+  end
+
+  def test_the_display_string_redacts_secret_bearing_flags
+    shown = Riggs::MCP::Approval.redact("npx", ["-y", "hb-mcp", "--token", "sk-live-abc123",
+                                                "--api-key=sk-xyz", "--verbose"])
+    refute_includes shown, "sk-live-abc123"
+    refute_includes shown, "sk-xyz"
+    assert_includes shown, "--token"
+    assert_includes shown, "--verbose"
+    assert_includes shown, "[redacted]"
+  end
+
+  def test_redaction_leaves_ordinary_arguments_alone
+    shown = Riggs::MCP::Approval.redact("npx", %w[-y hb-mcp --port 8080])
+    assert_includes shown, "8080"
+  end
+end
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Expected: FAIL — `NameError: uninitialized constant Riggs::MCP::NotApproved`
+
+- [ ] **Step 3: Implement**
+
+Create `lib/riggs/mcp/approval.rb`:
+
+```ruby
+# frozen_string_literal: true
+
+module Riggs
+  module MCP
+    class NotApproved < Error; end
+
+    # Rendering a command for a human to approve is a leak path: a secret
+    # passed in argv would land in the terminal and in scrollback. This
+    # redacts the common shape -- a value following a secret-bearing flag, in
+    # either `--flag value` or `--flag=value` form. It is a heuristic and
+    # cannot catch a bare positional secret; MCP configs are documented to
+    # pass secrets by environment variable name instead.
+    module Approval
+      SECRET_FLAG = /\A--?[\w-]*(key|token|secret|password|credential)[\w-]*\z/i
+      SECRET_INLINE = /\A(--?[\w-]*(key|token|secret|password|credential)[\w-]*)=(.+)\z/i
+      REDACTED = "[redacted]"
+
+      def self.redact(command, args)
+        out = []
+        redact_next = false
+        Array(args).map(&:to_s).each do |arg|
+          if redact_next
+            out << REDACTED
+            redact_next = false
+          elsif (m = SECRET_INLINE.match(arg))
+            out << "#{m[1]}=#{REDACTED}"
+          else
+            redact_next = SECRET_FLAG.match?(arg)
+            out << arg
+          end
+        end
+        ([command.to_s] + out).join(" ")
+      end
+    end
+  end
+end
+```
+
+In `lib/riggs/mcp/manager.rb`, extend the constructor and gate `client_for`:
+
+```ruby
+      def self.from_config(servers, provenance: {}, trust: nil, project_path: nil, interactive: false)
+        return new({}) if servers.nil? || servers.empty?
+
+        new(Identity.deep_symbolize(servers), provenance: provenance, trust: trust,
+            project_path: project_path, interactive: interactive)
+      end
+
+      def initialize(configs = {}, provenance: {}, trust: nil, project_path: nil, interactive: false)
+        @configs = configs.transform_keys(&:to_s)
+        @provenance = (provenance || {}).transform_keys(&:to_s)
+        @trust = trust
+        @project_path = project_path
+        @interactive = interactive
+        @clients = {}
+      end
+```
+
+and, inside `client_for`, immediately before `Client.new`:
+
+```ruby
+        ensure_approved!(key, cfg)
+```
+
+with:
+
+```ruby
+      # The one place a configured name becomes a spawned process. A server
+      # the global tier defined is the operator's own; one a repo introduced
+      # is not, and is approved separately from the directory itself so a
+      # later commit cannot add a command under an existing trust grant.
+      def ensure_approved!(name, cfg)
+        return unless @provenance[name] == :project
+        return unless @trust && @project_path
+
+        digest = Trust.digest(command: cfg[:command], args: cfg[:args] || [], env: cfg[:env] || {})
+        return if @trust.mcp_approved?(@project_path, name, digest)
+        return if @interactive && prompt_and_record!(name, cfg, digest)
+
+        raise NotApproved, "MCP server '#{name}' is declared by this project and is not approved.\n" \
+                           "  #{Approval.redact(cfg[:command], cfg[:args] || [])}\n" \
+                           "Run: riggs mcp:approve #{name}"
+      end
+
+      def prompt_and_record!(name, cfg, digest)
+        warn "⚠ project declares MCP server '#{name}'"
+        warn "  #{Approval.redact(cfg[:command], cfg[:args] || [])}"
+        warn "  approve? [y/N]"
+        answer = $stdin.gets.to_s.strip.downcase
+        return false unless %w[y yes].include?(answer)
+
+        @trust.approve_mcp!(@project_path, name, digest)
+        true
+      end
+```
+
+Add `require_relative "approval"` and `require_relative "../trust"` at the top of `manager.rb`.
+
+Update the two `Manager.from_config` call sites (find them with `grep -rn "from_config" lib`) to pass `provenance:`, `trust:`, `project_path:` from `Identity.resolved`, and `interactive: $stdin.tty?` from the CLI only. The web app and trigger paths pass `interactive: false`.
+
+- [ ] **Step 4: Verify pass, then full suite**
+
+- [ ] **Step 5: Mutation-verify the gate**
+
+Change `return unless @provenance[name] == :project` to `return`.
+`test_an_unapproved_project_server_raises_rather_than_spawning` MUST fail. Revert, paste output.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add lib/riggs/mcp/approval.rb lib/riggs/mcp/manager.rb test/test_mcp_approval.rb
+git commit -m "Gate project-declared MCP servers behind per-server approval"
+```
+
+---
+
+### Task 7: Two-tier `riggs setup`
+
+**Files:**
+- Modify: `lib/riggs/cli/commands.rb:44-137`
+- Test: `test/test_setup_tiers.rb`
+
+**Interfaces:**
+- Consumes: `Trust`, `Config::Resolver`.
+- Produces: `riggs setup` with no new flags, ensuring both tiers per artifact.
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `test/test_setup_tiers.rb` covering exactly the spec's tests 13–16:
+
+```ruby
+# frozen_string_literal: true
+
+require_relative "test_helper"
+require "tmpdir"
+require "fileutils"
+
+class TestSetupTiers < Minitest::Test
+  def setup
+    Riggs::Config::Resolver.reset_cache!
+  end
+
+  def teardown
+    Riggs::Config::Resolver.reset_cache!
+  end
+
+  def run_setup(home:, cwd:)
+    Riggs::CLI::Setup.new(home: home, cwd: cwd).call
+  end
+
+  def test_running_setup_twice_leaves_an_existing_global_config_byte_for_byte
+    Dir.mktmpdir do |dir|
+      home = File.join(dir, "home")
+      repo = File.join(dir, "repo")
+      [home, repo].each { |d| FileUtils.mkdir_p(d) }
+      run_setup(home: home, cwd: repo)
+      global = File.join(home, ".riggs", "config.yml")
+      before = File.read(global)
+      FileUtils.rm_rf(File.join(home, ".riggs", "skills"))
+      run_setup(home: home, cwd: repo)
+      assert_equal before, File.read(global)
+      assert File.directory?(File.join(home, ".riggs", "skills")), "deleted skills dir must be repaired"
+    end
+  end
+
+  def test_the_first_global_creation_seeds_from_an_existing_agent_hubrc
+    Dir.mktmpdir do |dir|
+      home = File.join(dir, "home")
+      repo = File.join(dir, "repo")
+      [home, repo].each { |d| FileUtils.mkdir_p(d) }
+      File.write(File.join(repo, ".agent_hubrc"), Psych.dump(
+                                                    "users" => { "matt" => { "role" => "pm" } },
+                                                    "roles" => { "pm" => %w[publish] },
+                                                    "providers" => { "mock" => { "type" => "mock" } }
+                                                  ))
+      run_setup(home: home, cwd: repo)
+      global = Psych.safe_load(File.read(File.join(home, ".riggs", "config.yml")), aliases: true)
+      assert_equal({ "role" => "pm" }, global["users"]["matt"])
+      assert_equal %w[publish], global["roles"]["pm"]
+    end
+  end
+
+  def test_seeding_never_runs_against_an_existing_global_config
+    Dir.mktmpdir do |dir|
+      home = File.join(dir, "home")
+      first = File.join(dir, "first")
+      second = File.join(dir, "second")
+      [home, first, second].each { |d| FileUtils.mkdir_p(d) }
+      File.write(File.join(first, ".agent_hubrc"), Psych.dump("users" => { "a" => { "role" => "pm" } }))
+      run_setup(home: home, cwd: first)
+      File.write(File.join(second, ".agent_hubrc"), Psych.dump("users" => { "b" => { "role" => "pm" } }))
+      run_setup(home: home, cwd: second)
+      global = Psych.safe_load(File.read(File.join(home, ".riggs", "config.yml")), aliases: true)
+      assert global["users"].key?("a")
+      refute global["users"].key?("b")
+    end
+  end
+
+  def test_home_as_the_project_writes_no_project_tier_over_the_global_one
+    Dir.mktmpdir do |dir|
+      home = File.join(dir, "home")
+      FileUtils.mkdir_p(home)
+      run_setup(home: home, cwd: home)
+      global = File.join(home, ".riggs", "config.yml")
+      assert File.exist?(global)
+      cfg = Psych.safe_load(File.read(global), aliases: true)
+      refute_nil cfg["users"], "the global config must not have been clobbered by a project skeleton"
+    end
+  end
+
+  def test_setup_records_trust_for_the_project_path
+    Dir.mktmpdir do |dir|
+      home = File.join(dir, "home")
+      repo = File.join(dir, "repo")
+      [home, repo].each { |d| FileUtils.mkdir_p(d) }
+      run_setup(home: home, cwd: repo)
+      trust = Riggs::Trust.new(path: File.join(home, ".riggs", "trust.yml"))
+      assert trust.trusted?(File.realpath(repo))
+    end
+  end
+
+  def test_setup_writes_a_project_skeleton_that_does_not_trip_a_hard_error
+    Dir.mktmpdir do |dir|
+      home = File.join(dir, "home")
+      repo = File.join(dir, "repo")
+      [home, repo].each { |d| FileUtils.mkdir_p(d) }
+      run_setup(home: home, cwd: repo)
+      trust = Riggs::Trust.new(path: File.join(home, ".riggs", "trust.yml"))
+      cfg = Riggs::Identity.resolved(
+        cwd: repo, trust: trust, global_config: File.join(home, ".riggs", "config.yml")
+      )
+      refute_nil cfg.config[:default_user]
+    end
+  end
+end
+```
+
+- [ ] **Step 2: Run to verify failure** — `NameError: uninitialized constant Riggs::CLI::Setup`
+
+- [ ] **Step 3: Implement**
+
+Extract the setup body out of the Thor command into `lib/riggs/cli/setup.rb` as `Riggs::CLI::Setup`, taking `home:` and `cwd:` so it is testable without changing the developer's home directory. The Thor `setup` command becomes a two-line call into it.
+
+`Setup#call` performs, in order:
+
+1. Compute `project_path = Config::Resolver.project_path(cwd)`.
+2. Ensure `<home>/.riggs/`, `skills/`, `workflows/` — `mkdir_p` each, which is already idempotent.
+3. Ensure `<home>/.riggs/trust.yml` via `Trust#grant!` later; no separate creation step.
+4. If `<home>/.riggs/config.yml` does **not** exist: build the default hub config (reuse the existing literal from `commands.rb:57-108`, minus `sqlite_path` pointing into the repo — it now points at `<home>/.riggs/riggs.sqlite3`), then **seed** from `project_path`'s `.riggs/config.yml` or `.agent_hubrc` if one exists, taking only `users`, `roles`, `providers`. Write it. Print what was seeded, or print plainly that an empty global config was created.
+5. If it does exist: print `⏭️  Keeping existing <path>`.
+6. Ensure the database at the global `sqlite_path` via `Storage.new(db_path:).close`.
+7. Unless `project_path == File.expand_path(home)`: `mkdir_p` the project `config/riggs/{workflows,skills}`, copy the example playbook and skill as today, and write `<project_path>/.riggs/config.yml` if absent — a commented skeleton naming only `default_user`, `users`, `providers` (override form), and `mcp_servers`. It MUST NOT contain `sqlite_path` or `roles`.
+8. `Trust.new(path: <home>/.riggs/trust.yml).grant!(project_path)` and print that trust was recorded.
+
+Every print stays in the existing emoji style.
+
+- [ ] **Step 4: Verify pass, then full suite.** Existing `test_cli.rb` setup tests will need their expectations updated for the new output and paths; update them rather than weakening the new behavior.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lib/riggs/cli/setup.rb lib/riggs/cli/commands.rb test/test_setup_tiers.rb test/test_cli.rb
+git commit -m "Make riggs setup ensure both tiers per artifact, seeding on first creation"
+```
+
+---
+
+### Task 8: Trust commands and identity provenance
+
+**Files:**
+- Modify: `lib/riggs/cli/commands.rb`
+- Test: `test/test_trust_cli.rb`
+
+**Interfaces:**
+- Consumes: `Trust`, `Identity.resolved`.
+- Produces: `riggs trust`, `riggs trust:list`, `riggs trust:forget PATH`, `riggs mcp:approve NAME`, and a provenance line on every run.
+
+- [ ] **Step 1: Write failing tests** asserting:
+  - `riggs trust` grants the current project path and prints it.
+  - `riggs trust:list` prints granted paths and marks any whose directory no longer exists.
+  - `riggs trust:forget PATH` removes an entry and reports when there was nothing to remove.
+  - `riggs mcp:approve NAME` records the digest of the currently-configured command and refuses, with a message naming the tier, when the named server is global (there is nothing to approve).
+  - `workflow:run` prints `▸ running as <id> (<role>) — from <path>` where `<path>` is the file the identity came from, taken from `provenance[:users][id]` and `provenance[:default_user]`.
+
+- [ ] **Step 2–4: Red, implement, green.**
+
+Register each command with `desc` and Thor `map` in the existing style (`map "trust:list" => :trust_list`). `riggs trust` and `riggs projects` are bare commands like `setup` and `serve`; also register `map "trust:grant" => :trust` for symmetry.
+
+The provenance line goes in the private helper that every command already uses to resolve identity, not in each command, so no command can be added later that skips it.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lib/riggs/cli/commands.rb test/test_trust_cli.rb
+git commit -m "Add trust CLI commands and print identity provenance on every run"
+```
+
+---
+
+### Task 9: Tier-aware `ConfigStore` and web config view
+
+**Files:**
+- Modify: `lib/riggs/config_store.rb`
+- Modify: `lib/riggs/web/app.rb:96-98`, `lib/riggs/web/views/config.erb`
+- Test: `test/test_config_store.rb` (extend)
+
+**Interfaces:**
+- Consumes: `Identity.resolved`, `Identity.config_path`.
+- Produces: `ConfigStore.new(path:, tier:)` where `tier` is `:project` or `:global`; `#public_view` gains a `_tier` and `_path` key; writes still refuse when the file is missing.
+
+- [ ] **Step 1: Write failing tests** asserting:
+  - `ConfigStore` defaults to the project tier path when one exists and the global path otherwise.
+  - `public_view` reports which tier and path it read, so the web UI can label it.
+  - `merge!` writing a `sqlite_path` or a `roles` key that the project tier may not set raises `Riggs::Error` before touching the file — asserted by checking the file's mtime and contents are unchanged.
+
+That last one matters: `ConfigStore#merge!` is reachable from `/config` over HTTP, so it is the one path where a *remote* write could try to set a key the merge algebra forbids. Validating in `Config::Merge` alone is not enough, because the write happens before anything merges.
+
+- [ ] **Step 2–4: Red, implement, green.**
+
+`ConfigStore#write!` validates the candidate document by running `Config::Merge.call` against the current global tier and raising before `backup!` if it would not merge. Show the tier and path in `config.erb`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lib/riggs/config_store.rb lib/riggs/web/app.rb lib/riggs/web/views/config.erb test/test_config_store.rb
+git commit -m "Make ConfigStore tier-aware and validate writes against the merge algebra"
+```
+
+---
+
+## Definition of done for 11a
+
+- All nine tasks committed, `bundle exec rubocop` clean, `bundle exec rake test` 0 failures.
+- The mutation verifications in Tasks 1, 2, 3 and 6 have each been run and their failure output pasted into the task report. A security claim nobody broke is a claim nobody tested.
+- Cloning a repository whose `.riggs/config.yml` declares an MCP server and a privileged user, then running a riggs command in it, executes no attacker-chosen command and grants no attacker-chosen role — demonstrated by hand, with the declared command being one whose execution leaves an observable artifact (e.g. `touch /tmp/pwned-<uuid>`), and the artifact confirmed absent.
+
+## Explicitly out of scope
+
+R11.6 (`project_path` column, `riggs cost`, `riggs projects`) and R11.7 (memory scoping) are Phase 11b. Do not add the column, the commands, or the namespace composition in this phase. If a task seems to need them, it has drifted.

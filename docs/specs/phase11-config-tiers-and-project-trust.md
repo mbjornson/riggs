@@ -104,12 +104,25 @@ every approval. A hand-authored config file must not churn under the tool.
 
 `~/.riggs/config.yml` and `~/.riggs/trust.yml` are both created `0600`.
 
-**`project_path` is always the absolute current working directory**, resolved
-once per invocation, whether or not `.riggs/config.yml` exists there and whether
-or not the path is trusted. It is the key for trust, attribution (R11.6), and
-memory scoping (R11.7), so it must never be nil — a directory with no project
-tier is still a project for the purposes of "whose spend was that" and "which
-memories are these."
+**`project_path` is the git toplevel; failing that, the nearest ancestor
+holding a `.riggs/config.yml`; failing that, the absolute current directory.**
+Resolved once per invocation, whether or not the path is trusted. It must never
+be nil — a directory with no project tier is still a project for the purposes
+of "whose spend was that" and "which memories are these."
+
+Containment is the rule: `~/Projects/riggs` and `~/Projects/agentcrm` are
+different projects, and `~/Projects/agentcrm/lib` is part of agentcrm. Keying
+on the raw working directory would make `riggs run` from `<repo>/lib` a
+different project than from `<repo>` — separate trust prompt, separate memory,
+separate cost bucket — and the roll-up this phase exists to produce would
+fragment by however deep you happened to be standing. The project tier is
+therefore read from `<project_path>/.riggs/config.yml`, not from
+`./.riggs/config.yml`.
+
+**The ancestor walk stops before `$HOME`.** `~/.riggs/config.yml` is the global
+tier, so treating it as a project marker would resolve every directory under
+the home directory to `$HOME` — one project for the whole machine. This is the
+same collision as the `$HOME` rule above, reached from the other direction.
 
 **`$HOME` is never a project directory.** The project tier lives at
 `<project_path>/.riggs/config.yml` and the global tier at
