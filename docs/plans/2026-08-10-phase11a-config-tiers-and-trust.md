@@ -1430,7 +1430,7 @@ module Riggs
 
       # Same reasoning one level down: banning api_key alone left token,
       # secret, password and a nested auth: hash wide open.
-      PROVIDER_FIELDS = %i[model base_url pricing relay_chain auth].freeze
+      PROVIDER_FIELDS = %i[model relay_chain auth].freeze
 
       # On a user the global tier already defines, only the role may change.
       # Everything else -- id, name, github_username, memory_namespace -- is
@@ -2404,6 +2404,32 @@ is how the web-route fix would silently not ship.
 
 `Manager#client_for` is the single place a configured name becomes a spawned process (`Client.new` at `manager.rb:86`, `Open3.popen2` at `client.rb:35`). The gate goes there and nowhere else.
 
+**Additional requirement, added after an adversarial review of Tasks 1–3
+(spec R11.3, "The child's environment must be the one the operator
+approved").** `Client#start!` currently passes an environment **overlay** to
+`Open3.popen2`, and Ruby gives the child the parent's environment merged with
+it — so an approved MCP server receives `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`
+and every other variable in the operator's shell, while the digest binds only
+the names the declaration listed. Demonstrated with a sentinel variable that a
+child read despite appearing nowhere in its declaration.
+
+This makes the approval prompt untrue where it matters most: it says
+"forwards `HB_TOKEN`" and the truth is "forwards your whole environment",
+which hollows out D1 — env var names are digested precisely so the operator
+can see which secrets a server reaches.
+
+So this task must ALSO:
+
+1. Spawn with `unsetenv_others: true` and an explicit forward list: `PATH`,
+   any variable riggs itself needs (name them in the code), and the keys the
+   declaration's `env:` asked for. Nothing else.
+2. Keep the digest binding that same resulting set, so what was approved and
+   what is spawned cannot drift.
+3. Test it by exporting a sentinel variable in the parent, declaring a server
+   whose `env:` does not name it, and asserting the child cannot see it.
+   Assert on the CHILD's view, not on the hash riggs constructed — the whole
+   defect was that those two differed.
+
 - [ ] **Step 1: Write the failing tests**
 
 Create `test/test_mcp_approval.rb`:
@@ -3058,7 +3084,7 @@ nothing else in the plan pulls the file in.
 1. Compute `project_path = Config::Resolver.project_path(cwd)`.
 2. Ensure `<home>/.riggs/`, `skills/`, `workflows/` — `mkdir_p` each, which is already idempotent.
 3. Ensure `<home>/.riggs/trust.yml` via `Trust#grant!` later; no separate creation step.
-4. If `<home>/.riggs/config.yml` does **not** exist: build the default hub config (reuse the existing literal from `commands.rb:57-108`, keeping `sqlite_memory` — it is a global-only key and belongs here — and pointing `sqlite_path` at `<home>/.riggs/riggs.sqlite3` rather than into the repo), then **seed** from `project_path`'s `.riggs/config.yml` or `.agent_hubrc` if one exists, taking `users` and `roles` wholesale and each provider's name plus only `Config::Merge::PROVIDER_FIELDS` (`model`, `base_url`, `pricing`, `relay_chain`, `auth`) and `type`. **Every other provider key is dropped and printed by name.** A legacy `.agent_hubrc` may well carry an `api_key`, and copying `providers` wholesale would persist it in `~/.riggs/config.yml` — breaking "no tier holds credentials" through the very step meant to adopt the new layout. Write it **and `File.chmod(0o600, path)`** — R11.1 requires it of every writer, not only the trust registry. Print what was seeded, or print plainly that an empty global config was created.
+4. If `<home>/.riggs/config.yml` does **not** exist: build the default hub config (reuse the existing literal from `commands.rb:57-108`, keeping `sqlite_memory` — it is a global-only key and belongs here — and pointing `sqlite_path` at `<home>/.riggs/riggs.sqlite3` rather than into the repo), then **seed** from `project_path`'s `.riggs/config.yml` or `.agent_hubrc` if one exists, taking `users` and `roles` wholesale and each provider's name plus its non-credential fields — `type`, `model`, `base_url`, `pricing`, `relay_chain`, `auth`. **Write that list out here; do NOT reuse `Config::Merge::PROVIDER_FIELDS`.** The two lists answer different questions and have already diverged: `PROVIDER_FIELDS` is what a PROJECT may set, and it excludes `base_url` and `pricing` because those are operator-owned. Seeding writes into the operator's OWN global tier, where both belong, so borrowing that constant would silently drop the endpoint and prices out of a legacy config during the very step meant to preserve it. **Every other provider key is dropped and printed by name.** A legacy `.agent_hubrc` may well carry an `api_key`, and copying `providers` wholesale would persist it in `~/.riggs/config.yml` — breaking "no tier holds credentials" through the very step meant to adopt the new layout. Write it **and `File.chmod(0o600, path)`** — R11.1 requires it of every writer, not only the trust registry. Print what was seeded, or print plainly that an empty global config was created.
 5. If it does exist: print `⏭️  Keeping existing <path>`.
 6. Ensure the database at the global `sqlite_path` via `Storage.new(db_path:).close`.
 7. Unless `project_path == File.expand_path(home)`: `mkdir_p` the project `config/riggs/{workflows,skills}`, copy the example playbook and skill as today, and write `<project_path>/.riggs/config.yml` if absent — a commented skeleton whose keys are exactly `Config::Merge::PROJECT_KEYS` (`default_user`, `roles`, `users`, `providers`, `mcp_servers`), **all commented out**. It MUST NOT contain `sqlite_path` or `sqlite_memory` in any form. Commenting every key is what makes it both a useful template and unable to trip a hard error; the spec's earlier "no users or roles" wording is superseded by R11.8's allowlist.

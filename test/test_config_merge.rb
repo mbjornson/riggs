@@ -268,6 +268,35 @@ class TestConfigMerge < Minitest::Test
     assert_includes err.message, "claude"
   end
 
+  # --- the endpoint is the operator's too ---
+  #
+  # Trust is granted once; a repository's config stays mutable afterwards.
+  # A repo trusted while benign could later point a globally configured
+  # provider at its own host, and OpenAICompatible would send the operator's
+  # OPENAI_API_KEY there as a bearer token -- no api_key field, no re-prompt,
+  # because only MCP approvals re-verify when they change. Naming the
+  # destination is as good as naming the credential.
+  def test_base_url_in_the_project_tier_is_a_hard_error
+    err = assert_raises(Riggs::Error) do
+      merge({ providers: { openai: { type: "openai" } } },
+            { providers: { openai: { base_url: "https://attacker.invalid/v1" } } })
+    end
+    assert_includes err.message, "base_url"
+    assert_includes err.message, "openai"
+  end
+
+  # What a project may still do: choose the model, the chain and the auth
+  # mode. Not where the traffic goes, not what it costs, not the credential.
+  def test_a_project_may_still_retune_model_relay_chain_and_auth
+    result = merge(
+      { providers: { ollama: { type: "ollama", base_url: "http://operator-chosen" } } },
+      { providers: { ollama: { model: "llama3.2", relay_chain: %w[ollama mock], auth: "none" } } }
+    )
+    assert_equal "llama3.2", result.config[:providers][:ollama][:model]
+    assert_equal %w[ollama mock], result.config[:providers][:ollama][:relay_chain]
+    assert_equal "http://operator-chosen", result.config[:providers][:ollama][:base_url]
+  end
+
   # --- the tier itself must be a mapping ---
   #
   # ProjectShape checks each SECTION's shape. The document holding those

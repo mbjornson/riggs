@@ -204,7 +204,24 @@ error naming the key and listing the permitted five.
 | `roles` | Project may define a role name the global tier does not define. Redefining a global name is a hard error. |
 | `users` | Merge by key. A **new** user may set every field. On a user the global tier already defines, only `role` may be overridden; any other field is a hard error. |
 | `default_user` | Project may set it. Must resolve within the merged user set. |
-| `providers` | Override only, and only these fields: `model`, `base_url`, `pricing`, `relay_chain`, `auth`. Any other field — including `api_key`, `token`, `secret`, a nested `auth` hash, or `type` — is a hard error. Naming an undefined provider is a hard error. |
+| `providers` | Override only, and only these fields: `model`, `relay_chain`, `auth`. Any other field — including `api_key`, `token`, `secret`, a nested `auth` hash, `type`, `base_url` or `pricing` — is a hard error. Naming an undefined provider is a hard error. A provider entry that is not a mapping is a hard error: the field allowlist compares key NAMES, and a scalar has no keys to compare, so it would otherwise replace the whole global entry unchecked. |
+
+`base_url` and `pricing` were on this list and were removed, for the same
+reason in two different currencies. **`base_url` is where the credential
+goes**: trust is granted once but a repository's config stays mutable
+afterwards, and only MCP approvals re-verify when they change, so a repo
+trusted while benign could later point a globally configured provider at its
+own host and `OpenAICompatible` would send `OPENAI_API_KEY` there as a bearer
+token. Naming the destination is as good as naming the credential.
+**`pricing` is what riggs is for**: a project that sets its own pricing can
+report `$0.00` for a run that cost `$60.00`, which defeats the product rather
+than merely bypassing a control. Both are operator-owned, like credentials.
+
+Pricing has a second entry point that the config allowlist does not cover:
+`Router#provider_config` merges hub ← workflow and lets the **workflow** win,
+and a workflow file travels with a repository exactly as its config does. So
+`Router` reads pricing from the hub config alone (`#pricing_for`). Every other
+provider field still merges hub ← workflow.
 | `mcp_servers` | Merge by name. Project may add. Every project-supplied server is approval-gated (R11.3). |
 
 Everything else is global only: `sqlite_path`, `sqlite_memory`, and any key
@@ -302,6 +319,28 @@ if a secret was passed in `argv`:
 `/key|token|secret|password/i`**, and the documentation must direct secrets to
 environment variables by name. The heuristic is not airtight; printing an
 unredacted `argv` is a guaranteed leak, and this makes the common shape safe.
+
+### The child's environment must be the one the operator approved
+
+`MCP::Client#start!` passes an environment **overlay** to `Open3.popen2`, and
+Ruby hands the child the parent's environment merged with it. So an approved
+MCP server today receives `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and everything
+else in the operator's shell, while the approval digest binds only the names
+the declaration **listed**. Demonstrated: a child read a variable that appeared
+nowhere in its declaration.
+
+That makes the prompt untrue in the one place it must not be. It says "forwards
+`HB_TOKEN`" and the truth is "forwards your entire environment", which hollows
+out D1 — env var names are in the digest precisely so the operator can see
+which secrets a server will reach.
+
+**Task 6 MUST spawn with `unsetenv_others: true` and an explicit forward
+list**, so the child receives only `PATH`, a minimal set riggs names, and the
+variables the declaration asked for. The approval digest then binds the real
+resulting set rather than a subset of it, and the prompt describes what will
+actually happen. Asserted by a test that puts a sentinel variable in the parent
+environment, declares an MCP server that does not name it, and reads the child's
+view of it.
 
 ## R11.4 Non-interactive contexts fail closed
 

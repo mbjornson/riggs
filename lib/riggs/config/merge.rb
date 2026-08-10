@@ -19,13 +19,26 @@ module Riggs
       # Same reasoning one level down: banning api_key alone left token,
       # secret, password and a nested auth: hash wide open.
       #
-      # `pricing` is deliberately NOT here. riggs exists to tell the operator
-      # what their agents cost, and a project that sets its own pricing can
-      # report $0.00 for a run that cost $60.00 -- measured, not theorised.
-      # That defeats the product rather than merely bypassing a control, so
-      # pricing is the operator's the same way credentials are. The matching
-      # guard for workflow-declared pricing lives in Router#pricing_for.
-      PROVIDER_FIELDS = %i[model base_url relay_chain auth].freeze
+      # Neither `pricing` nor `base_url` is here, for the same reason in two
+      # different currencies.
+      #
+      # riggs exists to tell the operator what their agents cost, and a
+      # project that sets its own pricing can report $0.00 for a run that
+      # cost $60.00 -- measured, not theorised. The matching guard for
+      # workflow-declared pricing is Router#pricing_for.
+      #
+      # `base_url` is where the credential GOES. Trust is granted once, but a
+      # repository's config stays mutable afterwards, and only MCP approvals
+      # re-verify when they change -- so a repo trusted while benign could
+      # later point a globally configured provider at its own host and
+      # OpenAICompatible would send OPENAI_API_KEY there as a bearer token
+      # (openai_compatible.rb:16,20,22,39). Naming the destination is as good
+      # as naming the credential.
+      #
+      # What is left is what a project legitimately needs: which model, which
+      # chain, which auth mode. Not where the traffic goes, not what it costs,
+      # not the credential itself.
+      PROVIDER_FIELDS = %i[model relay_chain auth].freeze
 
       # On a user the global tier already defines, only the role may change.
       # Everything else -- id, name, github_username, memory_namespace -- is
