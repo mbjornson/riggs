@@ -218,7 +218,7 @@ A prompt nobody can answer is a hang, and auto-approving because nobody is
 watching inverts the guarantee.
 
 New commands: `riggs trust` (approve the current directory), `riggs trust:list`,
-`riggs mcp:approve <name>`.
+`riggs trust:forget PATH`, `riggs mcp:approve <name>`.
 
 ## R11.5 Identity provenance is printed
 
@@ -250,12 +250,74 @@ duplicate a value that cannot vary and invite the two to disagree.
 `Storage#ensure_columns!` already inspects `riggs_sessions` and adds a missing
 column; this is a second entry in the same method, on the same table.
 
-New: `riggs cost --by-project`, joining `riggs_provider_calls` to
-`riggs_sessions` and grouping on `project_path`.
+### `riggs projects`
 
-Rows written before this column exists have `project_path` NULL and MUST be
-reported under an explicit `(unattributed)` bucket rather than silently
-dropped — a roll-up that omits history is a wrong total, not a partial one.
+Lists every project riggs knows about, from the **union of two sources that
+disagree**: the paths registered in `trust.yml`, and
+`SELECT DISTINCT project_path FROM riggs_sessions`. A trusted path that never
+ran appears only in the first; a path that ran and was later removed appears
+only in the second. Reporting either alone omits real projects.
+
+```
+PATH                             TRUST      RUNS  LAST RUN   SPEND
+/Users/matt/Projects/riggs       trusted      47  2h ago     $12.4031
+/Users/matt/Projects/tradeflow   trusted      12  3d ago     $4.1120 + 88 unmetered
+/Users/matt/Projects/newthing    trusted       0  —          —
+/Users/matt/Projects/zeroclaw    not trusted   3  6w ago     $0.8800   ⚠ path missing
+(unattributed)                   —           118  —          $31.2200
+```
+
+Each row reports whether the path is currently in `trust.yml` and whether it
+still exists on disk. A registry that silently accumulates dead paths becomes
+a graveyard nobody prunes, and `⚠ path missing` is what makes
+`riggs trust:forget PATH` an obvious next step rather than a command you have
+to know exists.
+
+### `riggs cost [PROJECT]`
+
+No argument: every project, grouped, with a total. This replaces the
+`--by-project` flag, which no longer exists — the roll-up is the command's
+purpose, not a mode of it. With an argument: that project alone, broken down by
+provider (`riggs_provider_calls.provider` is already a column).
+
+`PROJECT` resolves in three ways, in order: an absolute path matches exactly;
+`.` means the current `project_path`; anything else is matched against path
+basenames. **A basename matching more than one project is an error listing the
+full paths**, never a silent pick of the first — two products both checked out
+as `web` is ordinary, and guessing between them misreports spend.
+
+### Unmetered work is not free work
+
+`Router::UNMETERED` covers every CLI provider, so those calls store
+`measured = 0` and a NULL `cost_usd`. A project running entirely on a CLI
+subscription therefore sums to NULL.
+
+**Rendering that as `$0.00` is a false record and MUST NOT happen.** It is the
+same defect as `auth: none` on a CLI provider — work that was really billed to
+a subscription, reported as billed to nobody — which is why `none` was removed
+from `Cli::AUTH_MODES` in Phase 10. Every cost figure carries its denominator:
+priced calls, and unmetered calls counted separately and never folded into a
+dollar amount. A project with no priced calls reports `— (88 unmetered)`, not a
+zero.
+
+### Unattributed history
+
+Rows written before `project_path` exists are NULL and MUST appear under an
+explicit `(unattributed)` bucket in both commands, and be included in the
+total. A roll-up that omits history is a wrong total, not a partial one.
+
+### Naming
+
+`projects` and `cost` are bare commands, like `setup` and `serve`, rather than
+`noun:verb` like `triggers:list`. They report across the whole install rather
+than operating on one subsystem. `projects:list` and `cost:show` are registered
+as aliases via Thor's `map`, which costs one line each.
+
+Deferred: breaking a project's spend down by **billing account** rather than by
+provider. `auth_modes` lives in the `workflow_start` audit payload rather than
+in a column, so that join means `json_extract` over `riggs_audit`. It is the
+question Phases 9 and 10 exist to answer and it should follow soon, but it is
+not this phase.
 
 ## R11.7 Memory is project-scoped
 
@@ -340,8 +402,17 @@ Every claim below must be proved by breaking it and watching a test fail.
    rather than blocking on input.
 10. `trust.yml` contains no environment variable value — asserted by writing a
     known sentinel into a forwarded variable and grepping the written file.
-11. `project_path` is recorded on new sessions and `riggs cost --by-project`
-    groups correctly, with pre-existing NULL rows reported as `(unattributed)`.
+11. `project_path` is recorded on new sessions and `riggs cost` groups by it,
+    with pre-existing NULL rows reported as `(unattributed)` and included in
+    the total.
+11a. A project whose calls are all unmetered reports its call count and no
+    dollar figure. Asserted on rendered output containing no `$0.00`, since a
+    formatter that coerces NULL to zero passes any assertion made on the
+    query result alone.
+11b. `riggs projects` lists a trusted path with zero runs and a path with runs
+    that is absent from `trust.yml` — proving the union, not either source.
+11c. `riggs cost <basename>` matching two projects errors and names both full
+    paths.
 12. A memory persisted under project A is not returned by recall under
     project B, on **both** the SQL and vector backends.
 13. `riggs setup` run twice leaves an existing `~/.riggs/config.yml` byte-for-byte
@@ -401,5 +472,6 @@ command and grants no attacker-chosen role — verified by running it, with the
 declared command being one whose execution leaves an observable artifact.
 
 Two product repositories on one machine run riggs against one global identity,
-one database, and their own workflows and skills, and `riggs cost --by-project`
-reports each product's spend separately.
+one database, and their own workflows and skills. `riggs projects` lists both,
+and `riggs cost` reports each product's spend separately — with unmetered
+subscription work counted and never rendered as a zero.
