@@ -119,7 +119,7 @@ module Riggs
     # boundary for deciding whether a discovered project configuration is safe.
     class ProjectPaths
       def self.path_for(cwd)
-        key = File.expand_path(cwd)
+        key = canonical_path(cwd)
         cache.fetch(key) { cache[key] = discovered_path(key) }
       end
 
@@ -161,6 +161,12 @@ module Riggs
         path = output.strip
         return nil if path.empty?
 
+        File.expand_path(path)
+      end
+
+      def self.canonical_path(path)
+        File.realpath(path)
+      rescue SystemCallError
         File.expand_path(path)
       end
     end

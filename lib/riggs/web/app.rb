@@ -131,7 +131,7 @@ module Riggs
 
         if m == "GET" && p == "/workflows"
           Auth.require!(@identity, "read_workflow")
-          return html(:workflows, title: "Playbooks", workflows: list_workflows)
+          return html(:workflows, title: "Playbooks", workflows: Triggers.list_declared.map { |workflow| workflow[:name] })
         end
         if m == "GET" && (wm = p.match(%r{\A/workflows/([^/]+)\z}))
           return show_workflow(wm[1])
@@ -167,7 +167,7 @@ module Riggs
           Auth.require!(@identity, "read_workflow")
           q = req.params["q"].to_s
           matches = q.empty? ? [] : trigger_matches(q)
-          declared = Triggers.list_declared(dir: workflows_dir)
+          declared = Triggers.list_declared
           return html(:triggers, title: "Triggers", query: q, matches: matches, declared: declared)
         end
 
@@ -180,7 +180,7 @@ module Riggs
 
         if m == "GET" && p == "/api/workflows"
           Auth.require!(@identity, "read_workflow")
-          return json_ok(list_workflows)
+          return json_ok(Triggers.list_declared.map { |workflow| workflow[:name] })
         end
         if m == "GET" && (wm = p.match(%r{\A/api/workflows/([^/]+)\z}))
           return api_show_workflow(wm[1])
@@ -227,7 +227,7 @@ module Riggs
         end
         if m == "GET" && p == "/api/triggers"
           Auth.require!(@identity, "read_workflow")
-          return json_ok(Triggers.list_declared(dir: workflows_dir))
+          return json_ok(Triggers.list_declared)
         end
         return json_ok(ok: true, identity: @identity[:id]) if m == "GET" && p == "/health"
 
@@ -275,7 +275,7 @@ module Riggs
 
       def show_workflow(name)
         Auth.require!(@identity, "read_workflow")
-        path = workflow_path(name)
+        path = Triggers.find_path(name)
         raise Error, "Workflow not found" unless path
 
         wf = Workflow::Loader.load(path: path)
@@ -322,7 +322,7 @@ module Riggs
 
       def api_show_workflow(name)
         Auth.require!(@identity, "read_workflow")
-        path = workflow_path(name)
+        path = Triggers.find_path(name)
         return json_error(404, "not found") unless path
 
         wf = Workflow::Loader.load(path: path)
@@ -470,7 +470,7 @@ module Riggs
       end
 
       def execute_workflow(name, input:, auto_approve:)
-        path = workflow_path(name)
+        path = Triggers.find_path(name)
         raise Error, "Workflow not found: #{name}" unless path
 
         workflow = Workflow::Loader.load(path: path)
@@ -529,7 +529,7 @@ module Riggs
       end
 
       def resume_session_run(id, workflow_name)
-        path = workflow_path(workflow_name)
+        path = Triggers.find_path(workflow_name)
         raise Error, "Workflow not found: #{workflow_name}" unless path
 
         engine = Workflow::GraphEngine.resume(
@@ -547,32 +547,10 @@ module Riggs
         engine.status.to_s
       end
 
-      def list_workflows
-        dirs = [
-          File.expand_path("config/riggs/workflows"),
-          File.expand_path("../../../config/riggs/workflows", __dir__)
-        ]
-        dirs.flat_map { |d| Dir.glob(File.join(d, "*.yml")).map { |p| File.basename(p, ".yml") } }.uniq.sort
-      end
-
-      def workflows_dir
-        local = File.expand_path("config/riggs/workflows")
-        return local if File.directory?(local)
-
-        File.expand_path("../../../config/riggs/workflows", __dir__)
-      end
-
       def trigger_matches(query)
-        Triggers.find_workflows(text: query, dir: workflows_dir).map do |wf|
+        Triggers.find_workflows(text: query).map do |wf|
           { "name" => wf[:name], "display_name" => wf[:display_name] }
         end
-      end
-
-      def workflow_path(name)
-        [
-          File.expand_path("config/riggs/workflows/#{name}.yml"),
-          File.expand_path("../../../config/riggs/workflows/#{name}.yml", __dir__)
-        ].find { |p| File.exist?(p) }
       end
 
       def list_skills

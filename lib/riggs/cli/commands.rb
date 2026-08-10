@@ -185,7 +185,7 @@ module Riggs
         puts "No playbooks matched #{text.inspect}."
       else
         matches.each do |wf|
-          puts "• #{wf[:name]} — #{wf[:display_name] || wf[:name]}"
+          puts "• #{wf[:name]} (#{wf[:tier]}) — #{wf[:display_name] || wf[:name]}"
         end
       end
     end
@@ -208,7 +208,7 @@ module Riggs
           end
         end.join(", ")
         summary = "(none)" if summary.empty?
-        puts "• #{row[:name]} — #{summary}"
+        puts "• #{row[:name]} (#{row[:tier]}) — #{summary}"
       end
     end
 
@@ -224,7 +224,10 @@ module Riggs
     method_option :validate, type: :boolean, default: true, desc: "Validate after write"
     def workflow_new(name)
       require_permission! %w[edit_workflow]
-      path = "./config/riggs/workflows/#{name}.yml"
+      name = Triggers.safe_name(name)
+      abort "❌ Invalid workflow name" unless name
+
+      path = File.join(Triggers.project_workflows_dir, "#{name}.yml")
       FileUtils.mkdir_p(File.dirname(path))
       abort "❌ Already exists: #{path}" if File.exist?(path)
 
@@ -607,10 +610,8 @@ module Riggs
       end
 
       def load_workflow(name)
-        path = "./config/riggs/workflows/#{name}.yml"
-        # Also try gem-bundled examples
-        path = File.expand_path("../../../config/riggs/workflows/#{name}.yml", __dir__) unless File.exist?(path)
-        abort "❌ Workflow not found: #{name}.yml" unless File.exist?(path)
+        path = Triggers.find_path(name)
+        abort "❌ Workflow not found: #{name}.yml" unless path
 
         Workflow::Loader.load(path: path)
       end
