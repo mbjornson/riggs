@@ -1806,8 +1806,10 @@ class TestTierRoots < Minitest::Test
         Dir.mktmpdir do |repo|
           Dir.chdir(repo) do
             Riggs::Config::Resolver.reset_cache!
-            entry = Riggs::Triggers.list_declared.find { |w| w[:name] == "deploy" }
-            assert_equal :global, entry[:tier]
+            declared = Riggs::Triggers.list_declared
+            assert_equal :global, declared.find { |w| w[:name] == "deploy" }[:tier]
+            bundled = declared.find { |w| w[:name] == "example_triage" }
+            assert_equal :bundled, bundled[:tier], "the third tier must label itself too"
           end
         end
       end
@@ -2013,18 +2015,30 @@ this codebase with separately hardcoded paths, and they diverged — gating
     # resume -- so gating default_roots governed what `triggers:list` displayed
     # and nothing that executed. First root wins, matching skill resolution.
     def self.find_path(name, roots: nil)
-      safe = File.basename(name.to_s)
       # A name is a NAME, not a path. File.join(dir, "../../etc/x.yml") escapes
       # every trusted root, and `name` arrives from `riggs workflow:run NAME`
       # and from the /api/workflows/:name/run route -- so this is remote path
       # traversal, not just a local footgun.
-      return nil if safe.empty? || safe != name.to_s || safe.start_with?(".")
+      safe = safe_name(name)
+      return nil if safe.nil?
 
       Array(roots || default_roots).compact.each do |dir|
         candidate = File.join(dir, "#{safe}.yml")
-        return candidate if File.exist?(candidate)
+        next unless File.exist?(candidate)
+        # The syntactic guard stops `../`; it does not stop a SYMLINK inside
+        # the root pointing out of it. Containment is checked on real paths.
+        next unless contained?(candidate, dir)
+
+        return candidate
       end
       nil
+    end
+
+    def self.contained?(candidate, dir)
+      real_dir = File.realpath(dir)
+      File.realpath(candidate).start_with?("#{real_dir}#{File::SEPARATOR}")
+    rescue SystemCallError
+      false
     end
 ```
 
@@ -2046,9 +2060,38 @@ Against the current tree that is **nine** sites in two files:
 | `web/app.rb:325` API show | `Triggers.find_path(name)` |
 | `web/app.rb:473` HTML run | `Triggers.find_path(name)` |
 | `web/app.rb:532` resume | `Triggers.find_path(workflow_name)` |
+| `web/app.rb:550` `list_workflows` | delete the method; callers use `Triggers.list_declared.map { \|w\| w[:name] }` |
 | `web/app.rb:558` `workflows_dir` | delete the method |
 | `web/app.rb:170`, `:230` | `Triggers.list_declared` with no `dir:` |
 | `web/app.rb:566` | `Triggers.find_workflows(text: query)` with no `dir:` |
+| `cli/commands.rb:227` `workflow_new` | see below — it **writes**, so it needs the guard and a root, not `find_path` |
+
+`workflow:new` is the site three review rounds missed because it is a writer
+rather than a reader. It builds `"./config/riggs/workflows/#{name}.yml"` from
+an unvalidated `NAME`, `mkdir_p`s its dirname, writes it, and reloads it at
+`:243`. `riggs workflow:new ../../../../tmp/x` creates directories and writes a
+file outside every root. Add to `Triggers`:
+
+```ruby
+    # Where a writer puts a new workflow. Separate from find_path because
+    # creating a file is not looking one up: there is exactly one correct
+    # destination, and it is the project's own root whether or not anything
+    # is there yet.
+    def self.project_workflows_dir
+      File.join(Config::Resolver.project_path, "config", "riggs", "workflows")
+    end
+
+    def self.safe_name(name)
+      base = File.basename(name.to_s)
+      return nil if base.empty? || base != name.to_s || base.start_with?(".")
+
+      base
+    end
+```
+
+`find_path` uses `safe_name` too, so the guard has one definition. `workflow_new`
+becomes `name = Triggers.safe_name(name) or abort "❌ Invalid workflow name"`,
+then writes into `Triggers.project_workflows_dir`.
 
 `workflow_path` and `workflows_dir` must both be **gone**, not merely unused —
 a private helper that still resolves an untrusted path is a bypass waiting for
@@ -2056,11 +2099,14 @@ its next caller. Verify:
 
 ```bash
 grep -rn "config/riggs/workflows" lib
-grep -rn "workflow_path\|workflows_dir" lib
+grep -rn "workflow_path\|workflows_dir\|list_workflows" lib
 ```
 
-The first must show hits only inside `Triggers.default_roots`; the second must
-show none. Paste both outputs in your report.
+The first must show hits only inside `Triggers.default_roots`,
+`Triggers.project_workflows_dir`, and `CLI::Setup` — setup legitimately
+*creates* the directory, and `project_workflows_dir` is where a writer puts a
+new file. Anything else is a route that escaped the resolver. The second must
+show no hits at all. Paste both outputs in your report.
 
 **Add these tests** to `test/test_tier_roots.rb`, because 1a and 1b in the spec
 are deliberately separate assertions:
@@ -2296,6 +2342,34 @@ class TestMcpApproval < Minitest::Test
     assert_raises(ArgumentError) { Riggs::MCP::Manager.from_config(SERVERS) }
   end
 
+  # Every other test here builds a flat PROV by hand, which agrees with the
+  # code by construction. This one takes the shape Identity.resolved actually
+  # produces -- provenance keyed by SECTION -- and proves the call sites index
+  # into :mcp_servers rather than passing the whole hash, which would make
+  # every lookup miss and fail every server closed, including global ones.
+  def test_provenance_from_identity_resolved_has_the_shape_the_gate_indexes
+    Dir.mktmpdir do |dir|
+      trust = Riggs::Trust.new(path: File.join(dir, "trust.yml"))
+      global = File.join(dir, "global.yml")
+      File.write(global, Psych.dump("mcp_servers" => { "ctx" => { "command" => "echo" } }))
+      resolved = Riggs::Identity.resolved(cwd: dir, trust: trust, global_config: global)
+
+      assert_equal :global, resolved.provenance[:mcp_servers][:ctx]
+      mgr = Riggs::MCP::Manager.from_config(
+        resolved.config[:mcp_servers], provenance: resolved.provenance[:mcp_servers],
+        trust: trust, project_path: dir
+      )
+      refute_nil mgr.send(:client_for, "ctx")
+    end
+  end
+
+  # The gate raising is worthless if the caller eats it.
+  def test_not_approved_escapes_list_tools_rather_than_becoming_an_empty_list
+    with_trust do |trust|
+      assert_raises(Riggs::MCP::NotApproved) { manager(trust).list_tools }
+    end
+  end
+
   # R11.9 7b. A regression tripwire, NOT a proof: it matches a string pattern,
   # so it will miss `Client.send(:new, ...)`, `Client.new(**cfg)`, an aliased
   # constant, or a factory, and it will fire on a legitimate in-process
@@ -2514,10 +2588,38 @@ with it.
 reading a repository. Add a comment on `wrap_client` recording that it performs
 no approval and must never be reachable from configuration.
 
+**`NotApproved` must not be swallowed.** `Manager#list_tools` wraps each server
+in `rescue StandardError => e; warn ...; []` (`manager.rb:46`), and
+`NotApproved < Riggs::Error < StandardError` — so the gate raises, the rescue
+eats it, and the run continues with an empty tool list and a warning nobody
+reads. That is the Phase 10 lesson exactly: a raise is not a guard if a relay
+swallows it. Add, **before** the generic rescue in `list_tools` and in every
+other method that rescues broadly around `client_for`:
+
+```ruby
+        rescue NotApproved
+          raise
+```
+
+Audit them: `grep -n "rescue StandardError" lib/riggs/mcp/manager.rb`. Every
+one that can reach `client_for` needs the re-raise. R11.4 requires an error the
+operator sees, and a warning that returns `[]` is not one.
+
 **There are four `Manager.from_config` call sites, not two** — `commands.rb:338`,
-`383`, `516`, `535`. Update every one to pass `provenance:`, `trust:` and
-`project_path:` from `Identity.resolved`, plus `interactive: $stdin.tty?`. The
-web app and trigger paths pass `interactive: false`. Verify with:
+`383`, `516`, `535`. Update every one to pass `trust:` and `project_path:` from
+`Identity.resolved`, plus `interactive: $stdin.tty?`, and — critically —
+`provenance: resolved.provenance[:mcp_servers]`, **not** `resolved.provenance`.
+
+`Merge` returns provenance keyed by section (`{roles:, users:, providers:,
+mcp_servers:, default_user:}`), while `ensure_approved!` indexes it by server
+name. Passing the whole hash makes every lookup miss, so `@provenance.key?(name)`
+is false and the fail-closed branch raises `NotApproved` for **every** server,
+including global ones. The direct Manager tests hide this because they build a
+flat `PROV` by hand. Add a test that constructs the Manager from a real
+`Identity.resolved` so the shapes are checked against each other, not against a
+fixture that agrees with the code by construction.
+
+The web app and trigger paths pass `interactive: false`. Verify with:
 
 ```bash
 grep -rn "Manager.from_config" lib test
