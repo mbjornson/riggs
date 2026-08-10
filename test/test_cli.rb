@@ -20,7 +20,8 @@ class TestCLI < Minitest::Test
 
   def test_workflow_run_warns_when_mcp_config_is_broken
     with_tmp_project do
-      File.write(".agent_hubrc", "#{File.read('.agent_hubrc')}mcp_servers: totally_not_a_hash\n")
+      global_config = Riggs::Config::Resolver.global_config
+      File.write(global_config, "#{File.read(global_config)}mcp_servers: totally_not_a_hash\n")
       out, err = capture_io do
         Riggs::CLI.start(
           ["workflow:run", "example_triage", "--auto-approve", "--ticket", "Password reset request"]

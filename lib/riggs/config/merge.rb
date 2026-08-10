@@ -105,12 +105,25 @@ module Riggs
           all_global_sections.merge(default_user: :global)
         end
 
+        # A malformed section maps to {}, never to a missing key. Every consumer
+        # indexes this two levels deep, so an absent key is "undefined method
+        # '[]' for nil" in the caller -- the same crash the malformed-section
+        # handling exists to prevent, one method further along.
         def all_global_sections
-          %i[roles users providers mcp_servers].to_h { |key| [key, tier_map(global[key], :global)] }
+          section_keys.to_h { |key| [key, tier_map(global[key], :global)] }
         end
 
+        def section_keys
+          %i[roles users providers mcp_servers]
+        end
+
+        # nil is an absent section and a non-Hash is a malformed one. Both
+        # contribute no names, so both produce an empty map rather than reaching
+        # .keys on something that does not answer it.
         def tier_map(hash, tier)
-          (hash || {}).keys.to_h { |key| [key, tier] }
+          return {} unless hash.is_a?(Hash)
+
+          hash.keys.to_h { |key| [key, tier] }
         end
       end
 
@@ -223,15 +236,25 @@ module Riggs
         attr_reader :global, :project, :paths
 
         def merge(name, algebra)
-          Merge.const_get(algebra).new(global: global[name], project: project[name], paths: paths).call
+          Merge.const_get(algebra).new(
+            global: section_mapping(global, name),
+            project: section_mapping(project, name),
+            paths: paths
+          ).call
         end
 
         def config(results)
-          global.merge(results.transform_values(&:first)).merge(default_user_config)
+          merged = global.merge(results.transform_values(&:first)).merge(default_user_config)
+          malformed_global_sections.each { |name| merged[name] = global[name] }
+          merged
         end
 
+        # Emptied, not deleted -- see TierMerger#all_global_sections for why an
+        # absent key moves the crash into the caller instead of removing it.
         def provenance(results)
-          results.transform_values(&:last).merge(default_user: default_user_provenance)
+          merged = results.transform_values(&:last).merge(default_user: default_user_provenance)
+          malformed_global_sections.each { |name| merged[name] = {} }
+          merged
         end
 
         def default_user_config
@@ -244,6 +267,20 @@ module Riggs
           return :global unless project.key?(:default_user)
 
           :project
+        end
+
+        # The asymmetry is deliberate: project section shapes are enforced
+        # because repository config is untrusted input, but malformed global
+        # section values are preserved unchanged so legacy consumers still see
+        # the operator's exact data and can emit their own warnings.
+        def malformed_global_sections
+          ALGEBRAS.keys.select { |name| global.key?(name) && !global[name].is_a?(Hash) }
+        end
+
+        def section_mapping(tier, name)
+          return {} unless tier[name].is_a?(Hash)
+
+          tier[name]
         end
       end
 

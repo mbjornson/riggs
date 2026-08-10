@@ -6,7 +6,7 @@ require "json"
 class TestConfigStore < Minitest::Test
   def test_public_view_masks_secrets
     with_tmp_project do
-      File.write(".agent_hubrc", <<~YAML)
+      File.write(Riggs::Config::Resolver.global_config, <<~YAML)
         default_user: eng_bob
         users:
           eng_bob:
@@ -38,7 +38,7 @@ class TestConfigStore < Minitest::Test
       after = store.read
       assert_equal "ollama", after.dig(:providers, :extra, :type) || after.dig("providers", "extra", "type")
       assert before[:users] || before["users"]
-      backups = Dir.glob(".agent_hubrc.bak.*")
+      backups = Dir.glob("#{store.path}.bak.*")
       assert backups.any?, "expected backup file"
     end
   end

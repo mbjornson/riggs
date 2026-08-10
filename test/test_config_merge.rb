@@ -303,6 +303,51 @@ class TestConfigMerge < Minitest::Test
   # sections was still unchecked, so a top-level scalar reached .keys as a
   # NoMethodError instead of a configuration error.
 
+  # The asymmetry is deliberate: the global tier is operator-owned and must
+  # preserve malformed values as-is so downstream warnings still fire, while
+  # the project tier is repository input and remains shape-gated.
+  def test_a_malformed_global_section_passes_through_when_the_project_tier_is_empty
+    result = merge({ mcp_servers: "totally_not_a_hash" }, {})
+    assert_equal "totally_not_a_hash", result.config[:mcp_servers]
+    assert_equal({}, result.provenance[:mcp_servers])
+  end
+
+  def test_a_malformed_global_section_passes_through_when_the_project_tier_is_present
+    result = merge({ default_user: "matt", users: { matt: { role: "pm" } }, mcp_servers: "totally_not_a_hash" },
+                   { default_user: "matt" })
+    assert_equal "totally_not_a_hash", result.config[:mcp_servers]
+    assert_equal({}, result.provenance[:mcp_servers])
+  end
+
+  # Every consumer indexes provenance two levels deep -- provenance[:mcp_servers][name].
+  # Dropping the key instead of emptying it turned a malformed operator file into
+  # "undefined method '[]' for nil" inside whoever asked, which is the crash the
+  # malformed-section handling exists to prevent, moved one method along. Task 6
+  # hands provenance[:mcp_servers] to Manager.from_config, so this is that path.
+  def test_a_malformed_global_section_is_still_safe_to_index_by_name
+    %i[roles users providers mcp_servers].each do |section|
+      result = merge({ section => "not-a-mapping" }, {})
+      assert_equal({}, result.provenance[section], "#{section} provenance must be an empty map, not absent")
+      assert_nil result.provenance[section][:anything], "#{section} must be indexable by name"
+    end
+  end
+
+  # Global wins, and the project's well-formed entry is dropped rather than
+  # merged into a String. Fail-safe on purpose -- the operator's typo is the
+  # actual bug, and fixing it restores the project's servers -- but asserted
+  # here so the loss is a decision on record rather than a surprise.
+  def test_a_malformed_global_section_drops_a_project_contribution_to_that_section
+    result = merge({ mcp_servers: "totally_not_a_hash" }, { mcp_servers: { legit: { command: "echo" } } })
+    assert_equal "totally_not_a_hash", result.config[:mcp_servers]
+    assert_equal({}, result.provenance[:mcp_servers])
+  end
+
+  def test_the_same_malformed_value_is_still_rejected_in_the_project_tier
+    err = assert_raises(Riggs::Error) { merge({}, { mcp_servers: "totally_not_a_hash" }) }
+    assert_includes err.message, "mcp_servers"
+    assert_includes err.message, "mapping"
+  end
+
   def test_a_project_tier_that_is_not_a_mapping_is_a_configuration_error
     err = assert_raises(Riggs::Error) { merge({}, "not-a-mapping") }
     assert_includes err.message, P

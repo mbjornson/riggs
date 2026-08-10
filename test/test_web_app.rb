@@ -302,12 +302,13 @@ class TestWebApp < Minitest::Test
 
   # Every seeded role in test_helper holds inspect_run, so add one that does not.
   def write_role_without_inspect_run
-    cfg = Psych.safe_load(File.read(".agent_hubrc"), permitted_classes: [Symbol], aliases: true)
+    global_config = Riggs::Config::Resolver.global_config
+    cfg = Psych.safe_load(File.read(global_config), permitted_classes: [Symbol], aliases: true)
     cfg["users"]["blind_dan"] = {
       "id" => "blind_dan", "name" => "Dan", "role" => "blind", "memory_namespace" => "blind_dan_private"
     }
     cfg["roles"]["blind"] = ["read_workflow"]
-    File.write(".agent_hubrc", Psych.dump(cfg))
+    File.write(global_config, Psych.dump(cfg))
   end
 
   def test_stream_endpoint_emits_sse_frames_and_closes_on_terminal_status
