@@ -287,9 +287,13 @@ class TestConfigMerge < Minitest::Test
 
   # What a project may still do: choose the model, the chain and the auth
   # mode. Not where the traffic goes, not what it costs, not the credential.
+  #
+  # The operator defines `mock` here rather than the project naming it out of
+  # nowhere, which is what this fixture used to do -- and that made it a
+  # demonstration of the relay_chain introduction hole, not of retuning.
   def test_a_project_may_still_retune_model_relay_chain_and_auth
     result = merge(
-      { providers: { ollama: { type: "ollama", base_url: "http://operator-chosen" } } },
+      { providers: { ollama: { type: "ollama", base_url: "http://operator-chosen" }, mock: { type: "mock" } } },
       { providers: { ollama: { model: "llama3.2", relay_chain: %w[ollama mock], auth: "none" } } }
     )
     assert_equal "llama3.2", result.config[:providers][:ollama][:model]
@@ -302,6 +306,37 @@ class TestConfigMerge < Minitest::Test
   # ProjectShape checks each SECTION's shape. The document holding those
   # sections was still unchecked, so a top-level scalar reached .keys as a
   # NoMethodError instead of a configuration error.
+
+  # relay_chain is on the project allowlist because choosing WHICH configured
+  # provider runs is a local decision. But Router#build resolves a chain member
+  # straight from BUILTINS when no provider entry exists for it, so a chain was
+  # a way to name a provider class -- and its default endpoint -- that the
+  # operator had never enabled. Verified: default.relay_chain: [ollama] built
+  # OpenAICompatible against http://127.0.0.1:11434/v1 with no ollama entry
+  # anywhere. Assignment stays local; the set assigned from stays global.
+  def test_a_project_relay_chain_may_not_name_a_provider_the_operator_never_defined
+    err = assert_raises(Riggs::Error) do
+      merge({ providers: { default: { relay_chain: ["mock"] } } },
+            { providers: { default: { relay_chain: ["ollama"] } } })
+    end
+    assert_includes err.message, "ollama"
+    assert_includes err.message, P
+  end
+
+  def test_a_project_relay_chain_may_name_a_globally_defined_provider
+    result = merge({ providers: { default: { relay_chain: ["mock"] }, claude: { model: "opus" } } },
+                   { providers: { default: { relay_chain: ["claude"] } } })
+    assert_equal ["claude"], result.config.dig(:providers, :default, :relay_chain)
+  end
+
+  # The operator's own chains name builtins with no provider entry of their
+  # own, and that is legitimate. A project reordering names the operator
+  # already dispatches is assignment, not introduction.
+  def test_a_project_relay_chain_may_name_a_member_of_a_global_relay_chain
+    result = merge({ providers: { default: { relay_chain: %w[codex claude_cli] } } },
+                   { providers: { default: { relay_chain: ["claude_cli"] } } })
+    assert_equal ["claude_cli"], result.config.dig(:providers, :default, :relay_chain)
+  end
 
   # The asymmetry is deliberate: the global tier is operator-owned and must
   # preserve malformed values as-is so downstream warnings still fire, while

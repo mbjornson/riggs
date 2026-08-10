@@ -433,6 +433,41 @@ module Riggs
         def validate_fields!(name)
           reject_extra_fields!(name)
           validate_auth!(name)
+          validate_relay_chain!(name)
+        end
+
+        # relay_chain is allowlisted, but Router#build resolves a chain member
+        # from BUILTINS when nothing configures it, so an unchecked chain let a
+        # project name a provider class -- and its default endpoint -- the
+        # operator never enabled. reject_unknown! above checks the entry being
+        # overridden; this checks the names inside it.
+        def validate_relay_chain!(name)
+          unknown = chain_for(name) - dispatchable
+          return if unknown.empty?
+
+          raise Error, chain_message(name, unknown.first)
+        end
+
+        def chain_for(name)
+          Array(fields_for(name)[:relay_chain]).map(&:to_s)
+        end
+
+        # What the operator already dispatches: an entry in their providers
+        # map, or a member of one of their own chains -- those legitimately
+        # have no entry of their own.
+        def dispatchable
+          global.keys.map(&:to_s) | global.each_value.flat_map { |opts| global_chain(opts) }
+        end
+
+        def global_chain(opts)
+          return [] unless opts.is_a?(Hash)
+
+          Array(opts[:relay_chain]).map(&:to_s)
+        end
+
+        def chain_message(name, unknown)
+          "#{paths[:project]}: provider '#{name}' relay_chain names '#{unknown}', which #{paths[:global]} does " \
+            "not define (a project may reorder providers the operator configured, not introduce one)"
         end
 
         def reject_extra_fields!(name)

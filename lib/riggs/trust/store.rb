@@ -2,6 +2,7 @@
 
 require "psych"
 require "fileutils"
+require "securerandom"
 
 module Riggs
   class Trust
@@ -15,12 +16,13 @@ module Riggs
         @path = path
       end
 
-      # Opened once, with TRUNC, and written through that one descriptor.
-      # NOFOLLOW is what stops the registry becoming a write primitive aimed
-      # somewhere else: pointing trust.yml at another file made riggs write
-      # its project list THROUGH the link into that file and chmod the target
-      # to 0600.
-      WRITE_FLAGS = File::WRONLY | File::CREAT | File::TRUNC | File::NOFOLLOW
+      # EXCL, not TRUNC. NOFOLLOW stops the registry becoming a write primitive
+      # aimed somewhere else through a SYMBOLIC link, but a hard link is not a
+      # link to open -- the entry IS the file, and TRUNC wrote our project list
+      # into whatever inode was already sitting there and chmod'd it to 0600.
+      # EXCL refuses any pre-existing entry at all, link or not, which is the
+      # only form of that check that does not have to enumerate link types.
+      WRITE_FLAGS = File::WRONLY | File::CREAT | File::EXCL | File::NOFOLLOW
 
       def read
         return empty unless File.exist?(@path)
@@ -61,9 +63,18 @@ module Riggs
       # cannot leave the half-written file #shaped exists to survive.
       def write_private(body)
         reject_symlink!
-        temp = "#{@path}.#{Process.pid}.tmp"
+        temp = temp_path
         File.open(temp, WRITE_FLAGS, 0o600) { |file| write_body(file, body) }
         File.rename(temp, @path)
+      end
+
+      # Random, not "#{@path}.#{Process.pid}.tmp". A pid is public and reused,
+      # so the old name told an attacker exactly which entry to occupy before
+      # riggs got there, and told two concurrent runs to fight over one file.
+      # EXCL above is what refuses an occupied name; this is what stops the
+      # name being worth occupying.
+      def temp_path
+        "#{@path}.#{SecureRandom.hex(8)}.tmp"
       end
 
       # The rename above already refuses to write THROUGH a link, so this is

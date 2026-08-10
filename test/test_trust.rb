@@ -344,6 +344,37 @@ class TestTrust < Minitest::Test
     end
   end
 
+  # The hard-link fix above moved the target rather than removing it: the temp
+  # file was named trust.yml.<pid>.tmp, which anyone can predict, and it was
+  # opened with TRUNC. A hard link waiting at THAT name got truncated and
+  # chmod'd 0600 before the rename -- Store#write as an arbitrary-overwrite
+  # primitive, one filename over from where it was just closed.
+  def test_writing_does_not_truncate_a_hard_link_waiting_at_the_predictable_temp_path
+    Dir.mktmpdir do |dir|
+      victim = File.join(dir, "victim.txt")
+      File.write(victim, "PRECIOUS\n")
+      File.chmod(0o644, victim)
+      path = File.join(dir, "trust.yml")
+      File.link(victim, "#{path}.#{Process.pid}.tmp")
+      Riggs::Trust.new(path: path).grant!("/p")
+      assert_equal "PRECIOUS\n", File.read(victim), "a hard link at the temp path must not be written through"
+      assert_equal 0o644, File.stat(victim).mode & 0o777, "a hard link at the temp path must not be chmod'd"
+    end
+  end
+
+  # Predictability is the other half: even without a pre-placed link, two names
+  # derived from the same pid collide across runs, so the temp name must not be
+  # derivable from the path and the process id alone.
+  def test_the_temporary_path_is_not_derivable_from_the_process_id
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "trust.yml")
+      File.write("#{path}.#{Process.pid}.tmp", "squatted\n")
+      Riggs::Trust.new(path: path).grant!("/p")
+      assert_equal "squatted\n", File.read("#{path}.#{Process.pid}.tmp")
+      assert Riggs::Trust.new(path: path).trusted?("/p"), "the write must still have succeeded"
+    end
+  end
+
   # The rename is also what makes a write atomic, so a crash mid-write cannot
   # produce the half-written file that Store#shaped exists to survive.
   def test_writing_leaves_no_temporary_file_behind
