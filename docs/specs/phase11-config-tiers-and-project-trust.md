@@ -111,6 +111,14 @@ memory scoping (R11.7), so it must never be nil — a directory with no project
 tier is still a project for the purposes of "whose spend was that" and "which
 memories are these."
 
+**`$HOME` is never a project directory.** The project tier lives at
+`<project_path>/.riggs/config.yml` and the global tier at
+`~/.riggs/config.yml`; when `project_path` is `$HOME` those are the same file,
+and reading one file as both tiers makes every R11.2 redefinition check fire
+against itself. When `project_path == File.expand_path("~")` there is no
+project tier: the global tier is used alone, and `riggs setup` writes no
+project file. Attribution and memory scoping still key on the path as normal.
+
 Skills and workflows resolve through an ordered root list, first match wins:
 
 ```
@@ -282,16 +290,33 @@ becomes a tiered resolver rather than a flat list.
 each value came from, since a value shown without its origin invites an edit
 that lands in the wrong file.
 
-`riggs setup` splits:
+`riggs setup` stays one command with no new flags. It ensures both tiers exist,
+per artifact, creating only what is missing and never overwriting a config file
+that is already there — the behavior `setup` has today, extended across two
+tiers.
 
-- `riggs setup --global` writes `~/.riggs/config.yml`, `~/.riggs/trust.yml`,
-  the skills and workflows directories, and the database. Idempotent.
-- `riggs setup` in a repo writes only `.riggs/config.yml` and the project
-  skills/workflows directories, and records trust for the path. It no longer
-  writes `db/`, `sqlite_path`, `users`, or `roles`. The project file it writes
-  is a commented skeleton — every key it mentions is one the project tier is
-  permitted to set under R11.2, so the generated file cannot itself trip a
-  hard error.
+**Global tier**, checked and created first: `~/.riggs/config.yml`,
+`~/.riggs/trust.yml`, `~/.riggs/skills/`, `~/.riggs/workflows/`, and the
+database. Each is created only if absent, so a global tier whose `skills/`
+directory was deleted is repaired rather than left broken, and an existing
+`config.yml` is reported and kept.
+
+**On first creation of the global `config.yml` only**, if the current directory
+has an `.agent_hubrc` or `.riggs/config.yml` carrying `users`, `roles`, or
+`providers`, setup seeds the global file from them and says so. This is the
+upgrade path, and it fires at the one moment the values to import are in reach.
+It never runs against an existing global config.
+
+**Project tier**, unless `project_path` is `$HOME` (R11.1): `.riggs/config.yml`
+plus the project `skills/` and `workflows/` directories. It no longer writes
+`db/`, `sqlite_path`, `users`, or `roles`. The file it writes is a commented
+skeleton naming only keys the project tier may set under R11.2, so a generated
+file cannot itself trip a hard error.
+
+Running `riggs setup` in a directory **records trust for that path**. Typing it
+somewhere you chose is consent, so no separate prompt is raised — but setup MUST
+print that it granted trust, alongside which tiers it created and which it found
+and kept. A trust grant nobody saw is the thing R11.5 exists to prevent.
 
 ## R11.9 Tests
 
@@ -319,15 +344,28 @@ Every claim below must be proved by breaking it and watching a test fail.
     groups correctly, with pre-existing NULL rows reported as `(unattributed)`.
 12. A memory persisted under project A is not returned by recall under
     project B, on **both** the SQL and vector backends.
+13. `riggs setup` run twice leaves an existing `~/.riggs/config.yml` byte-for-byte
+    unchanged, while recreating a `~/.riggs/skills/` directory deleted between
+    the two runs.
+14. `riggs setup` in a directory holding an `.agent_hubrc` with `users` and
+    `roles`, against a machine with no `~/.riggs/`, produces a global config
+    carrying those users and roles — and the same command run a second time,
+    against a different `.agent_hubrc`, does not alter the global file.
+15. `riggs setup` with `project_path == $HOME` writes no project tier and does
+    not overwrite the global `config.yml` it just created.
+16. `riggs setup` records trust for the path and prints that it did.
 
 ## What breaks
 
 - Any existing `.agent_hubrc` continues to load, but `sqlite_path`, `users`,
-  and `roles` in it now belong to the project tier. A single-project user who
-  never runs `riggs setup --global` gets a global tier with no users defined,
-  so **`riggs setup --global` must be able to import an existing
-  `.agent_hubrc`'s `users`, `roles`, and `providers` into `~/.riggs/config.yml`**
-  in one step. Without that, the first upgrade is a manual copy.
+  and `roles` in it now belong to the project tier, where `sqlite_path` and
+  `roles` redefinitions are hard errors. The seeding step in R11.8 is what
+  keeps the first upgrade from being a manual copy, and it only fires once —
+  so the upgrade must be run from a repo that still has the `.agent_hubrc`
+  worth importing. Running `riggs setup` first in an empty directory creates
+  an empty global tier and forecloses the import; setup MUST say what it
+  seeded, or say plainly that it created an empty global config, so this is
+  visible when it happens rather than at the next failed run.
 - The database moves from `db/riggs.sqlite3` to `~/.riggs/riggs.sqlite3`. An
   explicit `sqlite_path` in the global tier still wins, so an existing database
   can be adopted in place rather than migrated.
@@ -349,7 +387,7 @@ operator's call rather than the implementer's:
 ## Split
 
 **Phase 11a** — R11.1 through R11.5, R11.8. Config tiers, trust, approval,
-provenance, `setup --global`.
+provenance, two-tier `setup`.
 
 **Phase 11b** — R11.6, R11.7. Attribution column, cost roll-up, memory scoping.
 Small, and depends on 11a landing, because the project path it records is the
