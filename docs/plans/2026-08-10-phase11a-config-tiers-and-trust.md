@@ -1076,6 +1076,15 @@ class TestConfigMerge < Minitest::Test
     assert_equal :global, result.provenance[:users][:kim]
   end
 
+  # The distinguishing case: mentioned but unchanged. Without this, the
+  # "unless merged[name] == g[name]" guard could be deleted and the test above
+  # would still pass.
+  def test_restating_a_users_existing_role_does_not_claim_project_provenance
+    result = merge({ roles: { pm: [] }, users: { matt: { role: "pm" } } },
+                   { users: { matt: { role: "pm" } } })
+    assert_equal :global, result.provenance[:users][:matt]
+  end
+
   def test_a_user_naming_an_undefined_role_is_a_hard_error_listing_the_defined_ones
     err = assert_raises(Riggs::Error) do
       merge({ roles: { pm: [] } }, { users: { kim: { role: "client_reviewer" } } })
@@ -1557,10 +1566,15 @@ In `lib/riggs/identity.rb`, replace `CONFIG_CANDIDATES`, `config_path` and `load
                           :trusted, :legacy, keyword_init: true)
 
     def self.resolved(cwd: Dir.pwd, trust: nil, global_config: nil)
-      r = Config::Resolver.new(cwd: cwd, trust: trust, global_config: global_config).resolve
+      # Resolve the real path first. Passing the nil-defaulted parameter
+      # straight through made every production merge diagnostic name a
+      # placeholder instead of the actual file -- the same defect as
+      # config_path's nil, one method over.
+      gc = global_config || Config::Resolver.global_config
+      r = Config::Resolver.new(cwd: cwd, trust: trust, global_config: gc).resolve
       merged = Config::Merge.call(
         global: r.global, project: r.project,
-        global_path: global_config, project_path: r.project_config_path || r.project_path
+        global_path: gc, project_path: r.project_config_path || r.project_path
       )
       Resolved.new(
         config: merged.config, provenance: merged.provenance, project_path: r.project_path,
@@ -1775,8 +1789,28 @@ class TestTierRoots < Minitest::Test
       assert_equal %w[deploy triage], found.map { |w| w[:name] }.sort
       triage = found.find { |w| w[:name] == "triage" }
       assert_equal File.join(project, "triage.yml"), triage[:path]
+      # Both roots here are explicit temp directories, so neither equals
+      # Trust.home/workflows or the bundled path and tier_for reports :project
+      # for both. Shadowing is what this test asserts; tier LABELLING is
+      # asserted below against real roots, where the comparison is meaningful.
       assert_equal :project, triage[:tier]
-      assert_equal :global, found.find { |w| w[:name] == "deploy" }[:tier]
+    end
+  end
+
+  def test_tier_labels_the_real_global_and_bundled_roots
+    Dir.mktmpdir do |home|
+      with_riggs_home(File.join(home, ".riggs")) do
+        global = File.join(home, ".riggs", "workflows")
+        FileUtils.mkdir_p(global)
+        File.write(File.join(global, "deploy.yml"), workflow_yaml("deploy"))
+        Dir.mktmpdir do |repo|
+          Dir.chdir(repo) do
+            Riggs::Config::Resolver.reset_cache!
+            entry = Riggs::Triggers.list_declared.find { |w| w[:name] == "deploy" }
+            assert_equal :global, entry[:tier]
+          end
+        end
+      end
     end
   end
 
@@ -1932,10 +1966,14 @@ In `lib/riggs/triggers.rb`, replace both methods:
       end
     end
 
+    # Carries the tier out with each match. The spec requires BOTH triggers:list
+    # and triggers:match to report it, and discarding it here left
+    # triggers_match unable to explain why a workflow that is not in the repo
+    # matched -- which is the case the tier exists to explain.
     def self.find_workflows(text:, dir: nil, roots: nil)
       out = []
-      each_declared(roots || (dir ? [dir] : default_roots)) do |workflow, _path, _tier|
-        out << workflow if match(workflow, text: text)
+      each_declared(roots || (dir ? [dir] : default_roots)) do |workflow, _path, tier|
+        out << workflow.merge(tier: tier) if match(workflow, text: text)
       end
       out
     end
@@ -1957,7 +1995,10 @@ In `lib/riggs/triggers.rb`, replace both methods:
 
 Keep the rest of `list_declared`'s existing return shape intact — read the current method before editing and preserve every key it already produces.
 
-In `lib/riggs/cli/commands.rb`, `triggers_list` prints each workflow; add the tier to that line so a global match is explicable.
+In `lib/riggs/cli/commands.rb`, **both** `triggers_list` (`:193`) and
+`triggers_match` (`:179`) print each workflow; add the tier to both lines. The
+match path is the one that most needs it — that is where a workflow which is
+not in the repo appears without explanation.
 
 **Route every workflow caller through the same root list.** This is the point
 of the task, not a tidy-up. Enumeration and loading are separate functions in
@@ -1966,35 +2007,60 @@ this codebase with separately hardcoded paths, and they diverged — gating
 *execution* path open. Add:
 
 ```ruby
-    # The one place a workflow NAME becomes a file path. CLI#load_workflow and
-    # WebApp#list_workflows each hardcoded config/riggs/workflows before this,
-    # so trusting default_roots gated what `triggers:list` showed and nothing
-    # that ran. First root wins, matching skill resolution.
+    # The one place a workflow NAME becomes a file path. Before this,
+    # CLI#load_workflow and WebApp#workflow_path each hardcoded
+    # config/riggs/workflows, and web/app.rb reached them from show, run and
+    # resume -- so gating default_roots governed what `triggers:list` displayed
+    # and nothing that executed. First root wins, matching skill resolution.
     def self.find_path(name, roots: nil)
+      safe = File.basename(name.to_s)
+      # A name is a NAME, not a path. File.join(dir, "../../etc/x.yml") escapes
+      # every trusted root, and `name` arrives from `riggs workflow:run NAME`
+      # and from the /api/workflows/:name/run route -- so this is remote path
+      # traversal, not just a local footgun.
+      return nil if safe.empty? || safe != name.to_s || safe.start_with?(".")
+
       Array(roots || default_roots).compact.each do |dir|
-        candidate = File.join(dir, "#{name}.yml")
+        candidate = File.join(dir, "#{safe}.yml")
         return candidate if File.exist?(candidate)
       end
       nil
     end
 ```
 
-Then replace both callers:
+Then replace **every** caller. Enumerate them mechanically rather than by
+memory — routing one helper and missing the rest is the exact error this task
+has now made twice, and both times the missed route was the one that executes:
 
-- `lib/riggs/cli/commands.rb:609` — `load_workflow(name)` becomes
-  `path = Triggers.find_path(name) or abort "❌ Workflow not found: #{name}.yml"`,
-  deleting its two hardcoded paths.
-- `lib/riggs/web/app.rb:550` — `list_workflows` becomes
-  `Triggers.list_declared.map { |w| w[:name] }`, deleting its `dirs` array.
-  Audit the rest of `web/app.rb` for any other `config/riggs/workflows` literal
-  and route it the same way:
+```bash
+grep -rn "config/riggs/workflows\|workflows_dir\|workflow_path\|Triggers\." lib
+```
+
+Against the current tree that is **nine** sites in two files:
+
+| site | change |
+| --- | --- |
+| `cli/commands.rb:609` `load_workflow` | `path = Triggers.find_path(name)`, delete both hardcoded paths |
+| `web/app.rb:571` `workflow_path` | delete the method; callers use `Triggers.find_path(name)` |
+| `web/app.rb:278` HTML show | `Triggers.find_path(name)` |
+| `web/app.rb:325` API show | `Triggers.find_path(name)` |
+| `web/app.rb:473` HTML run | `Triggers.find_path(name)` |
+| `web/app.rb:532` resume | `Triggers.find_path(workflow_name)` |
+| `web/app.rb:558` `workflows_dir` | delete the method |
+| `web/app.rb:170`, `:230` | `Triggers.list_declared` with no `dir:` |
+| `web/app.rb:566` | `Triggers.find_workflows(text: query)` with no `dir:` |
+
+`workflow_path` and `workflows_dir` must both be **gone**, not merely unused —
+a private helper that still resolves an untrusted path is a bypass waiting for
+its next caller. Verify:
 
 ```bash
 grep -rn "config/riggs/workflows" lib
+grep -rn "workflow_path\|workflows_dir" lib
 ```
 
-Every remaining hit must be inside `Triggers.default_roots`. Paste the grep
-output in your report.
+The first must show hits only inside `Triggers.default_roots`; the second must
+show none. Paste both outputs in your report.
 
 **Add these tests** to `test/test_tier_roots.rb`, because 1a and 1b in the spec
 are deliberately separate assertions:
@@ -2041,9 +2107,14 @@ Run the file, then `bundle exec rake test`.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add lib/riggs/skills/registry.rb lib/riggs/triggers.rb lib/riggs/cli/commands.rb test/test_tier_roots.rb
-git commit -m "Add global tier to skill and workflow roots, report tier on match"
+git add lib/riggs/skills/registry.rb lib/riggs/triggers.rb lib/riggs/cli/commands.rb \
+        lib/riggs/web/app.rb test/test_tier_roots.rb test/test_web_app.rb
+git commit -m "Route every workflow lookup through one trust-gated resolver"
 ```
+
+Before committing, re-derive this file list from `git status --short` rather
+than trusting the line above. A commit block that omits a file the task edited
+is how the web-route fix would silently not ship.
 
 ---
 
@@ -2126,6 +2197,40 @@ class TestMcpApproval < Minitest::Test
       command = client.instance_variable_get(:@command)
       assert command.start_with?("/"), "expected an absolute resolved path, got #{command.inspect}"
       assert_equal Riggs::Trust.resolve_executable("echo"), command
+    end
+  end
+
+  # The one test in this file that actually reaches Open3. Every other
+  # assertion stops at Client construction, which cannot distinguish "the gate
+  # allowed it" from "the gate allowed it and the spawn would have failed".
+  def test_an_unapproved_server_never_reaches_open3
+    Dir.mktmpdir do |dir|
+      marker = File.join(dir, "spawned-4c1a")
+      trust = Riggs::Trust.new(path: File.join(dir, "trust.yml"))
+      trust.grant!("/repo")
+      cfg = { evil: { command: "/bin/sh", args: ["-c", "touch #{marker}"] } }
+      mgr = Riggs::MCP::Manager.from_config(cfg, provenance: { evil: :project },
+                                            trust: trust, project_path: "/repo")
+      assert_raises(Riggs::MCP::NotApproved) { mgr.list_tools }
+      refute File.exist?(marker), "an unapproved server must never be spawned"
+    end
+  end
+
+  def test_an_approved_server_does_reach_open3
+    Dir.mktmpdir do |dir|
+      marker = File.join(dir, "spawned-9f2a")
+      trust = Riggs::Trust.new(path: File.join(dir, "trust.yml"))
+      trust.grant!("/repo")
+      cfg = { ok: { command: "/bin/sh", args: ["-c", "touch #{marker}; exec cat"] } }
+      digest = Riggs::Trust.digest(command: Riggs::Trust.resolve_executable("/bin/sh"),
+                                   args: cfg[:ok][:args], env: {})
+      trust.approve_mcp!("/repo", "ok", digest)
+      mgr = Riggs::MCP::Manager.from_config(cfg, provenance: { ok: :project },
+                                            trust: trust, project_path: "/repo")
+      mgr.send(:client_for, "ok").start!
+      assert File.exist?(marker), "an approved server must actually spawn; otherwise the gate proves nothing"
+    ensure
+      mgr&.close
     end
   end
 
@@ -2353,7 +2458,13 @@ with:
       # that cannot answer "did a repo introduce this?" must refuse, not
       # assume no.
       def ensure_approved!(name, cfg)
-        return cfg[:command] if @provenance[name] == :global
+        # Resolve for BOTH tiers. A global server spawned by bare name still
+        # re-consults PATH inside popen2, so "the resolved path is what gets
+        # spawned" would have been false for exactly the servers the operator
+        # trusts most. Resolution is not an approval; it is just naming the
+        # file precisely.
+        resolved = Trust.resolve_executable(cfg[:command], env: cfg[:env] || {})
+        return resolved if @provenance[name] == :global
 
         unless @provenance.key?(name)
           raise NotApproved, "MCP server '#{name}' has no recorded tier. Build the Manager with " \
@@ -2364,8 +2475,11 @@ with:
                              "without trust:/project_path:, so approval cannot be checked."
         end
 
-        resolved = Trust.resolve_executable(cfg[:command], env: cfg[:env] || {})
-        digest = Trust.digest(command: cfg[:command], args: cfg[:args] || [], env: cfg[:env] || {})
+        # Digest the path ALREADY resolved above, not the bare command -- which
+        # would make Trust.digest resolve a second time, and a filesystem or
+        # PATH change between the two calls could approve binary B while
+        # spawning binary A. One resolution, used for both.
+        digest = Trust.digest(command: resolved, args: cfg[:args] || [], env: cfg[:env] || {})
         return resolved if @trust.mcp_approved?(@project_path, name, digest)
         return resolved if @interactive && prompt_and_record!(name, cfg, digest)
 
@@ -2424,9 +2538,15 @@ Change `return unless @provenance[name] == :project` to `return`.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add lib/riggs/mcp/approval.rb lib/riggs/mcp/manager.rb test/test_mcp_approval.rb
+git add lib/riggs/mcp/approval.rb lib/riggs/mcp/manager.rb lib/riggs/mcp/client.rb \
+        test/test_mcp_approval.rb test/test_mcp.rb test/test_mcp_manager.rb
 git commit -m "Gate project-declared MCP servers behind per-server approval"
 ```
+
+`client.rb` is in the list because Task 6 deletes `MCP::Client.from_config` from
+it; `test_mcp.rb` and `test_mcp_manager.rb` because they assert on that method
+and call `from_config` without `provenance:`. Re-derive the list from
+`git status --short` before committing.
 
 ---
 

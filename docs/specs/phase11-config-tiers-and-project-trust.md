@@ -47,6 +47,16 @@ recorded against the path.
 - **Sandboxing.** Trust is an input-loading guard, exactly as Pi's docs are
   careful to describe `project_trust`. An approved MCP server runs with the
   user's full privileges. Nothing here constrains what approved code may do.
+- **Binding an interpreter's own lookups.** Approval binds the executable
+  file that riggs spawns. It does not bind what that file then resolves: an
+  approved `/opt/homebrew/bin/npx` typically runs `#!/usr/bin/env node`, and a
+  project-controlled `PATH` can change which `node` that finds — without
+  re-prompting, because the digest deliberately excludes environment *values*.
+  Closing this would mean digesting `PATH`'s value, which changes between
+  shells and would re-prompt constantly for no security gain against the
+  threat this phase addresses. Stated as a limit rather than left implied,
+  because "the resolved executable is what runs" is otherwise easy to read as
+  a stronger guarantee than it is.
 - **Credential storage.** No tier gains the ability to hold a secret value.
   Phases 9 and 10 settled that credentials come from the environment or a CLI's
   own stored login; this spec narrows where they may appear, never widens it.
