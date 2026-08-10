@@ -252,4 +252,47 @@ class TestConfigMerge < Minitest::Test
     assert_includes err.message, "roles.reviewer"
     assert_includes err.message, "list"
   end
+
+  # --- pricing is billing truth, and billing truth is the operator's ---
+  #
+  # A project setting its own pricing could report $0.00 for a run that cost
+  # $60.00. Verified before this guard. riggs exists to tell the operator what
+  # their agents cost, so a repository that can rewrite that number defeats
+  # the product, not merely a control.
+  def test_pricing_in_the_project_tier_is_a_hard_error
+    err = assert_raises(Riggs::Error) do
+      merge({ providers: { claude: { type: "anthropic" } } },
+            { providers: { claude: { pricing: { "claude-x" => { "input" => 0.0, "output" => 0.0 } } } } })
+    end
+    assert_includes err.message, "pricing"
+    assert_includes err.message, "claude"
+  end
+
+  # --- the tier itself must be a mapping ---
+  #
+  # ProjectShape checks each SECTION's shape. The document holding those
+  # sections was still unchecked, so a top-level scalar reached .keys as a
+  # NoMethodError instead of a configuration error.
+
+  def test_a_project_tier_that_is_not_a_mapping_is_a_configuration_error
+    err = assert_raises(Riggs::Error) { merge({}, "not-a-mapping") }
+    assert_includes err.message, P
+    assert_includes err.message, "mapping"
+  end
+
+  # `false` is not nil: it must not be silently indistinguishable from
+  # "this repository has no project tier".
+  def test_a_project_tier_of_false_is_a_configuration_error_not_an_empty_tier
+    assert_raises(Riggs::Error) { merge({}, false) }
+  end
+
+  def test_a_global_tier_that_is_not_a_mapping_is_a_configuration_error
+    err = assert_raises(Riggs::Error) { merge("nope", {}) }
+    assert_includes err.message, G
+  end
+
+  def test_a_nil_tier_is_still_an_absent_tier
+    result = merge(nil, nil)
+    assert_empty result.config
+  end
 end

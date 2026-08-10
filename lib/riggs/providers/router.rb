@@ -265,13 +265,27 @@ module Riggs
       # Normalizes vendor usage and prices it. Only Router resolves provider
       # config, so the per-model pricing override is only reachable here.
       def meter(result, name)
-        opts = provider_config(name)
         usage = Usage.normalize(result[:usage])
-        overrides = opts[:pricing] || {}
         result.merge(
           usage: usage,
-          cost_usd: ModelInfo.cost(model: result[:model], usage: usage, overrides: overrides)
+          cost_usd: ModelInfo.cost(model: result[:model], usage: usage, overrides: pricing_for(name))
         )
+      end
+
+      # Pricing comes from the HUB config alone, deliberately not through
+      # #provider_config -- which merges hub <- workflow and lets the workflow
+      # win, as every other field should. A workflow file travels with a
+      # repository, so that merge let a clone declare its own prices and
+      # report $0.00 for a run that cost $60.00. riggs exists to tell the
+      # operator what their agents cost, so pricing is the operator's the same
+      # way credentials are; Config::Merge::PROVIDER_FIELDS is the matching
+      # guard for the project config tier.
+      def pricing_for(name)
+        key = name.to_s
+        hub = @hub_providers[key.to_sym] || @hub_providers[key] || {}
+        return {} unless hub.is_a?(Hash)
+
+        hub[:pricing] || {}
       end
     end
   end

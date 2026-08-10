@@ -18,7 +18,14 @@ module Riggs
 
       # Same reasoning one level down: banning api_key alone left token,
       # secret, password and a nested auth: hash wide open.
-      PROVIDER_FIELDS = %i[model base_url pricing relay_chain auth].freeze
+      #
+      # `pricing` is deliberately NOT here. riggs exists to tell the operator
+      # what their agents cost, and a project that sets its own pricing can
+      # report $0.00 for a run that cost $60.00 -- measured, not theorised.
+      # That defeats the product rather than merely bypassing a control, so
+      # pricing is the operator's the same way credentials are. The matching
+      # guard for workflow-declared pricing lives in Router#pricing_for.
+      PROVIDER_FIELDS = %i[model base_url relay_chain auth].freeze
 
       # On a user the global tier already defines, only the role may change.
       # Everything else -- id, name, github_username, memory_namespace -- is
@@ -42,9 +49,9 @@ module Riggs
         # This seam keeps diagnostics supplied by the required public interface
         # while avoiding optional parameters under the current Ruby standards.
         def initialize(global:, project:, global_path:, project_path:)
-          @global = Identity.deep_symbolize(global || {})
-          @project = Identity.deep_symbolize(project || {})
           @paths = { global: global_path, project: project_path }
+          @global = mapping(global, :global)
+          @project = mapping(project, :project)
         end
 
         def call
@@ -56,6 +63,18 @@ module Riggs
         private
 
         attr_reader :global, :project, :paths
+
+        # ProjectShape checks each SECTION's shape; this checks the document
+        # holding them. A top-level scalar reached .keys as a NoMethodError
+        # rather than a configuration error, and `false` was silently
+        # indistinguishable from "this repository has no project tier at all".
+        # nil still means absent, which is how a missing file arrives.
+        def mapping(tier, which)
+          return {} if tier.nil?
+          raise Error, "#{paths[which]}: the file must contain a mapping, got #{tier.class}" unless tier.is_a?(Hash)
+
+          Identity.deep_symbolize(tier)
+        end
 
         def merge_project
           ProjectKeys.new(project: project, paths: paths).validate!

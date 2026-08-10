@@ -325,6 +325,34 @@ class TestTrust < Minitest::Test
     end
   end
 
+  # O_NOFOLLOW stops a symbolic link but says nothing about a HARD link: the
+  # directory entry is the file, so opening it with TRUNC overwrote the shared
+  # inode and chmod'd it to 0600. Writing a fresh file and renaming it over
+  # the entry replaces our name only, and leaves every other name for that
+  # inode untouched.
+  def test_writing_replaces_our_directory_entry_not_the_inode_behind_a_hard_link
+    Dir.mktmpdir do |dir|
+      victim = File.join(dir, "victim.yml")
+      File.write(victim, "do-not-overwrite: true\n")
+      File.chmod(0o644, victim)
+      path = File.join(dir, "trust.yml")
+      File.link(victim, path)
+      Riggs::Trust.new(path: path).grant!("/p")
+      assert_equal "do-not-overwrite: true\n", File.read(victim), "the other link's content must survive"
+      assert_equal 0o644, File.stat(victim).mode & 0o777, "the other link's mode must survive"
+      assert_equal 0o600, File.stat(path).mode & 0o777
+    end
+  end
+
+  # The rename is also what makes a write atomic, so a crash mid-write cannot
+  # produce the half-written file that Store#shaped exists to survive.
+  def test_writing_leaves_no_temporary_file_behind
+    with_trust do |trust, dir|
+      trust.grant!("/p")
+      assert_equal ["trust.yml"], Dir.children(dir).sort
+    end
+  end
+
   private
 
   def assert_reads_as_empty(trust)

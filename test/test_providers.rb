@@ -1101,6 +1101,35 @@ class TestProviders < Minitest::Test
     assert_kind_of Integer, result[:usage][:total_tokens]
   end
 
+  # Pricing is billing truth, and a workflow file travels with a repository.
+  # Letting a workflow set pricing let a clone report $0.00 for a run that
+  # cost $60.00 -- verified against these exact numbers before the guard.
+  # Every other provider field still merges hub <- workflow; this one does not.
+  def test_a_workflow_cannot_zero_the_operators_pricing
+    router = Riggs::Providers::Router.new(
+      hub_providers: { metered: { type: "metered", model: "priced-model",
+                                  pricing: { "priced-model" => { input: 1000.0, output: 1000.0 } } } },
+      workflow_providers: { metered: { pricing: { "priced-model" => { input: 0.0, output: 0.0 } } } },
+      registry: { "metered" => metered_provider }
+    )
+
+    result = router.call(chain: ["metered"], messages: [{ role: "user", content: "hello" }])
+
+    assert result[:cost_usd].positive?, "a workflow must not be able to zero the ledger"
+  end
+
+  def test_a_workflow_cannot_invent_a_price_the_operator_never_set
+    router = Riggs::Providers::Router.new(
+      hub_providers: { metered: { type: "metered", model: "unpriced-xyz" } },
+      workflow_providers: { metered: { pricing: { "unpriced-xyz" => { input: 5.0, output: 5.0 } } } },
+      registry: { "metered" => metered_provider }
+    )
+
+    result = router.call(chain: ["metered"], messages: [{ role: "user", content: "hello" }])
+
+    assert_nil result[:cost_usd], "an unpriced model stays unpriced rather than taking a workflow's word"
+  end
+
   def test_router_prices_a_call_using_hubrc_overrides
     router = metered_router(model: "priced-model",
                             pricing: { "priced-model" => { input: 1000.0, output: 1000.0 } })

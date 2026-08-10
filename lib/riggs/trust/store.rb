@@ -52,18 +52,36 @@ module Riggs
         Psych.safe_load(File.read(@path), permitted_classes: [], aliases: false)
       end
 
-      # Order is load-bearing. TRUNC empties a pre-existing file before the
-      # chmod, and the chmod lands before any content is written, so at no
-      # point does a readable-by-others file hold the operator's project list.
-      # The 0o600 on open covers creation; File#chmod covers a file that
-      # already existed 0644, which the creation mode does not touch.
+      # Written to a fresh private file and renamed over our directory entry.
+      # Truncating the existing inode in place was wrong twice over: O_NOFOLLOW
+      # stops a SYMBOLIC link but says nothing about a HARD one, where the
+      # entry IS the file, so the write landed in a shared inode and chmod'd
+      # it to 0600. Renaming replaces our name only and leaves every other
+      # name for that inode untouched. It is also atomic, so a crash mid-write
+      # cannot leave the half-written file #shaped exists to survive.
       def write_private(body)
-        File.open(@path, WRITE_FLAGS, 0o600) do |file|
-          file.chmod(0o600)
-          file.write(body)
-        end
-      rescue Errno::ELOOP, Errno::EMLINK
+        reject_symlink!
+        temp = "#{@path}.#{Process.pid}.tmp"
+        File.open(temp, WRITE_FLAGS, 0o600) { |file| write_body(file, body) }
+        File.rename(temp, @path)
+      end
+
+      # The rename above already refuses to write THROUGH a link, so this is
+      # about telling the operator rather than about safety: someone who
+      # deliberately symlinked trust.yml into a dotfiles repo should hear that
+      # riggs will not honour it, not silently find it replaced.
+      def reject_symlink!
+        return unless File.symlink?(@path)
+
         raise Error, "#{@path} is a symbolic link; riggs will not write trust records through one"
+      end
+
+      # chmod before any content: 0o600 on open covers a file we create, and
+      # File#chmod covers one that already existed 0644, which the creation
+      # mode does not touch.
+      def write_body(file, body)
+        file.chmod(0o600)
+        file.write(body)
       end
 
       # trust.yml is the one file riggs writes itself, so it is the one most
