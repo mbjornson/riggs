@@ -59,6 +59,7 @@ module Riggs
 
         def merge_project
           ProjectKeys.new(project: project, paths: paths).validate!
+          ProjectShape.new(project: project, paths: paths).validate!
           merge_sections
         end
 
@@ -104,6 +105,65 @@ module Riggs
         def message
           "#{paths[:project]}: '#{unlisted.first}' may only be set in #{paths[:global]} " \
             "(a project may set: #{PROJECT_KEYS.map(&:to_s).sort.join(', ')})"
+        end
+      end
+
+      # PROJECT_KEYS and PROVIDER_FIELDS compare NAMES. A value with no keys
+      # has no names to compare, so `providers: {openai: "x"}` walked past
+      # PROVIDER_FIELDS untouched and KeyMerger then substituted the string
+      # for the whole global provider entry -- model, base_url, pricing,
+      # relay_chain and auth all gone, with no error. Checking shape before
+      # any algebra runs is what makes the name allowlists mean anything.
+      #
+      # The expected shape is per section, not one rule for all four: a role
+      # maps to a LIST of permissions (Identity::DEFAULT_ROLES values are
+      # Arrays), so a single "entries must be mappings" rule would reject
+      # every legitimate roles: block in existence.
+      class ProjectShape
+        ENTRY_SHAPES = { roles: Array, users: Hash, providers: Hash, mcp_servers: Hash }.freeze
+
+        def initialize(project:, paths:)
+          @project = project
+          @paths = paths
+        end
+
+        def validate!
+          ENTRY_SHAPES.each_key { |section| validate_section!(section) }
+        end
+
+        private
+
+        attr_reader :project, :paths
+
+        # The section is checked before its entries are walked, so a section
+        # that is not a mapping raises here rather than on #each.
+        def validate_section!(section)
+          return unless project.key?(section)
+
+          reject!(section, nil, project[section], Hash)
+          project[section].each { |name, value| reject!(section, name, value, ENTRY_SHAPES[section]) }
+        end
+
+        def reject!(section, name, value, shape)
+          return if value.is_a?(shape)
+
+          raise Error, message(section, name, value, shape)
+        end
+
+        def message(section, name, value, shape)
+          "#{paths[:project]}: #{label(section, name)} must be a #{noun(shape)}, got #{value.class}"
+        end
+
+        def label(section, name)
+          return section.to_s if name.nil?
+
+          "#{section}.#{name}"
+        end
+
+        def noun(shape)
+          return "list" if shape == Array
+
+          "mapping"
         end
       end
 

@@ -191,4 +191,65 @@ class TestConfigMerge < Minitest::Test
     assert_equal "./evil", result.config[:mcp_servers][:hb][:command]
     assert_equal :project, result.provenance[:mcp_servers][:hb]
   end
+
+  # --- value SHAPE, not just key names ---
+  #
+  # PROJECT_KEYS and PROVIDER_FIELDS compare NAMES. A value with no keys has
+  # no names to compare, so `providers: {openai: "x"}` walked past
+  # PROVIDER_FIELDS untouched and replaced the whole global provider entry --
+  # model, base_url, pricing, relay_chain and auth all gone. Reproduced before
+  # this guard existed: the merge returned {openai: "pwned"} and raised
+  # nothing. Checking shape before any algebra runs is what makes the name
+  # allowlists mean anything.
+
+  def test_a_provider_declared_as_a_string_is_rejected_not_silently_substituted
+    err = assert_raises(Riggs::Error) do
+      merge({ providers: { openai: { model: "gpt-5", base_url: "https://internal" } } },
+            { providers: { openai: "pwned" } })
+    end
+    assert_includes err.message, "providers.openai"
+    assert_includes err.message, "mapping"
+    assert_includes err.message, P
+  end
+
+  def test_a_provider_declared_as_a_list_is_rejected
+    err = assert_raises(Riggs::Error) do
+      merge({ providers: { openai: {} } }, { providers: { openai: [{ api_key: "sk-EVIL" }] } })
+    end
+    assert_includes err.message, "providers.openai"
+  end
+
+  def test_a_user_declared_as_a_string_is_rejected
+    err = assert_raises(Riggs::Error) { merge({ users: { matt: { role: "pm" } } }, { users: { matt: "pm" } }) }
+    assert_includes err.message, "users.matt"
+  end
+
+  def test_an_mcp_server_declared_as_a_string_is_rejected
+    err = assert_raises(Riggs::Error) do
+      merge({ mcp_servers: { hb: { command: "npx" } } }, { mcp_servers: { hb: "npx" } })
+    end
+    assert_includes err.message, "mcp_servers.hb"
+  end
+
+  def test_a_section_that_is_not_a_mapping_is_rejected
+    err = assert_raises(Riggs::Error) { merge({ providers: { openai: {} } }, { providers: "everything" }) }
+    assert_includes err.message, "providers"
+    assert_includes err.message, "mapping"
+  end
+
+  # The guard above must not over-tighten. A role maps to a LIST of
+  # permissions -- Identity::DEFAULT_ROLES values are Arrays -- so requiring
+  # every section's entries to be mappings would reject every legitimate
+  # roles: block in existence. This test is why that did not ship.
+  def test_a_role_is_still_a_list_of_permissions_and_is_not_rejected
+    result = merge({ roles: { pm: ["publish"] } }, { roles: { reviewer: %w[read_workflow inspect_run] } })
+    assert_equal %w[read_workflow inspect_run], result.config[:roles][:reviewer]
+    assert_equal :project, result.provenance[:roles][:reviewer]
+  end
+
+  def test_a_role_declared_as_a_bare_string_is_rejected
+    err = assert_raises(Riggs::Error) { merge({ roles: {} }, { roles: { reviewer: "read_workflow" } }) }
+    assert_includes err.message, "roles.reviewer"
+    assert_includes err.message, "list"
+  end
 end

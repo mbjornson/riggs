@@ -25,21 +25,44 @@ module Riggs
 
       def initialize(command:, env:)
         @command = command.to_s
-        @env = (env || {}).transform_keys(&:to_s)
+        @env = mapping(env)
       end
 
       # An unresolvable name resolves to "unresolved:<name>" so approval still
       # binds something stable and the spawn fails on its own terms, not here.
       def path
+        return unresolved unless resolvable?
         return realpath(File.expand_path(@command)) if qualified?
 
         found = candidates.detect { |candidate| runnable?(candidate) }
-        return "unresolved:#{@command}" if found.nil?
+        return unresolved if found.nil?
 
         realpath(found)
       end
 
       private
+
+      # No filename may contain a NUL byte, and File.expand_path raises
+      # ArgumentError on one -- which escaped as a raw crash from inside
+      # digest computation, where a malformed MCP declaration should have
+      # produced a stable digest instead. An empty command is not a filename
+      # either, and would otherwise resolve against each PATH entry as a
+      # directory.
+      def resolvable?
+        !@command.empty? && !@command.include?("\u0000")
+      end
+
+      def unresolved
+        "unresolved:#{@command}"
+      end
+
+      # A declaration whose env is not a mapping forwards no variables. Calling
+      # .transform_keys on it crashed the digest instead of digesting it.
+      def mapping(env)
+        return env.transform_keys(&:to_s) if env.is_a?(Hash)
+
+        {}
+      end
 
       def qualified?
         @command.include?(File::SEPARATOR)

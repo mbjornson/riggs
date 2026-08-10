@@ -231,7 +231,109 @@ class TestTrust < Minitest::Test
     end
   end
 
+  # --- a corrupt registry must not take every command down with it ---
+  #
+  # trust.yml is the one file riggs writes itself, so it is the one most
+  # likely to be found half-written after a crash or a full disk. Before this
+  # guard, `data["projects"] ||= {}` raised IndexError on a String document
+  # and TypeError on a list, from inside `trusted?` -- which every riggs
+  # command calls. The failure was an opaque stack trace with no way out.
+
+  def corrupt(body)
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "trust.yml")
+      File.write(path, body)
+      yield Riggs::Trust.new(path: path)
+    end
+  end
+
+  def test_a_trust_file_that_is_not_a_mapping_is_ignored_rather_than_raising
+    corrupt("just a string\n") { |trust| assert_reads_as_empty(trust) }
+  end
+
+  def test_a_trust_file_that_is_a_list_is_ignored_rather_than_raising
+    corrupt("- a\n- b\n") { |trust| assert_reads_as_empty(trust) }
+  end
+
+  def test_a_trust_file_whose_projects_key_is_not_a_mapping_is_ignored
+    corrupt("projects: nope\n") { |trust| assert_reads_as_empty(trust) }
+  end
+
+  def test_a_trust_file_whose_project_entry_is_not_a_mapping_is_ignored
+    corrupt("projects:\n  \"/p\": oops\n") { |trust| assert_reads_as_empty(trust) }
+  end
+
+  # Ignoring a corrupt file must not be silent: the operator is about to be
+  # re-prompted for trust they already granted, and needs to know why.
+  def test_ignoring_a_corrupt_trust_file_warns_naming_the_file
+    corrupt("just a string\n") do |trust|
+      _out, err = capture_io { trust.trusted?("/p") }
+      assert_includes err, trust.path
+    end
+  end
+
+  # Recovery: a corrupt file must be writable over, not permanently wedged.
+  def test_a_corrupt_trust_file_can_be_granted_over
+    corrupt("projects: nope\n") do |trust|
+      capture_io { trust.grant!("/p") }
+      assert trust.trusted?("/p")
+    end
+  end
+
+  # --- a malformed declaration reaches the digest as data, not as a crash ---
+
+  def test_a_non_mapping_env_does_not_crash_the_digest
+    assert_match(/\Asha256:/, Riggs::Trust.digest(command: "npx", args: [], env: "oops"))
+  end
+
+  def test_an_env_that_is_not_a_mapping_digests_as_no_forwarded_variables
+    assert_equal Riggs::Trust.digest(command: "npx", args: [], env: {}),
+                 Riggs::Trust.digest(command: "npx", args: [], env: "oops")
+  end
+
+  # File.expand_path raises ArgumentError on a NUL byte, which escaped as a
+  # raw crash from inside digest computation. No filename may contain one, so
+  # such a command is unresolvable by definition.
+  def test_a_command_containing_a_nul_byte_does_not_crash_the_digest
+    assert_match(/\Asha256:/, Riggs::Trust.digest(command: "a\u0000b", args: [], env: {}))
+  end
+
+  def test_a_command_containing_a_nul_byte_never_resolves_to_a_real_file
+    resolved = Riggs::Trust.resolve_executable(command: "/bin/sh\u0000", env: {})
+    refute_equal "/bin/sh", resolved
+    assert_match(/\Aunresolved:/, resolved)
+  end
+
+  def test_an_empty_command_does_not_resolve_to_a_directory
+    assert_equal "unresolved:", Riggs::Trust.resolve_executable(command: "", env: { "PATH" => "/usr/bin" })
+  end
+
+  # --- the registry must not become a write primitive aimed elsewhere ---
+  #
+  # Verified before the guard existed: riggs wrote its projects list THROUGH
+  # the link into the target, and chmod'd that target to 0600.
+  def test_writing_refuses_to_follow_a_symbolic_link
+    Dir.mktmpdir do |dir|
+      victim = File.join(dir, "victim.yml")
+      File.write(victim, "some_key: some_value\n")
+      File.chmod(0o644, victim)
+      File.symlink(victim, File.join(dir, "trust.yml"))
+      err = assert_raises(Riggs::Error) { Riggs::Trust.new(path: File.join(dir, "trust.yml")).grant!("/pwned") }
+      assert_includes err.message, "symbolic link"
+      assert_equal "some_key: some_value\n", File.read(victim)
+      assert_equal 0o644, File.stat(victim).mode & 0o777
+    end
+  end
+
   private
+
+  def assert_reads_as_empty(trust)
+    capture_io do
+      refute trust.trusted?("/p")
+      assert_empty trust.projects
+      assert_nil trust.trusted_at("/p")
+    end
+  end
 
   def write_fake(dir, name)
     FileUtils.mkdir_p(dir)

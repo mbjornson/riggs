@@ -23,7 +23,7 @@ module Riggs
       def initialize(command:, args:, env:)
         @command = command
         @args = Array(args).map(&:to_s)
-        @env = env || {}
+        @env = mapping(env)
       end
 
       # ::Digest, not Digest -- inside this class the bare constant resolves to
@@ -33,6 +33,15 @@ module Riggs
       end
 
       private
+
+      # Mirrors Executable#mapping: a declaration whose env is not a mapping
+      # forwards no variables, and must digest identically to one that
+      # declares none rather than raising NoMethodError on .keys.
+      def mapping(env)
+        return env if env.is_a?(Hash)
+
+        {}
+      end
 
       def canonical
         JSON.generate("command" => resolved, "args" => @args, "env_keys" => env_keys)
