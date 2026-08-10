@@ -209,6 +209,60 @@ class TestTrust < Minitest::Test
     assert_equal a, b
   end
 
+  # POSIX: an empty PATH component means the current directory. File.join("", c)
+  # yields "/c", so a naive implementation digests a file in the filesystem
+  # root while the child executes one in the working directory.
+  def test_an_empty_path_component_resolves_to_the_current_directory
+    Dir.mktmpdir do |dir|
+      bin = File.join(dir, "fakemcp")
+      File.write(bin, "#!/bin/sh\nexit 0\n")
+      File.chmod(0o755, bin)
+      Dir.chdir(dir) do
+        resolved = Riggs::Trust.resolve_executable("fakemcp", env: { "PATH" => ":/nonexistent" })
+        assert_equal File.realpath(bin), resolved
+      end
+    end
+  end
+
+  def test_a_relative_path_component_resolves_to_an_absolute_path
+    Dir.mktmpdir do |dir|
+      FileUtils.mkdir_p(File.join(dir, "tools"))
+      bin = File.join(dir, "tools", "fakemcp")
+      File.write(bin, "#!/bin/sh\nexit 0\n")
+      File.chmod(0o755, bin)
+      Dir.chdir(dir) do
+        resolved = Riggs::Trust.resolve_executable("fakemcp", env: { "PATH" => "tools" })
+        assert_equal File.realpath(bin), resolved
+        assert resolved.start_with?("/"), "a digest input must be an absolute path"
+      end
+    end
+  end
+
+  def test_a_swapped_symlink_is_a_different_approval
+    Dir.mktmpdir do |dir|
+      %w[a b].each do |n|
+        File.write(File.join(dir, n), "#!/bin/sh\nexit 0\n")
+        File.chmod(0o755, File.join(dir, n))
+      end
+      link = File.join(dir, "fakemcp")
+      File.symlink(File.join(dir, "a"), link)
+      first = Riggs::Trust.digest(command: link)
+      File.unlink(link)
+      File.symlink(File.join(dir, "b"), link)
+      refute_equal first, Riggs::Trust.digest(command: link)
+    end
+  end
+
+  # The bug: a frozen constant dup'd on read shares its nested hash.
+  def test_two_registries_with_no_file_do_not_share_state
+    Dir.mktmpdir do |dir|
+      a = Riggs::Trust.new(path: File.join(dir, "a.yml"))
+      b = Riggs::Trust.new(path: File.join(dir, "b.yml"))
+      a.grant!("/p")
+      refute b.trusted?("/p"), "a grant in one registry must not appear in another"
+    end
+  end
+
   # The strongest guarantee in this file: assert on the bytes, not the intent.
   def test_no_environment_variable_value_reaches_the_file
     with_trust do |trust, _|
@@ -254,7 +308,12 @@ module Riggs
   # the command, its arguments, and the NAMES of forwarded environment
   # variables. Values are never read into the digest and never written.
   class Trust
-    EMPTY = { "projects" => {} }.freeze
+    # NOT a shared frozen constant dup'd on read. `{"projects" => {}}.freeze`
+    # freezes only the outer hash, so every `.dup` of it shares the SAME inner
+    # projects hash -- and `project_entry` mutates that hash in place. One
+    # Trust instance whose file does not exist would then leak grants into
+    # every other. Build a fresh nested hash each time instead.
+    def self.empty = { "projects" => {} }
 
     attr_reader :path
 
@@ -294,19 +353,39 @@ module Riggs
       "sha256:#{Digest::SHA256.hexdigest(canonical)}"
     end
 
-    # An absolute or explicitly-relative command is used as given. A bare name
-    # is looked up through the PATH the child will actually receive, falling
-    # back to the parent's. An unresolvable name digests as "unresolved:<name>"
-    # so approval still binds something stable and the spawn fails on its own
-    # terms rather than here.
+    # POSIX PATH semantics, including the one that is easy to get wrong: an
+    # EMPTY component means the current directory, so PATH=":/usr/bin" can run
+    # ./mcp. File.join("", cmd) yields "/cmd", which would have digested a
+    # different file than the one that runs. Relative components resolve to
+    # absolute, and the winner is realpath'd so a swapped symlink is a
+    # different path and therefore a different approval.
+    #
+    # An unresolvable name digests as "unresolved:<name>" so approval still
+    # binds something stable and the spawn fails on its own terms, not here.
+    DEFAULT_PATH = "/bin:/usr/bin"
+
     def self.resolve_executable(command, env: {})
       cmd = command.to_s
-      return File.expand_path(cmd) if cmd.include?(File::SEPARATOR)
+      return realpath_or(File.expand_path(cmd)) if cmd.include?(File::SEPARATOR)
 
-      path = (env || {}).transform_keys(&:to_s)["PATH"] || ENV.fetch("PATH", "")
-      found = path.split(File::PATH_SEPARATOR).lazy.map { |d| File.join(d, cmd) }
-                  .find { |p| File.file?(p) && File.executable?(p) }
-      found || "unresolved:#{cmd}"
+      found = search_path(env).lazy
+                              .map { |dir| File.expand_path(File.join(dir.empty? ? "." : dir, cmd)) }
+                              .find { |p| File.file?(p) && File.executable?(p) }
+      found ? realpath_or(found) : "unresolved:#{cmd}"
+    end
+
+    # A key present with a nil value means "unset in the child" to Open3, and
+    # exec then falls back to a system default path rather than to ours.
+    def self.search_path(env)
+      e = (env || {}).transform_keys(&:to_s)
+      raw = e.key?("PATH") ? e["PATH"] : ENV.fetch("PATH", nil)
+      (raw || DEFAULT_PATH).split(File::PATH_SEPARATOR, -1)
+    end
+
+    def self.realpath_or(path)
+      File.realpath(path)
+    rescue SystemCallError
+      path
     end
 
     # Trust is `trusted_at` being present, NOT an entry existing. An entry is
@@ -379,9 +458,9 @@ module Riggs
     # registry, so this is the strict form rather than the permissive one
     # Identity uses for hand-authored config.
     def read
-      return EMPTY.dup unless File.exist?(@path)
+      return self.class.empty unless File.exist?(@path)
 
-      Psych.safe_load(File.read(@path), permitted_classes: [], aliases: false) || EMPTY.dup
+      Psych.safe_load(File.read(@path), permitted_classes: [], aliases: false) || self.class.empty
     end
 
     def write!(data)
@@ -843,10 +922,18 @@ nothing in it ran.
                       "evil" => { "command" => "/bin/sh", "args" => ["-c", "touch #{marker}"] }
                     })
       result = resolve(root, trust, global)
-      mgr = Riggs::MCP::Manager.from_config(result.project[:mcp_servers] || {})
-      mgr.list_tools
-      refute File.exist?(marker), "an untrusted project's MCP command must never run"
       refute result.trusted
+
+      # provenance :global deliberately. The MCP approval gate is Task 6's
+      # job and would block this spawn on its own, which would make the test
+      # pass with the RESOLVER gate removed -- proving Task 6 twice and Task 2
+      # not at all. Declaring the server global strips that second gate away
+      # so the only thing standing between the config and the marker file is
+      # the trust check under test.
+      servers = result.project[:mcp_servers] || {}
+      prov = servers.keys.to_h { |k| [k, :global] }
+      Riggs::MCP::Manager.from_config(servers, provenance: prov).list_tools
+      refute File.exist?(marker), "an untrusted project's MCP command must never run"
     end
   end
 ```
@@ -854,6 +941,10 @@ nothing in it ran.
 Then mutate: change `trusted && path ? load_yaml(path) : {}` to
 `path ? load_yaml(path) : {}`. BOTH `test_an_untrusted_project_file_is_not_read`
 and the marker test MUST fail. Revert and paste both outputs.
+
+If the marker test still passes under that mutation, stop — it means a
+downstream gate is covering for the one under test, and the test is measuring
+the wrong thing.
 
 This is the single most important line in the phase. If deleting the gate does
 not fail a test, the gate is decorative.
@@ -1116,7 +1207,13 @@ module Riggs
       Merged = Struct.new(:config, :provenance, keyword_init: true)
 
       class << self
-        def call(global:, project:, global_path:, project_path:)
+        # global_path and project_path default to a readable placeholder rather
+        # than nil: they appear verbatim in every diagnostic, and a nil one
+        # renders "role 'engineer' is defined in  and cannot be redefined",
+        # which fails the two-file requirement precisely when someone is
+        # debugging a merge.
+        def call(global:, project:, global_path: "the global config",
+                 project_path: "the project config")
           g = Identity.deep_symbolize(global || {})
           pr = Identity.deep_symbolize(project || {})
           return Merged.new(config: g, provenance: all_global(g)) if pr.empty?
@@ -1204,7 +1301,10 @@ module Riggs
             else
               merged[name] = fields
             end
-            prov[name] = :project
+            # :project only when the value actually differs. Marking every
+            # mentioned user :project would make R11.5 print "from
+            # .riggs/config.yml" for a user the project merely restated.
+            prov[name] = :project unless merged[name] == g[name]
           end
 
           [merged, prov]
@@ -1231,12 +1331,15 @@ module Riggs
                            "credentials come from the environment"
             end
 
-            # `auth` names a mode -- "subscription", "api", "none". A hash here
-            # would smuggle api_key back in under an allowlisted key, since the
-            # key check above only looks one level down.
-            next unless fields[:auth].is_a?(Hash) || fields[:auth].is_a?(Array)
+            # `auth` names a mode -- "subscription", "api", "none". Anything
+            # that is not a String or Symbol is rejected: a Hash would smuggle
+            # api_key back in under an allowlisted key (the check above only
+            # looks one level down), and false/nil/1 are not mode names either,
+            # so an allowlist of TYPES beats a denylist of them.
+            next unless fields.key?(:auth)
+            next if fields[:auth].is_a?(String) || fields[:auth].is_a?(Symbol)
 
-            raise Error, "provider '#{name}': 'auth' must be a mode name, not a #{fields[:auth].class}, " \
+            raise Error, "provider '#{name}': 'auth' must be a mode name, got #{fields[:auth].inspect}, " \
                          "in #{project_path}"
           end
 
@@ -1580,11 +1683,26 @@ errors — do not delete it.
 If a test only passes with the gate loosened, that test is asserting the hole.
 Report it instead.
 
-Expect real churn here: tests that write `.agent_hubrc` mid-test to override
-config (e.g. `test_cli.rb:22` appending `mcp_servers`) now write to a file that
-is a project tier and may name a forbidden key. Convert each to write the key
-into the global config, or into `.riggs/config.yml` if the key is one a project
-may set. List every test you touched in your report.
+Four existing tests are known to break. They are named here so you do not have
+to discover them, and so a green suite that skipped one is visible:
+
+- `test/test_cli.rb:21` `test_workflow_run_warns_when_mcp_config_is_broken` —
+  appends `mcp_servers: totally_not_a_hash` to `.agent_hubrc`, now a project
+  tier. Write it into the global config instead; `mcp_servers` is a permitted
+  project key but the malformed-value warning is what the test is about.
+- `test/test_config_store.rb:32` `test_merge_writes_backup_and_preserves_unrelated_keys` —
+  expects an editor to add an **undefined** provider and to back up
+  `.agent_hubrc`. Both assumptions now conflict with Task 9. Rewrite it against
+  the global tier, or against a provider the global tier defines.
+- `test/test_mcp.rb:13` and `test/test_mcp_manager.rb:53,70` — call
+  `Manager.from_config` without the now-required `provenance:`. Add
+  `provenance:` naming each server `:global`, which is what those tests mean.
+- `test/test_mcp.rb:8-9` — assert `Client.from_config` returns nil. That method
+  is deleted in Task 6; remove both assertions with it.
+
+Any other test that writes `.agent_hubrc` mid-test to override config must move
+that write to the global tier, or to `.riggs/config.yml` when the key is one a
+project may set. List every test you touched in your report, including these.
 
 Expected: 382+ runs, 0 failures.
 
@@ -1785,9 +1903,14 @@ In `lib/riggs/triggers.rb`, replace both methods:
     # compacts away an untrusted project root, so index 0 is not always the
     # project and a positional rule would relabel the global tier as project
     # for exactly the repos where that claim is most misleading.
+    #
+    # Exact comparison of expanded paths, not start_with?. A prefix test calls
+    # /tmp/riggs-home-evil "global" when RIGGS_HOME=/tmp/riggs-home, and calls
+    # a project living under RIGGS_HOME global too.
     def self.tier_for(dir)
-      return :global if dir.to_s.start_with?(Trust.home)
-      return :bundled if dir.to_s.start_with?(File.expand_path("../..", __dir__))
+      expanded = File.expand_path(dir.to_s)
+      return :global if expanded == File.expand_path(File.join(Trust.home, "workflows"))
+      return :bundled if expanded == File.expand_path("../../config/riggs/workflows", __dir__)
 
       :project
     end
@@ -1835,6 +1958,81 @@ In `lib/riggs/triggers.rb`, replace both methods:
 Keep the rest of `list_declared`'s existing return shape intact — read the current method before editing and preserve every key it already produces.
 
 In `lib/riggs/cli/commands.rb`, `triggers_list` prints each workflow; add the tier to that line so a global match is explicable.
+
+**Route every workflow caller through the same root list.** This is the point
+of the task, not a tidy-up. Enumeration and loading are separate functions in
+this codebase with separately hardcoded paths, and they diverged — gating
+`Triggers.default_roots` while `load_workflow` keeps its own literal leaves the
+*execution* path open. Add:
+
+```ruby
+    # The one place a workflow NAME becomes a file path. CLI#load_workflow and
+    # WebApp#list_workflows each hardcoded config/riggs/workflows before this,
+    # so trusting default_roots gated what `triggers:list` showed and nothing
+    # that ran. First root wins, matching skill resolution.
+    def self.find_path(name, roots: nil)
+      Array(roots || default_roots).compact.each do |dir|
+        candidate = File.join(dir, "#{name}.yml")
+        return candidate if File.exist?(candidate)
+      end
+      nil
+    end
+```
+
+Then replace both callers:
+
+- `lib/riggs/cli/commands.rb:609` — `load_workflow(name)` becomes
+  `path = Triggers.find_path(name) or abort "❌ Workflow not found: #{name}.yml"`,
+  deleting its two hardcoded paths.
+- `lib/riggs/web/app.rb:550` — `list_workflows` becomes
+  `Triggers.list_declared.map { |w| w[:name] }`, deleting its `dirs` array.
+  Audit the rest of `web/app.rb` for any other `config/riggs/workflows` literal
+  and route it the same way:
+
+```bash
+grep -rn "config/riggs/workflows" lib
+```
+
+Every remaining hit must be inside `Triggers.default_roots`. Paste the grep
+output in your report.
+
+**Add these tests** to `test/test_tier_roots.rb`, because 1a and 1b in the spec
+are deliberately separate assertions:
+
+```ruby
+  def test_an_untrusted_project_workflow_is_not_findable_by_name
+    Dir.mktmpdir do |home|
+      with_riggs_home(File.join(home, ".riggs")) do
+        Dir.mktmpdir do |repo|
+          FileUtils.mkdir_p(File.join(repo, "config", "riggs", "workflows"))
+          File.write(File.join(repo, "config", "riggs", "workflows", "sneaky.yml"), workflow_yaml("sneaky"))
+          Dir.chdir(repo) do
+            Riggs::Config::Resolver.reset_cache!
+            assert_nil Riggs::Triggers.find_path("sneaky"),
+                       "loading is a different path from listing; both must be gated"
+          end
+        end
+      end
+    end
+  end
+
+  def test_a_trusted_project_workflow_is_findable_by_name
+    Dir.mktmpdir do |home|
+      with_riggs_home(File.join(home, ".riggs")) do
+        Dir.mktmpdir do |repo|
+          FileUtils.mkdir_p(File.join(repo, "config", "riggs", "workflows"))
+          path = File.join(repo, "config", "riggs", "workflows", "mine.yml")
+          File.write(path, workflow_yaml("mine"))
+          Riggs::Trust.new.grant!(Riggs::Config::Resolver.project_path(repo))
+          Dir.chdir(repo) do
+            Riggs::Config::Resolver.reset_cache!
+            assert_equal path, Riggs::Triggers.find_path("mine")
+          end
+        end
+      end
+    end
+  end
+```
 
 - [ ] **Step 4: Verify pass, then full suite**
 
@@ -1919,6 +2117,42 @@ class TestMcpApproval < Minitest::Test
     end
   end
 
+  # The client must be built with the RESOLVED path, or popen2 re-consults
+  # PATH at spawn time and can exec a different binary under this approval.
+  def test_an_approved_client_is_constructed_with_the_resolved_executable
+    with_trust do |trust|
+      trust.approve_mcp!("/repo", "project_one", Riggs::Trust.digest(command: "echo", args: %w[project]))
+      client = manager(trust).send(:client_for, "project_one")
+      command = client.instance_variable_get(:@command)
+      assert command.start_with?("/"), "expected an absolute resolved path, got #{command.inspect}"
+      assert_equal Riggs::Trust.resolve_executable("echo"), command
+    end
+  end
+
+  # End to end: approve under one PATH, then make the same name resolve to a
+  # different binary. The stale approval must not carry over.
+  def test_an_approval_does_not_survive_the_name_resolving_elsewhere
+    Dir.mktmpdir do |dir|
+      %w[a b].each do |sub|
+        FileUtils.mkdir_p(File.join(dir, sub))
+        bin = File.join(dir, sub, "swapmcp")
+        File.write(bin, "#!/bin/sh\nexit 0\n")
+        File.chmod(0o755, bin)
+      end
+      trust = Riggs::Trust.new(path: File.join(dir, "trust.yml"))
+      trust.grant!("/repo")
+      servers = { swap: { command: "swapmcp", args: [], env: { "PATH" => File.join(dir, "a") } } }
+      prov = { swap: :project }
+      build = lambda do |path_dir|
+        cfg = { swap: { command: "swapmcp", args: [], env: { "PATH" => path_dir } } }
+        Riggs::MCP::Manager.from_config(cfg, provenance: prov, trust: trust, project_path: "/repo")
+      end
+      trust.approve_mcp!("/repo", "swap", Riggs::Trust.digest(**servers[:swap]))
+      refute_nil build.call(File.join(dir, "a")).send(:client_for, "swap")
+      assert_raises(Riggs::MCP::NotApproved) { build.call(File.join(dir, "b")).send(:client_for, "swap") }
+    end
+  end
+
   def test_a_changed_command_revokes_the_approval
     with_trust do |trust|
       trust.approve_mcp!("/repo", "project_one", Riggs::Trust.digest(command: "echo", args: %w[old]))
@@ -1957,7 +2191,12 @@ class TestMcpApproval < Minitest::Test
     assert_raises(ArgumentError) { Riggs::MCP::Manager.from_config(SERVERS) }
   end
 
-  # R11.9 7b: the gate must not have doors it does not know about.
+  # R11.9 7b. A regression tripwire, NOT a proof: it matches a string pattern,
+  # so it will miss `Client.send(:new, ...)`, `Client.new(**cfg)`, an aliased
+  # constant, or a factory, and it will fire on a legitimate in-process
+  # construction. Its job is to make a future `MCP::Client.new` in lib/ fail
+  # loudly enough that someone thinks about provenance. The real audit is the
+  # spec's route list, done by reading.
   def test_no_config_driven_client_construction_exists_outside_the_manager
     refute Riggs::MCP::Client.respond_to?(:from_config),
            "Client.from_config builds a client from config with no approval; it must not exist"
@@ -2084,11 +2323,20 @@ In `lib/riggs/mcp/manager.rb`, extend the constructor and gate `client_for`:
       end
 ```
 
-and, inside `client_for`, immediately before `Client.new`:
+and, inside `client_for`, replace the `Client.new` construction with:
 
 ```ruby
-        ensure_approved!(key, cfg)
+        command = ensure_approved!(key, cfg)
+        client = Client.new(command: command, args: cfg[:args] || [], env: cfg[:env] || {})
 ```
+
+`ensure_approved!` returns the command to spawn: the **resolved absolute path**
+for a project-declared server, and the configured command unchanged for a
+global one. Approval runs in `client_for`, but `Open3.popen2` runs later in
+`Client#start!` (`lib/riggs/mcp/client.rb:35`) — so handing `Client` the
+original bare name would leave a window where `PATH` changes and a different
+binary runs under a valid approval. Passing the resolved path removes the race
+rather than detecting it: `popen2` execs exactly the file that was digested.
 
 with:
 
@@ -2105,7 +2353,7 @@ with:
       # that cannot answer "did a repo introduce this?" must refuse, not
       # assume no.
       def ensure_approved!(name, cfg)
-        return if @provenance[name] == :global
+        return cfg[:command] if @provenance[name] == :global
 
         unless @provenance.key?(name)
           raise NotApproved, "MCP server '#{name}' has no recorded tier. Build the Manager with " \
@@ -2116,9 +2364,10 @@ with:
                              "without trust:/project_path:, so approval cannot be checked."
         end
 
+        resolved = Trust.resolve_executable(cfg[:command], env: cfg[:env] || {})
         digest = Trust.digest(command: cfg[:command], args: cfg[:args] || [], env: cfg[:env] || {})
-        return if @trust.mcp_approved?(@project_path, name, digest)
-        return if @interactive && prompt_and_record!(name, cfg, digest)
+        return resolved if @trust.mcp_approved?(@project_path, name, digest)
+        return resolved if @interactive && prompt_and_record!(name, cfg, digest)
 
         raise NotApproved, "MCP server '#{name}' is declared by this project and is not approved.\n" \
                            "  #{Approval.redact(cfg[:command], cfg[:args] || [])}\n" \
@@ -2247,6 +2496,52 @@ class TestSetupTiers < Minitest::Test
     end
   end
 
+  def test_seeding_drops_credentials_rather_than_persisting_them_globally
+    Dir.mktmpdir do |dir|
+      home = File.join(dir, "home")
+      repo = File.join(dir, "repo")
+      [home, repo].each { |d| FileUtils.mkdir_p(d) }
+      File.write(File.join(repo, ".agent_hubrc"), Psych.dump(
+                                                    "providers" => {
+                                                      "openai" => { "type" => "openai", "model" => "gpt-5",
+                                                                    "api_key" => "sk-live-SENTINEL-4c1a" }
+                                                    }
+                                                  ))
+      out, = capture_io { run_setup(home: home, cwd: repo) }
+      global_raw = File.read(File.join(home, ".riggs", "config.yml"))
+      refute_includes global_raw, "sk-live-SENTINEL-4c1a"
+      refute_includes global_raw, "api_key"
+      assert_includes global_raw, "gpt-5", "non-credential provider fields must survive"
+      assert_includes out, "api_key", "a dropped key must be named so the operator can move it to the env"
+    end
+  end
+
+  def test_the_global_config_is_written_private_to_the_owner
+    Dir.mktmpdir do |dir|
+      home = File.join(dir, "home")
+      repo = File.join(dir, "repo")
+      [home, repo].each { |d| FileUtils.mkdir_p(d) }
+      run_setup(home: home, cwd: repo)
+      assert_equal 0o600, File.stat(File.join(home, ".riggs", "config.yml")).mode & 0o777
+    end
+  end
+
+  def test_the_generated_project_skeleton_names_only_permitted_keys_and_is_commented
+    Dir.mktmpdir do |dir|
+      home = File.join(dir, "home")
+      repo = File.join(dir, "repo")
+      [home, repo].each { |d| FileUtils.mkdir_p(d) }
+      run_setup(home: home, cwd: repo)
+      raw = File.read(File.join(repo, ".riggs", "config.yml"))
+      refute_match(/^\s*sqlite_(path|memory)/, raw)
+      raw.each_line do |line|
+        next if line.strip.empty? || line.strip.start_with?("#")
+
+        flunk "skeleton must be fully commented; found live line: #{line.inspect}"
+      end
+    end
+  end
+
   def test_seeding_never_runs_against_an_existing_global_config
     Dir.mktmpdir do |dir|
       home = File.join(dir, "home")
@@ -2317,7 +2612,7 @@ nothing else in the plan pulls the file in.
 1. Compute `project_path = Config::Resolver.project_path(cwd)`.
 2. Ensure `<home>/.riggs/`, `skills/`, `workflows/` — `mkdir_p` each, which is already idempotent.
 3. Ensure `<home>/.riggs/trust.yml` via `Trust#grant!` later; no separate creation step.
-4. If `<home>/.riggs/config.yml` does **not** exist: build the default hub config (reuse the existing literal from `commands.rb:57-108`, keeping `sqlite_memory` — it is a global-only key and belongs here — and pointing `sqlite_path` at `<home>/.riggs/riggs.sqlite3` rather than into the repo), then **seed** from `project_path`'s `.riggs/config.yml` or `.agent_hubrc` if one exists, taking only `users`, `roles`, `providers`. Write it **and `File.chmod(0o600, path)`** — R11.1 requires it of every writer, not only the trust registry. Print what was seeded, or print plainly that an empty global config was created.
+4. If `<home>/.riggs/config.yml` does **not** exist: build the default hub config (reuse the existing literal from `commands.rb:57-108`, keeping `sqlite_memory` — it is a global-only key and belongs here — and pointing `sqlite_path` at `<home>/.riggs/riggs.sqlite3` rather than into the repo), then **seed** from `project_path`'s `.riggs/config.yml` or `.agent_hubrc` if one exists, taking `users` and `roles` wholesale and each provider's name plus only `Config::Merge::PROVIDER_FIELDS` (`model`, `base_url`, `pricing`, `relay_chain`, `auth`) and `type`. **Every other provider key is dropped and printed by name.** A legacy `.agent_hubrc` may well carry an `api_key`, and copying `providers` wholesale would persist it in `~/.riggs/config.yml` — breaking "no tier holds credentials" through the very step meant to adopt the new layout. Write it **and `File.chmod(0o600, path)`** — R11.1 requires it of every writer, not only the trust registry. Print what was seeded, or print plainly that an empty global config was created.
 5. If it does exist: print `⏭️  Keeping existing <path>`.
 6. Ensure the database at the global `sqlite_path` via `Storage.new(db_path:).close`.
 7. Unless `project_path == File.expand_path(home)`: `mkdir_p` the project `config/riggs/{workflows,skills}`, copy the example playbook and skill as today, and write `<project_path>/.riggs/config.yml` if absent — a commented skeleton whose keys are exactly `Config::Merge::PROJECT_KEYS` (`default_user`, `roles`, `users`, `providers`, `mcp_servers`), **all commented out**. It MUST NOT contain `sqlite_path` or `sqlite_memory` in any form. Commenting every key is what makes it both a useful template and unable to trip a hard error; the spec's earlier "no users or roles" wording is superseded by R11.8's allowlist.
@@ -2404,9 +2699,32 @@ git commit -m "Make ConfigStore tier-aware and validate writes against the merge
 
 - All nine tasks committed, `bundle exec rubocop` clean, `bundle exec rake test` 0 failures.
 - The mutation verifications in Tasks 1, 2, 3 and 6 have each been run and their failure output pasted into the task report. A security claim nobody broke is a claim nobody tested.
-- Cloning a repository whose `.riggs/config.yml` declares an MCP server and a privileged user, then running a riggs command in it, executes no attacker-chosen command and grants no attacker-chosen role — demonstrated by hand, with the declared command being one whose execution leaves an observable artifact (e.g. `touch /tmp/pwned-<uuid>`), and the artifact confirmed absent.
-- The same hostile clone also carries `config/riggs/workflows/evil.yml` and a `sqlite_memory.vector_path` pointing at a library that would leave an artifact if loaded. Neither runs. These are the two channels the first draft of this plan left open, so the demonstration must cover all three, not only MCP.
-- `grep -rn "Manager.from_config" lib` shows `provenance:` on every hit, and `MCP::Client.from_config` no longer exists.
+- The hostile-clone demonstration covers **all four** channels from the spec's
+  Phase 11a definition of done, run by hand and reported with actual output:
+  MCP command (no marker file), privileged user (`default_user` ignored,
+  provenance line printed), workflow `base_url` exfiltration (a local
+  `TCPServer` records no connection), and `sqlite_memory.vector_path` (rejected
+  before any load). Earlier drafts closed the first two while claiming all.
+- The exfiltration check is its own automated test, not only a manual step:
+
+```ruby
+  def test_an_untrusted_workflow_cannot_redirect_a_provider_base_url
+    server = TCPServer.new("127.0.0.1", 0)
+    hits = []
+    Thread.new { loop { hits << server.accept } }
+    # workflow in an untrusted repo sets providers.openai.base_url to this port
+    # ... run the workflow ...
+    assert_empty hits, "an untrusted workflow must not reach an attacker-chosen host"
+  ensure
+    server&.close
+  end
+```
+
+  Asserted on a real socket because the whole point is what crossed the
+  process boundary; arguments handed to a stubbed HTTP client prove nothing.
+- `grep -rn "Manager.from_config" lib` shows `provenance:` on every hit,
+  `grep -rn "config/riggs/workflows" lib` shows hits only inside
+  `Triggers.default_roots`, and `MCP::Client.from_config` no longer exists.
 
 ## Explicitly out of scope
 

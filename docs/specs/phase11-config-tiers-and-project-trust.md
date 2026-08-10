@@ -75,11 +75,33 @@ recorded against the path.
    misclassified is a silent escalation.
 
    Skills and workflows belong under the same gate as config because they are
-   not inert data. A skill declares `mcp_servers`, which pins which servers a
-   step may reach; a workflow declares `providers` and `relay_chain`, which
-   decides what gets dispatched and what pays for it. Gating the config file
-   while loading executable declarations from the same untrusted directory
-   would leave the door open beside the lock.
+   not inert data. A workflow's `providers` block is merged over the hub's by
+   `Router#provider_config` — **workflow wins** — and reaches
+   `OpenAICompatible#complete`, which reads `options[:base_url]` and then sends
+   `ENV["OPENAI_API_KEY"]` to it as a bearer token
+   (`lib/riggs/providers/openai_compatible.rb:20,22,39`). So a workflow file in
+   a cloned repo exfiltrates the operator's real API key with no MCP server, no
+   role grant, and no command execution — the same defect Phase 10 closed for
+   `auth: none`, reached through a different file.
+
+   **Trust gates the loader, not only the enumeration.** These are separate
+   code paths in this codebase and they diverged: `Triggers.find_workflows`
+   decides what `triggers:list` shows, while `CLI#load_workflow`
+   (`lib/riggs/cli/commands.rb:609`) and `WebApp#list_workflows`
+   (`lib/riggs/web/app.rb:550`) each hardcode `config/riggs/workflows` and are
+   what actually open a file for execution. Gating enumeration alone changes
+   nothing. **Every caller resolves workflows through one root list**, and that
+   list is what carries the gate.
+
+   Stripping the dangerous keys from an untrusted workflow instead of refusing
+   the file was considered and rejected: a workflow holds four levers —
+   workflow `providers`, step `provider`, step `relay_chain`, and step
+   `skill`/`skills` — so stripping is a denylist over an evolving schema, which
+   is the mistake corrected twice already in this spec.
+
+   The cost is stated plainly: **`riggs setup` or `riggs trust` must be run in
+   a repository before a workflow will run there.** One step on first use per
+   repo, which is the same tax codex, Claude Code and cursor all charge.
 
 4. **Three merge algebras, on purpose.** A lost provider is a billing surprise,
    a lost MCP server is a missing tool, and a lost skill is a silent capability
@@ -237,10 +259,22 @@ Each MCP server is then approved separately before its first spawn.
 **The digest covers the resolved absolute executable, its arguments, and the
 names of forwarded environment variables** — never their values. Resolved,
 not literal: a digest over `command: "mcp"` binds nothing, because a later
-`PATH` change selects a different binary under the same name. The executable is
-resolved through `PATH` at approval time and re-resolved at spawn; a different
-resolution is a different digest and re-prompts. This also keeps `PATH` itself
-out of the file, which storing it as a digest input would not.
+`PATH` change selects a different binary under the same name. This also keeps
+`PATH` itself out of the file, which storing it as a digest input would not.
+
+**The resolved path is what gets spawned.** Approval happens in
+`Manager#client_for`, and the actual `Open3.popen2` happens later in
+`Client#start!` (`lib/riggs/mcp/client.rb:35`) — so checking a digest at
+approval time and then handing `Client` the original bare name leaves a window
+in which `PATH` changes and a different binary runs under a valid approval.
+Rather than detect that race, remove it: `client_for` passes the **resolved
+absolute path** as the command, and `popen2` executes exactly the file that was
+approved. Resolution uses `File.realpath`, so a swapped symlink is a different
+path and a different digest.
+
+Resolution follows POSIX `PATH` semantics, including the one that is easy to
+get wrong: **an empty component means the current directory**, so `PATH=:/usr/bin`
+can run `./mcp`. Relative components resolve to absolute before digesting.
 
 A changed command, argument, resolved path, or forwarded variable name
 re-prompts.
@@ -453,6 +487,15 @@ has an `.agent_hubrc` or `.riggs/config.yml` carrying `users`, `roles`, or
 upgrade path, and it fires at the one moment the values to import are in reach.
 It never runs against an existing global config.
 
+**Seeding must not carry a credential into the global tier.** A legacy
+`.agent_hubrc` may well contain an `api_key`, and copying `providers` wholesale
+would persist it in `~/.riggs/config.yml` — breaking "no tier holds
+credentials" through the very step meant to adopt the new layout. Seeding takes
+each provider's name and only its non-credential fields (`type`, `model`,
+`base_url`, `pricing`, `relay_chain`, `auth`), drops everything else, and
+**prints each dropped key by name** so the operator knows to move it into the
+environment.
+
 **Project tier**, unless `project_path` is `$HOME` (R11.1): `.riggs/config.yml`
 plus the project `skills/` and `workflows/` directories. It no longer writes
 `db/`, `sqlite_path`, or `sqlite_memory`. The file it writes is a commented
@@ -468,6 +511,8 @@ and kept. A trust grant nobody saw is the thing R11.5 exists to prevent.
 ## R11.9 Tests
 
 Every claim below must be proved by breaking it and watching a test fail.
+Items 1–10 and 13–16 belong to **Phase 11a**; items 11 and 12 belong to
+**Phase 11b** and must not be implemented in 11a.
 
 1. An untrusted directory's `.riggs/config.yml` is not read — asserted on a
    file whose `mcp_servers` entry would spawn a command that creates a file,
@@ -476,6 +521,13 @@ Every claim below must be proved by breaking it and watching a test fail.
 1a. An untrusted directory's project skill and workflow roots contribute
    nothing: a workflow present only in the untrusted repo is not listed and
    not matchable, and a skill present only there fails to resolve.
+1b. The same workflow is not **runnable** either — `riggs workflow:run` on it
+   fails to find it, and the web app neither lists nor executes it. Asserted
+   separately from 1a because enumeration and loading are different code
+   paths that already diverged once.
+1c. An untrusted workflow setting `providers.openai.base_url` sends nothing to
+   that host — asserted against a real local `TCPServer` that records whether
+   it received a connection, not against a stubbed HTTP client.
 2. A project tier redefining a global role name raises, naming both files.
 3. A project tier setting any top-level key outside the permitted five raises,
    naming the key and listing the five — asserted for `sqlite_memory` and
@@ -570,12 +622,29 @@ one 11a resolves.
 
 ## Definition of done
 
-Cloning a repository whose `.riggs/config.yml` declares an MCP server and a
-privileged user, then running a riggs command in it, executes no attacker-chosen
-command and grants no attacker-chosen role — verified by running it, with the
-declared command being one whose execution leaves an observable artifact.
+### Phase 11a
+
+Cloning a hostile repository and running a riggs command in it defeats all
+**four** channels, verified by running it rather than by reading:
+
+1. `.riggs/config.yml` declares an MCP server whose command creates a file —
+   the file does not exist afterward.
+2. The same config declares a privileged user and `default_user` — the run
+   proceeds under the global identity, and prints which file chose it.
+3. `config/riggs/workflows/evil.yml` sets `providers.openai.base_url` to a
+   listener — the listener receives nothing, in particular no bearer token.
+4. The config sets `sqlite_memory.vector_path` to a library that would leave an
+   artifact if loaded — it is rejected before any load is attempted.
+
+Channels 3 and 4 are listed because earlier drafts of this spec closed only 1
+and 2 while claiming to close everything.
 
 Two product repositories on one machine run riggs against one global identity,
-one database, and their own workflows and skills. `riggs projects` lists both,
-and `riggs cost` reports each product's spend separately — with unmetered
-subscription work counted and never rendered as a zero.
+one database, and their own workflows and skills, after `riggs setup` has been
+run in each.
+
+### Phase 11b
+
+`riggs projects` lists both repositories, and `riggs cost` reports each
+product's spend separately — with unmetered subscription work counted and never
+rendered as a zero.
