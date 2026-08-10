@@ -67,10 +67,19 @@ recorded against the path.
    which of those things they use. The one exception is a role name the global
    tier does not define (R11.2).
 
-3. **Trust gates the project tier in its entirety.** An untrusted directory's
-   `.riggs/config.yml` is not read — not partially, not for "safe" keys. A
-   partial read means maintaining a per-key threat model forever, and the first
-   key that gets misclassified is a silent escalation.
+3. **Trust gates every project-supplied input, in its entirety.** Not only
+   `.riggs/config.yml` but the project's `config/riggs/skills/` and
+   `config/riggs/workflows/` roots: an untrusted path contributes none of them,
+   and resolution falls through to the global and bundled tiers. A partial read
+   means maintaining a per-key threat model forever, and the first key that gets
+   misclassified is a silent escalation.
+
+   Skills and workflows belong under the same gate as config because they are
+   not inert data. A skill declares `mcp_servers`, which pins which servers a
+   step may reach; a workflow declares `providers` and `relay_chain`, which
+   decides what gets dispatched and what pays for it. Gating the config file
+   while loading executable declarations from the same untrusted directory
+   would leave the door open beside the lock.
 
 4. **Three merge algebras, on purpose.** A lost provider is a billing surprise,
    a lost MCP server is a missing tool, and a lost skill is a silent capability
@@ -102,7 +111,8 @@ recorded against the path.
 `trust.yml` is a separate file from `config.yml` because riggs rewrites it on
 every approval. A hand-authored config file must not churn under the tool.
 
-`~/.riggs/config.yml` and `~/.riggs/trust.yml` are both created `0600`.
+`~/.riggs/config.yml` and `~/.riggs/trust.yml` are both created `0600`, by
+every writer — `riggs setup` included, not only the trust registry.
 
 **`project_path` is the git toplevel; failing that, the nearest ancestor
 holding a `.riggs/config.yml`; failing that, the absolute current directory.**
@@ -153,16 +163,33 @@ an operator who cannot see that will not be able to explain why.
 
 ## R11.2 Merge algebra
 
+**The project tier is an allowlist, not a denylist.** It may set exactly five
+top-level keys. Any other key — known or unknown, now or in future — is a hard
+error naming the key and listing the permitted five.
+
 | key | rule |
 | --- | --- |
-| `sqlite_path` | Global only. Project tier setting it is a hard error. |
 | `roles` | Project may define a role name the global tier does not define. Redefining a global name is a hard error. |
-| `users` | Merge by key. Project may add users and may override an existing user's `role`. |
+| `users` | Merge by key. A **new** user may set every field. On a user the global tier already defines, only `role` may be overridden; any other field is a hard error. |
 | `default_user` | Project may set it. Must resolve within the merged user set. |
-| `providers` | Override only. Project may set `model`, `base_url`, `pricing`, `relay_chain`, `auth` on a globally-defined provider. Naming an undefined provider is a hard error. `api_key` in the project tier is a hard error. |
+| `providers` | Override only, and only these fields: `model`, `base_url`, `pricing`, `relay_chain`, `auth`. Any other field — including `api_key`, `token`, `secret`, a nested `auth` hash, or `type` — is a hard error. Naming an undefined provider is a hard error. |
 | `mcp_servers` | Merge by name. Project may add. Every project-supplied server is approval-gated (R11.3). |
 
-Three distinct behaviors — replace-or-error, merge-by-key, merge-with-gate —
+Everything else is global only: `sqlite_path`, `sqlite_memory`, and any key
+added later.
+
+An allowlist rather than a denylist because a denylist has to enumerate every
+dangerous key in advance and is wrong the moment one is added. It was already
+wrong once: an earlier draft of this spec banned `sqlite_path` and said nothing
+about `sqlite_memory`, which `MemoryService#load_extensions!` feeds straight
+into `enable_load_extension` and `load_extension`
+(`lib/riggs/memory/service.rb:54-62`). A project setting `sqlite_memory.vector_path`
+would have loaded an arbitrary native library — code execution reached without
+touching the MCP approval this phase exists to build. The same reasoning applies
+per-field inside `providers`: banning `api_key` alone left `token`, `secret`,
+and a nested `auth:` hash open.
+
+Three distinct behaviors — reject-unless-listed, merge-by-key, merge-with-gate —
 and each error message must name the file that lost, not just the key:
 
 ```
@@ -196,10 +223,26 @@ projects:
 A timestamp, an absolute path, and a digest. **No value from any environment
 variable, argument, or credential is ever written to this file.**
 
+**Trust and approval are separate, and neither implies the other.** A path is
+trusted only when `trusted_at` is present, written by an explicit trust grant.
+Recording an MCP approval MUST NOT create trust — and approving a server for an
+untrusted path is itself an error, since the declaration being approved comes
+from a file that may not be read yet. An implementation where "trusted" means
+"has an entry" collapses the two gates into one: approving a single MCP server
+would silently trust the whole project config.
+
 Folder trust is asked once per path, before any project-tier file is read.
-Each MCP server is then approved separately before its first spawn. The digest
-covers the resolved command array, its arguments, and the **names** of
-forwarded environment variables — never their values. A changed command
+Each MCP server is then approved separately before its first spawn.
+
+**The digest covers the resolved absolute executable, its arguments, and the
+names of forwarded environment variables** — never their values. Resolved,
+not literal: a digest over `command: "mcp"` binds nothing, because a later
+`PATH` change selects a different binary under the same name. The executable is
+resolved through `PATH` at approval time and re-resolved at spawn; a different
+resolution is a different digest and re-prompts. This also keeps `PATH` itself
+out of the file, which storing it as a digest input would not.
+
+A changed command, argument, resolved path, or forwarded variable name
 re-prompts.
 
 The approval prompt prints the command it is asking about, which is a leak path
@@ -232,6 +275,26 @@ watching inverts the guarantee.
 
 New commands: `riggs trust` (approve the current directory), `riggs trust:list`,
 `riggs trust:forget PATH`, `riggs mcp:approve <name>`.
+
+### Every route from config to a spawned process passes the gate
+
+`Manager#client_for` is the gate's location, and the routes around it must be
+closed rather than assumed absent:
+
+- **`MCP::Client.from_config` is removed.** It builds a client straight from a
+  servers hash with no provenance and no approval. It has no callers in `lib/`
+  — only two tests asserting it returns nil on empty input — so it is dead
+  config-driven API that exists solely as a bypass.
+- **`Manager.wrap_client` keeps taking an already-constructed client**, because
+  its caller (`GraphEngine`, `lib/riggs/workflow/graph_engine.rb:29`) is
+  injecting an object in-process, not reading a repository. It must document
+  that it performs no approval and must never be reachable from configuration.
+- **`Client.new` stays public** for the same reason. Neither is a config-driven
+  path, and the boundary this phase defends is "what a repository can cause to
+  run," not "what a Ruby caller in this process can construct."
+
+A phase whose gate has three doors it does not know about has no gate. This
+list is the audit, and R11.9 asserts it.
 
 ## R11.5 Identity provenance is printed
 
@@ -365,6 +428,14 @@ becomes a tiered resolver rather than a flat list.
 each value came from, since a value shown without its origin invites an edit
 that lands in the wrong file.
 
+**`ConfigStore` must not be a way around the trust gate.** It reads a path
+through `Identity.load_config(path)`, which is a raw single-file reader by
+design, and the web app hands it whatever `Identity.config_path` returns
+(`lib/riggs/web/app.rb:96-98`). So `Identity.config_path` MUST NOT return an
+untrusted project path — it falls through to the global config instead — and
+`ConfigStore` MUST refuse a project path that is not trusted. Otherwise `/config`
+reads and writes a file the resolver just declined to open, over HTTP.
+
 `riggs setup` stays one command with no new flags. It ensures both tiers exist,
 per artifact, creating only what is missing and never overwriting a config file
 that is already there — the behavior `setup` has today, extended across two
@@ -384,9 +455,10 @@ It never runs against an existing global config.
 
 **Project tier**, unless `project_path` is `$HOME` (R11.1): `.riggs/config.yml`
 plus the project `skills/` and `workflows/` directories. It no longer writes
-`db/`, `sqlite_path`, `users`, or `roles`. The file it writes is a commented
-skeleton naming only keys the project tier may set under R11.2, so a generated
-file cannot itself trip a hard error.
+`db/`, `sqlite_path`, or `sqlite_memory`. The file it writes is a commented
+skeleton whose every key is one the project tier may set under R11.2 — so it
+may mention `default_user`, `users`, `roles`, `providers` and `mcp_servers`,
+all commented out, and a generated file cannot itself trip a hard error.
 
 Running `riggs setup` in a directory **records trust for that path**. Typing it
 somewhere you chose is consent, so no separate prompt is raised — but setup MUST
@@ -398,17 +470,36 @@ and kept. A trust grant nobody saw is the thing R11.5 exists to prevent.
 Every claim below must be proved by breaking it and watching a test fail.
 
 1. An untrusted directory's `.riggs/config.yml` is not read — asserted on a
-   file whose `mcp_servers` entry would spawn an observable command, proving
-   the command never ran, not merely that a hash was empty.
+   file whose `mcp_servers` entry would spawn a command that creates a file,
+   proving that file does not exist afterward. An assertion that the merged
+   hash lacks a key passes even if the file was read, parsed, and discarded.
+1a. An untrusted directory's project skill and workflow roots contribute
+   nothing: a workflow present only in the untrusted repo is not listed and
+   not matchable, and a skill present only there fails to resolve.
 2. A project tier redefining a global role name raises, naming both files.
-3. A project tier setting `api_key` raises.
+3. A project tier setting any top-level key outside the permitted five raises,
+   naming the key and listing the five — asserted for `sqlite_memory` and
+   `sqlite_path` specifically, and for an unrecognized key.
+3a. A project tier setting a provider field outside the permitted five raises —
+   asserted for `api_key`, `token`, a nested `auth:` hash, and `type`.
+3b. A project tier overriding a field other than `role` on a globally-defined
+   user raises; overriding `role` on that user, and defining every field on a
+   new user, both succeed.
 4. A project tier naming an undefined provider raises, listing the defined ones.
 5. A project tier adding a user and overriding an existing user's role both
    take effect after trust is granted.
 6. Skill and workflow resolution: project shadows global shadows bundled; a
    globally-defined workflow is visible in a project that does not define it;
    `triggers:list` reports the tier.
-7. An MCP server whose command changes after approval re-prompts.
+7. An MCP server whose command changes after approval re-prompts, including
+   when only the `PATH`-resolved executable changed and the literal `command`
+   string did not.
+7a. Recording an MCP approval does not make the path trusted, and approving a
+   server for an untrusted path raises.
+7b. Every config-driven route to a spawn passes the gate: `MCP::Client.from_config`
+   no longer exists, and no `lib/` code constructs an `MCP::Client` from a
+   configuration hash outside `Manager#client_for` — asserted by a test that
+   greps the loaded source, so a future caller trips it.
 8. The approval prompt redacts `--token <value>`; asserted against captured
    output, not against the arguments handed to a formatter.
 9. Non-interactive: an unapproved server produces the `riggs mcp:approve` error
