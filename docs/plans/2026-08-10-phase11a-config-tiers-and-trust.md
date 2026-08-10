@@ -38,25 +38,48 @@ The spec left both open. The plan picks a default so implementation is not block
 
 ### Task 1: `Riggs::Trust` — the trust and approval registry
 
+**Governing standard:** `CLAUDE.md` in the repo root. Every class in this task
+is under 100 lines of code, every method under 5, no method takes more than 4
+parameters, there are no ternaries and no optional parameters. `Metrics` stays
+disabled in `.rubocop.yml` — the 60 pre-existing files do not meet this bar and
+turning the cops on globally would make the gate unpassable. This task meets it
+by construction instead.
+
+Bang names are retained (`grant!`, `forget!`, `approve_mcp!`): they are
+destructive and the operator chose to keep them over `?` forms that would read
+as pure queries.
+
 **Files:**
+- Create: `lib/riggs/trust/executable.rb`
+- Create: `lib/riggs/trust/digest.rb`
+- Create: `lib/riggs/trust/store.rb`
 - Create: `lib/riggs/trust.rb`
+- Modify: `lib/riggs.rb` (add `require_relative "riggs/trust"`)
 - Test: `test/test_trust.rb`
-- Modify: `lib/riggs.rb` (add the require)
 
-**Interfaces:**
-- Consumes: nothing. This task has no dependencies and no callers yet.
-- Produces:
-  - `Trust.new(path: <string>)` — defaults to `~/.riggs/trust.yml`
-  - `#trusted?(project_path) -> Boolean`
-  - `#grant!(project_path) -> String` (the path)
-  - `#forget!(project_path) -> Boolean` (true if an entry was removed)
-  - `#projects -> Array<String>` sorted
-  - `#trusted_at(project_path) -> String | nil`
-  - `#mcp_approved?(project_path, name, digest) -> Boolean`
-  - `#approve_mcp!(project_path, name, digest) -> String` (the digest)
-  - `Trust.digest(command:, args: [], env: {}) -> "sha256:<hex>"`
+**Interfaces produced** (Tasks 2, 6, 7 and 8 consume these):
 
-- [ ] **Step 1: Write the failing tests**
+- `Riggs::Trust.home -> String` — `ENV["RIGGS_HOME"]` or `~/.riggs`
+- `Riggs::Trust.default_path -> String` — `<home>/trust.yml`
+- `Riggs::Trust.default -> Trust` — the production instance
+- `Riggs::Trust.new(path:) -> Trust` — `path` is REQUIRED, no default
+- `Riggs::Trust.digest(command:, args:, env:) -> String` — all three required
+- `Riggs::Trust.resolve_executable(command:, env:) -> String` — both required
+- `#path -> String`
+- `#trusted?(project_path) -> Boolean`
+- `#trusted_at(project_path) -> String | nil`
+- `#grant!(project_path) -> String` (the path)
+- `#forget!(project_path) -> String | nil` (the path it forgot, else nil)
+- `#projects -> Array<String>` (sorted)
+- `#mcp_approved?(project_path, name, digest) -> Boolean`
+- `#approve_mcp!(project_path, name, digest) -> String` (the digest)
+
+Note `.new(path:)` is required with no default. A test that forgets it raises
+`ArgumentError` immediately rather than silently writing to the developer's
+real `~/.riggs/trust.yml`. The Global Constraint about not polluting `$HOME`
+is enforced by the signature, not by reviewer vigilance.
+
+- [ ] **Step 1: Write the failing test**
 
 Create `test/test_trust.rb`:
 
@@ -74,8 +97,16 @@ class TestTrust < Minitest::Test
     end
   end
 
+  def digest_for(command, args = [], env = {})
+    Riggs::Trust.digest(command: command, args: args, env: env)
+  end
+
   def test_an_unknown_path_is_not_trusted
     with_trust { |trust, _| refute trust.trusted?("/Users/matt/Projects/foo") }
+  end
+
+  def test_a_path_is_required_so_no_test_can_touch_the_real_home
+    assert_raises(ArgumentError) { Riggs::Trust.new }
   end
 
   def test_grant_makes_a_path_trusted_and_records_a_timestamp
@@ -96,12 +127,14 @@ class TestTrust < Minitest::Test
     end
   end
 
-  def test_forget_removes_a_path_and_reports_whether_it_did
+  # forget! returns what it removed, not a boolean: `?` would read as a pure
+  # query on a method that deletes an entry and rewrites the file.
+  def test_forget_returns_the_path_it_forgot_and_nil_when_there_was_nothing
     with_trust do |trust, _|
       trust.grant!("/p")
-      assert trust.forget!("/p")
+      assert_equal "/p", trust.forget!("/p")
       refute trust.trusted?("/p")
-      refute trust.forget!("/p")
+      assert_nil trust.forget!("/p")
     end
   end
 
@@ -116,42 +149,55 @@ class TestTrust < Minitest::Test
   def test_the_file_is_created_private_to_the_owner
     with_trust do |trust, _|
       trust.grant!("/p")
-      mode = File.stat(trust.path).mode & 0o777
-      assert_equal 0o600, mode
+      assert_equal 0o600, File.stat(trust.path).mode & 0o777
+    end
+  end
+
+  # Writing content first and chmod'ing after leaves a window in which the
+  # file is world-readable WITH the project list already in it. Creating the
+  # node private before any content is written closes that window; a file that
+  # arrived world-readable by some other route is tightened on the next write.
+  def test_a_world_readable_file_is_tightened_on_write
+    with_trust do |trust, _|
+      FileUtils.mkdir_p(File.dirname(trust.path))
+      File.write(trust.path, "---\nprojects: {}\n")
+      File.chmod(0o644, trust.path)
+      trust.grant!("/p")
+      assert_equal 0o600, File.stat(trust.path).mode & 0o777
     end
   end
 
   def test_a_digest_is_stable_across_calls
-    a = Riggs::Trust.digest(command: "npx", args: %w[-y hb-mcp], env: { "HB_TOKEN" => "sk-1" })
-    b = Riggs::Trust.digest(command: "npx", args: %w[-y hb-mcp], env: { "HB_TOKEN" => "sk-2" })
+    a = digest_for("npx", %w[-y hb-mcp], { "HB_TOKEN" => "sk-1" })
+    b = digest_for("npx", %w[-y hb-mcp], { "HB_TOKEN" => "sk-2" })
     assert_equal a, b
     assert_match(/\Asha256:[0-9a-f]{64}\z/, a)
   end
 
   def test_a_digest_changes_when_the_command_or_arguments_change
-    base = Riggs::Trust.digest(command: "npx", args: %w[-y hb-mcp])
-    refute_equal base, Riggs::Trust.digest(command: "node", args: %w[-y hb-mcp])
-    refute_equal base, Riggs::Trust.digest(command: "npx", args: %w[-y evil-mcp])
-    refute_equal base, Riggs::Trust.digest(command: "npx", args: %w[-y hb-mcp --extra])
+    base = digest_for("npx", %w[-y hb-mcp])
+    refute_equal base, digest_for("node", %w[-y hb-mcp])
+    refute_equal base, digest_for("npx", %w[-y evil-mcp])
+    refute_equal base, digest_for("npx", %w[-y hb-mcp --extra])
   end
 
   # D1: names are part of the identity of a server, values never are.
   def test_a_digest_changes_when_a_forwarded_variable_is_renamed
-    a = Riggs::Trust.digest(command: "x", env: { "HB_TOKEN" => "v" })
-    b = Riggs::Trust.digest(command: "x", env: { "OTHER_TOKEN" => "v" })
+    a = digest_for("x", [], { "HB_TOKEN" => "v" })
+    b = digest_for("x", [], { "OTHER_TOKEN" => "v" })
     refute_equal a, b
   end
 
   def test_a_digest_ignores_the_order_variables_were_declared_in
-    a = Riggs::Trust.digest(command: "x", env: { "A" => "1", "B" => "2" })
-    b = Riggs::Trust.digest(command: "x", env: { "B" => "2", "A" => "1" })
+    a = digest_for("x", [], { "A" => "1", "B" => "2" })
+    b = digest_for("x", [], { "B" => "2", "A" => "1" })
     assert_equal a, b
   end
 
   def test_approval_is_recorded_per_project_and_per_server
     with_trust do |trust, _|
       trust.grant!("/p")
-      d = Riggs::Trust.digest(command: "npx", args: %w[hb])
+      d = digest_for("npx", %w[hb])
       trust.approve_mcp!("/p", "honeybadger", d)
       assert trust.mcp_approved?("/p", "honeybadger", d)
       refute trust.mcp_approved?("/other", "honeybadger", d)
@@ -162,9 +208,16 @@ class TestTrust < Minitest::Test
   def test_a_changed_command_is_no_longer_approved
     with_trust do |trust, _|
       trust.grant!("/p")
-      trust.approve_mcp!("/p", "hb", Riggs::Trust.digest(command: "npx", args: %w[hb]))
-      changed = Riggs::Trust.digest(command: "npx", args: %w[hb --now-with-extras])
-      refute trust.mcp_approved?("/p", "hb", changed)
+      trust.approve_mcp!("/p", "hb", digest_for("npx", %w[hb]))
+      refute trust.mcp_approved?("/p", "hb", digest_for("npx", %w[hb --now-with-extras]))
+    end
+  end
+
+  # An absent approval must not compare equal to an absent digest.
+  def test_an_unrecorded_server_is_not_approved_by_a_nil_digest
+    with_trust do |trust, _|
+      trust.grant!("/p")
+      refute trust.mcp_approved?("/p", "never-approved", nil)
     end
   end
 
@@ -172,7 +225,7 @@ class TestTrust < Minitest::Test
   def test_approving_a_server_for_an_untrusted_path_raises
     with_trust do |trust, _|
       err = assert_raises(Riggs::Error) do
-        trust.approve_mcp!("/p", "hb", Riggs::Trust.digest(command: "npx"))
+        trust.approve_mcp!("/p", "hb", digest_for("npx"))
       end
       assert_includes err.message, "not trusted"
       refute trust.trusted?("/p")
@@ -182,7 +235,7 @@ class TestTrust < Minitest::Test
   def test_recording_an_approval_never_creates_trust
     with_trust do |trust, _|
       trust.grant!("/p")
-      trust.approve_mcp!("/p", "hb", Riggs::Trust.digest(command: "npx"))
+      trust.approve_mcp!("/p", "hb", digest_for("npx"))
       trust.forget!("/p")
       refute trust.trusted?("/p"), "forgetting trust must not be undone by a surviving approval entry"
     end
@@ -191,21 +244,16 @@ class TestTrust < Minitest::Test
   # The digest binds the binary, not the name that happened to select it.
   def test_a_digest_binds_the_path_resolved_executable
     Dir.mktmpdir do |dir|
-      %w[a b].each do |sub|
-        FileUtils.mkdir_p(File.join(dir, sub))
-        bin = File.join(dir, sub, "fakemcp")
-        File.write(bin, "#!/bin/sh\nexit 0\n")
-        File.chmod(0o755, bin)
-      end
-      a = Riggs::Trust.digest(command: "fakemcp", env: { "PATH" => File.join(dir, "a") })
-      b = Riggs::Trust.digest(command: "fakemcp", env: { "PATH" => File.join(dir, "b") })
+      %w[a b].each { |sub| write_fake(File.join(dir, sub), "fakemcp") }
+      a = digest_for("fakemcp", [], { "PATH" => File.join(dir, "a") })
+      b = digest_for("fakemcp", [], { "PATH" => File.join(dir, "b") })
       refute_equal a, b, "same command name, different binary, must not share an approval"
     end
   end
 
   def test_an_unresolvable_command_still_digests_stably
-    a = Riggs::Trust.digest(command: "definitely-not-on-this-path-9f2a", env: { "PATH" => "/nonexistent" })
-    b = Riggs::Trust.digest(command: "definitely-not-on-this-path-9f2a", env: { "PATH" => "/nonexistent" })
+    a = digest_for("definitely-not-on-this-path-9f2a", [], { "PATH" => "/nonexistent" })
+    b = digest_for("definitely-not-on-this-path-9f2a", [], { "PATH" => "/nonexistent" })
     assert_equal a, b
   end
 
@@ -214,11 +262,9 @@ class TestTrust < Minitest::Test
   # root while the child executes one in the working directory.
   def test_an_empty_path_component_resolves_to_the_current_directory
     Dir.mktmpdir do |dir|
-      bin = File.join(dir, "fakemcp")
-      File.write(bin, "#!/bin/sh\nexit 0\n")
-      File.chmod(0o755, bin)
+      bin = write_fake(dir, "fakemcp")
       Dir.chdir(dir) do
-        resolved = Riggs::Trust.resolve_executable("fakemcp", env: { "PATH" => ":/nonexistent" })
+        resolved = Riggs::Trust.resolve_executable(command: "fakemcp", env: { "PATH" => ":/nonexistent" })
         assert_equal File.realpath(bin), resolved
       end
     end
@@ -226,12 +272,9 @@ class TestTrust < Minitest::Test
 
   def test_a_relative_path_component_resolves_to_an_absolute_path
     Dir.mktmpdir do |dir|
-      FileUtils.mkdir_p(File.join(dir, "tools"))
-      bin = File.join(dir, "tools", "fakemcp")
-      File.write(bin, "#!/bin/sh\nexit 0\n")
-      File.chmod(0o755, bin)
+      bin = write_fake(File.join(dir, "tools"), "fakemcp")
       Dir.chdir(dir) do
-        resolved = Riggs::Trust.resolve_executable("fakemcp", env: { "PATH" => "tools" })
+        resolved = Riggs::Trust.resolve_executable(command: "fakemcp", env: { "PATH" => "tools" })
         assert_equal File.realpath(bin), resolved
         assert resolved.start_with?("/"), "a digest input must be an absolute path"
       end
@@ -240,16 +283,13 @@ class TestTrust < Minitest::Test
 
   def test_a_swapped_symlink_is_a_different_approval
     Dir.mktmpdir do |dir|
-      %w[a b].each do |n|
-        File.write(File.join(dir, n), "#!/bin/sh\nexit 0\n")
-        File.chmod(0o755, File.join(dir, n))
-      end
+      %w[a b].each { |n| write_fake(dir, n) }
       link = File.join(dir, "fakemcp")
       File.symlink(File.join(dir, "a"), link)
-      first = Riggs::Trust.digest(command: link)
+      first = digest_for(link)
       File.unlink(link)
       File.symlink(File.join(dir, "b"), link)
-      refute_equal first, Riggs::Trust.digest(command: link)
+      refute_equal first, digest_for(link)
     end
   end
 
@@ -268,7 +308,7 @@ class TestTrust < Minitest::Test
     with_trust do |trust, _|
       trust.grant!("/p")
       sentinel = "SENTINEL-b3f1c9d2-do-not-persist"
-      d = Riggs::Trust.digest(command: "npx", args: %w[hb], env: { "HB_TOKEN" => sentinel })
+      d = digest_for("npx", %w[hb], { "HB_TOKEN" => sentinel })
       trust.approve_mcp!("/p", "hb", d)
       contents = File.read(trust.path)
       refute_includes contents, sentinel
@@ -277,49 +317,258 @@ class TestTrust < Minitest::Test
     end
   end
 
+  private
+
+  def write_fake(dir, name)
+    FileUtils.mkdir_p(dir)
+    path = File.join(dir, name)
+    File.write(path, "#!/bin/sh\nexit 0\n")
+    File.chmod(0o755, path)
+    path
+  end
 end
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run the test and watch it fail for the right reason**
 
 Run: `PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec ruby -Itest test/test_trust.rb`
-Expected: FAIL — `NameError: uninitialized constant Riggs::Trust`
 
-- [ ] **Step 3: Implement `Riggs::Trust`**
+Expected: `NameError: uninitialized constant Riggs::Trust`. Any other failure
+means the harness is broken, not the feature missing — fix that first.
 
-Create `lib/riggs/trust.rb`:
+- [ ] **Step 3: Create `lib/riggs/trust/executable.rb`**
+
+```ruby
+# frozen_string_literal: true
+
+module Riggs
+  class Trust
+    # Turns a configured command into the absolute path that will actually be
+    # spawned. A digest over the literal string "mcp" binds nothing: a later
+    # PATH change selects a different binary under the same name and the old
+    # approval still matches. Resolving here, and re-resolving at spawn, means
+    # a different binary is a different digest.
+    #
+    # It also keeps PATH itself out of the digest input, which recording PATH
+    # as an environment value would not.
+    class Executable
+      # POSIX: an EMPTY PATH component means the current directory, so
+      # PATH=":/usr/bin" can run ./mcp. File.join("", cmd) yields "/cmd" --
+      # a file in the filesystem root, not the one that runs.
+      CURRENT_DIRECTORY = "."
+
+      # Where exec looks when PATH is unset in the child.
+      DEFAULT_PATH = "/bin:/usr/bin"
+
+      def self.resolve(command:, env:)
+        new(command: command, env: env).path
+      end
+
+      def initialize(command:, env:)
+        @command = command.to_s
+        @env = (env || {}).transform_keys(&:to_s)
+      end
+
+      # An unresolvable name digests as "unresolved:<name>" so approval still
+      # binds something stable and the spawn fails on its own terms, not here.
+      def path
+        return realpath(File.expand_path(@command)) if qualified?
+
+        found = candidates.detect { |candidate| runnable?(candidate) }
+        return "unresolved:#{@command}" if found.nil?
+
+        realpath(found)
+      end
+
+      private
+
+      def qualified?
+        @command.include?(File::SEPARATOR)
+      end
+
+      def candidates
+        search_path.lazy.map { |dir| expand(dir) }
+      end
+
+      def expand(dir)
+        File.expand_path(File.join(base_for(dir), @command))
+      end
+
+      def base_for(dir)
+        return CURRENT_DIRECTORY if dir.empty?
+
+        dir
+      end
+
+      def runnable?(candidate)
+        File.file?(candidate) && File.executable?(candidate)
+      end
+
+      def search_path
+        raw_path.split(File::PATH_SEPARATOR, -1)
+      end
+
+      # A key present with a NIL value means "unset in the child" to Open3, and
+      # exec then falls back to a system default path rather than to ours. That
+      # is why this checks for the key and then for the value, not just the
+      # value.
+      def raw_path
+        return @env["PATH"] || DEFAULT_PATH if @env.key?("PATH")
+
+        ENV.fetch("PATH", DEFAULT_PATH)
+      end
+
+      # The winner is realpath'd so a swapped symlink is a different path, and
+      # therefore a different approval.
+      def realpath(candidate)
+        File.realpath(candidate)
+      rescue SystemCallError
+        candidate
+      end
+    end
+  end
+end
+```
+
+- [ ] **Step 4: Create `lib/riggs/trust/digest.rb`**
+
+```ruby
+# frozen_string_literal: true
+
+require "digest"
+require "json"
+
+module Riggs
+  class Trust
+    # The identity of an approved MCP server: what will run, with which
+    # arguments, forwarding which environment variable NAMES.
+    #
+    # D1 -- names are part of that identity, so renaming a forwarded variable
+    # re-prompts. Excluding them would let an approved server be pointed at a
+    # different secret with no re-approval, which is the worse failure.
+    #
+    # Values never participate. A digest is one-way, but the rule "no value
+    # enters this subsystem" is checkable and "no value escapes this hash" is
+    # not.
+    class Digest
+      def self.of(command:, args:, env:)
+        new(command: command, args: args, env: env).value
+      end
+
+      def initialize(command:, args:, env:)
+        @command = command
+        @args = Array(args).map(&:to_s)
+        @env = env || {}
+      end
+
+      # ::Digest, not Digest -- inside this class the bare constant resolves to
+      # this class itself, not to the stdlib.
+      def value
+        "sha256:#{::Digest::SHA256.hexdigest(canonical)}"
+      end
+
+      private
+
+      def canonical
+        JSON.generate("command" => resolved, "args" => @args, "env_keys" => env_keys)
+      end
+
+      def resolved
+        Executable.resolve(command: @command, env: @env)
+      end
+
+      def env_keys
+        @env.keys.map(&:to_s).sort
+      end
+    end
+  end
+end
+```
+
+- [ ] **Step 5: Create `lib/riggs/trust/store.rb`**
 
 ```ruby
 # frozen_string_literal: true
 
 require "psych"
 require "fileutils"
-require "digest"
-require "json"
-require "time"
 
 module Riggs
-  # The registry of which absolute paths the operator has trusted, and which
-  # MCP servers they have approved within each. Machine-written: riggs rewrites
-  # it on every approval, which is why it is a separate file from the
-  # hand-authored ~/.riggs/config.yml.
+  class Trust
+    # The YAML file behind the registry. Machine-written: riggs rewrites it on
+    # every approval, which is why it is a separate file from the
+    # hand-authored ~/.riggs/config.yml.
+    class Store
+      attr_reader :path
+
+      def initialize(path:)
+        @path = path
+      end
+
+      def read
+        return empty unless File.exist?(@path)
+
+        loaded || empty
+      end
+
+      def write(data)
+        FileUtils.mkdir_p(File.dirname(@path))
+        create_private
+        File.write(@path, Psych.dump(data))
+        @path
+      end
+
+      private
+
+      # A fresh nested hash every call. A shared frozen constant dup'd on read
+      # would freeze only the OUTER hash, so every caller would mutate the same
+      # inner "projects" hash and one registry's grants would leak into every
+      # other.
+      def empty
+        { "projects" => {} }
+      end
+
+      # Neither symbols nor aliases have any business in a machine-written
+      # registry, so this is the strict form rather than the permissive one
+      # Identity uses for hand-authored config.
+      def loaded
+        Psych.safe_load(File.read(@path), permitted_classes: [], aliases: false)
+      end
+
+      # The node is created 0600 BEFORE any content is written, and an existing
+      # file is tightened before it is rewritten. Writing content first and
+      # chmod'ing after leaves a window in which the file is world-readable
+      # with the operator's project list already in it.
+      def create_private
+        File.open(@path, File::WRONLY | File::CREAT, 0o600) { nil }
+        File.chmod(0o600, @path)
+      end
+    end
+  end
+end
+```
+
+- [ ] **Step 6: Create `lib/riggs/trust.rb`**
+
+```ruby
+# frozen_string_literal: true
+
+require "time"
+require_relative "trust/executable"
+require_relative "trust/digest"
+require_relative "trust/store"
+
+module Riggs
+  # Which absolute paths the operator has trusted, and which MCP servers they
+  # have approved within each.
   #
   # Nothing secret is ever stored here. Approvals are recorded as a digest of
   # the command, its arguments, and the NAMES of forwarded environment
-  # variables. Values are never read into the digest and never written.
+  # variables.
   class Trust
-    # NOT a shared frozen constant dup'd on read. `{"projects" => {}}.freeze`
-    # freezes only the outer hash, so every `.dup` of it shares the SAME inner
-    # projects hash -- and `project_entry` mutates that hash in place. One
-    # Trust instance whose file does not exist would then leak grants into
-    # every other. Build a fresh nested hash each time instead.
-    def self.empty = { "projects" => {} }
-
-    attr_reader :path
-
-    # Resolved at call time, not as a load-time constant, so a test (and an
-    # operator with more than one riggs install) can point the whole global
-    # tier somewhere else. Same escape hatch CODEX_HOME provides.
+    # Resolved at call time, not as a load-time constant, so a test -- and an
+    # operator with more than one riggs install -- can point the whole global
+    # tier somewhere else. The same escape hatch CODEX_HOME provides.
     def self.home
       ENV["RIGGS_HOME"] || File.join(Dir.home, ".riggs")
     end
@@ -328,70 +577,33 @@ module Riggs
       File.join(home, "trust.yml")
     end
 
-    def initialize(path: nil)
-      @path = path || self.class.default_path
+    def self.default
+      new(path: default_path)
     end
 
-    # D1: environment variable NAMES are part of a server's identity, so
-    # renaming one re-prompts. Excluding them would let an approved server be
-    # pointed at a different secret with no re-approval. Values never
-    # participate -- a digest is not a safe place to put one even though it is
-    # one-way, because the rule "no value enters this subsystem" is checkable
-    # and "no value escapes this hash" is not.
-    #
-    # The RESOLVED executable, not the literal command: a digest over "mcp"
-    # binds nothing, because a later PATH change selects a different binary
-    # under the same name. Resolving here and re-resolving at spawn means a
-    # different binary is a different digest. It also keeps PATH itself out of
-    # the digest input, which storing PATH as an env value would not.
-    def self.digest(command:, args: [], env: {})
-      canonical = JSON.generate(
-        "command" => resolve_executable(command, env: env),
-        "args" => Array(args).map(&:to_s),
-        "env_keys" => (env || {}).keys.map(&:to_s).sort
-      )
-      "sha256:#{Digest::SHA256.hexdigest(canonical)}"
+    def self.digest(command:, args:, env:)
+      Digest.of(command: command, args: args, env: env)
     end
 
-    # POSIX PATH semantics, including the one that is easy to get wrong: an
-    # EMPTY component means the current directory, so PATH=":/usr/bin" can run
-    # ./mcp. File.join("", cmd) yields "/cmd", which would have digested a
-    # different file than the one that runs. Relative components resolve to
-    # absolute, and the winner is realpath'd so a swapped symlink is a
-    # different path and therefore a different approval.
-    #
-    # An unresolvable name digests as "unresolved:<name>" so approval still
-    # binds something stable and the spawn fails on its own terms, not here.
-    DEFAULT_PATH = "/bin:/usr/bin"
-
-    def self.resolve_executable(command, env: {})
-      cmd = command.to_s
-      return realpath_or(File.expand_path(cmd)) if cmd.include?(File::SEPARATOR)
-
-      found = search_path(env).lazy
-                              .map { |dir| File.expand_path(File.join(dir.empty? ? "." : dir, cmd)) }
-                              .find { |p| File.file?(p) && File.executable?(p) }
-      found ? realpath_or(found) : "unresolved:#{cmd}"
+    def self.resolve_executable(command:, env:)
+      Executable.resolve(command: command, env: env)
     end
 
-    # A key present with a nil value means "unset in the child" to Open3, and
-    # exec then falls back to a system default path rather than to ours.
-    def self.search_path(env)
-      e = (env || {}).transform_keys(&:to_s)
-      raw = e.key?("PATH") ? e["PATH"] : ENV.fetch("PATH", nil)
-      (raw || DEFAULT_PATH).split(File::PATH_SEPARATOR, -1)
+    # `path` is required and has no default. A caller that forgets it raises
+    # ArgumentError instead of quietly writing to the developer's real
+    # ~/.riggs/trust.yml.
+    def initialize(path:)
+      @store = Store.new(path: path)
     end
 
-    def self.realpath_or(path)
-      File.realpath(path)
-    rescue SystemCallError
-      path
+    def path
+      @store.path
     end
 
-    # Trust is `trusted_at` being present, NOT an entry existing. An entry is
-    # also created by recording an approval, and conflating the two means
+    # Trust is `trusted_at` being PRESENT, not an entry existing. An entry is
+    # also created by recording an approval, and conflating the two would mean
     # approving one MCP server silently trusts the whole project config --
-    # collapsing the two gates this phase deliberately separates.
+    # collapsing the two gates this phase exists to separate.
     def trusted?(project_path)
       !trusted_at(project_path).nil?
     end
@@ -401,112 +613,124 @@ module Riggs
     end
 
     def grant!(project_path)
-      update! do |data|
-        proj = project_entry(data, project_path)
-        proj["trusted_at"] ||= Time.now.utc.iso8601
-      end
+      update { |data| project_entry(data, project_path)["trusted_at"] ||= now }
       project_path.to_s
     end
 
+    # Returns the path it forgot, or nil when there was nothing to forget.
+    # Deliberately not a boolean and deliberately not `forget?`: this deletes
+    # an entry and rewrites the file, and `?` reads as a pure query.
     def forget!(project_path)
-      data = read
-      removed = (data["projects"] || {}).delete(project_path.to_s)
-      write!(data) unless removed.nil?
-      !removed.nil?
+      data = @store.read
+      return nil if projects_in(data).delete(project_path.to_s).nil?
+
+      @store.write(data)
+      project_path.to_s
     end
 
     def projects
-      (read["projects"] || {}).keys.sort
+      projects_in(@store.read).keys.sort
     end
 
+    # An absent approval must not compare equal to an absent digest, so the
+    # nil check is separate from the comparison.
     def mcp_approved?(project_path, name, digest)
-      recorded = entry(project_path)&.dig("mcp_approved", name.to_s)
-      !recorded.nil? && recorded == digest
+      found = recorded(project_path, name)
+      !found.nil? && found == digest
     end
 
     # Approving requires trust first: the declaration being approved lives in a
     # file that may not be read yet. This never writes trusted_at.
     def approve_mcp!(project_path, name, digest)
-      unless trusted?(project_path)
-        raise Error, "cannot approve MCP server '#{name}' for #{project_path}: " \
-                     "the path is not trusted. Run 'riggs trust' there first."
-      end
-
-      update! do |data|
-        (project_entry(data, project_path)["mcp_approved"] ||= {})[name.to_s] = digest
-      end
+      require_trust!(project_path, name)
+      update { |data| approvals(data, project_path)[name.to_s] = digest }
       digest
     end
 
     private
 
+    def recorded(project_path, name)
+      entry(project_path)&.dig("mcp_approved", name.to_s)
+    end
+
+    def require_trust!(project_path, name)
+      return if trusted?(project_path)
+
+      raise Error, "cannot approve MCP server '#{name}' for #{project_path}: " \
+                   "the path is not trusted. Run 'riggs trust' there first."
+    end
+
+    def approvals(data, project_path)
+      project_entry(data, project_path)["mcp_approved"] ||= {}
+    end
+
     def project_entry(data, project_path)
-      (data["projects"] ||= {})[project_path.to_s] ||= {}
+      projects_in(data)[project_path.to_s] ||= {}
+    end
+
+    def projects_in(data)
+      data["projects"] ||= {}
     end
 
     def entry(project_path)
-      (read["projects"] || {})[project_path.to_s]
+      projects_in(@store.read)[project_path.to_s]
     end
 
-    def update!
-      data = read
+    def update
+      data = @store.read
       yield data
-      write!(data)
+      @store.write(data)
     end
 
-    # Neither symbols nor aliases have any business in a machine-written
-    # registry, so this is the strict form rather than the permissive one
-    # Identity uses for hand-authored config.
-    def read
-      return self.class.empty unless File.exist?(@path)
-
-      Psych.safe_load(File.read(@path), permitted_classes: [], aliases: false) || self.class.empty
-    end
-
-    def write!(data)
-      FileUtils.mkdir_p(File.dirname(@path))
-      File.write(@path, Psych.dump(data))
-      File.chmod(0o600, @path)
-      @path
+    def now
+      Time.now.utc.iso8601
     end
   end
 end
 ```
 
-Add to `lib/riggs.rb` alongside the other requires:
+- [ ] **Step 7: Wire it into the entrypoint**
+
+In `lib/riggs.rb`, add above `require_relative "riggs/config_store"`:
 
 ```ruby
 require_relative "riggs/trust"
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 8: Run the test and watch it pass**
 
 Run: `PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec ruby -Itest test/test_trust.rb`
-Expected: PASS, 14 runs, 0 failures.
 
-- [ ] **Step 5: Mutation-verify the two security claims**
+Expected: 24 runs, 0 failures, 0 errors.
 
-These two tests are the reason this class exists. Prove each one can fail.
+- [ ] **Step 9: Prove the guards are load-bearing**
 
-1. Change `"env_keys" => (env || {}).keys.map(&:to_s).sort` to include values
-   (`env.to_a.flatten`). Run the file. `test_no_environment_variable_value_reaches_the_file`
-   must still pass (the digest is one-way) but `test_a_digest_is_stable_across_calls`
-   MUST fail. Revert.
-2. Delete the `File.chmod(0o600, @path)` line. `test_the_file_is_created_private_to_the_owner`
-   MUST fail. Revert.
+Each mutation must REMOVE protection, not reword it. Apply one, confirm the
+named test goes red, then REVERT it. A mutation that leaves an unconditional
+`raise` in place proves nothing.
 
-Paste both failure outputs into your report. If either passes, the test is not testing what it claims.
+1. In `Executable#base_for`, delete the `return CURRENT_DIRECTORY if dir.empty?`
+   line so an empty component falls through to `dir`.
+   Expect `test_an_empty_path_component_resolves_to_the_current_directory` to
+   fail. The candidate becomes `/fakemcp`, which does not exist, so the search
+   falls through the rest of the PATH and the assertion sees
+   `unresolved:fakemcp`. Either way the guard is proven load-bearing.
+2. In `Trust#require_trust!`, change `return if trusted?(project_path)` to
+   `return`. Expect `test_approving_a_server_for_an_untrusted_path_raises` to
+   fail because no error is raised.
+3. In `Store#create_private`, delete the `File.chmod` line. Expect
+   `test_a_world_readable_file_is_tightened_on_write` to fail with 0644.
+4. In `Digest#canonical`, drop the `"env_keys"` pair entirely. Expect
+   `test_a_digest_changes_when_a_forwarded_variable_is_renamed` to fail.
 
-- [ ] **Step 6: Run the full gate and commit**
+- [ ] **Step 10: Run the full gate and commit**
 
 ```bash
 PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec rubocop
 PATH="/Users/matt/.local/share/mise/shims:$PATH" bundle exec rake test
-git add lib/riggs/trust.rb lib/riggs.rb test/test_trust.rb
+git add lib/riggs/trust.rb lib/riggs/trust/ lib/riggs.rb test/test_trust.rb
 git commit -m "Add Riggs::Trust registry for project trust and MCP approval"
 ```
-
----
 
 ### Task 2: `Riggs::Config::Resolver` — tier paths and the trust gate
 
