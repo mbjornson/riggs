@@ -319,7 +319,9 @@ module Riggs
       require_permission! %w[run_workflow]
       workflow = load_workflow(name)
       identity = current_identity
-      cfg = load_config
+      trust = Trust.default
+      resolved = Identity.resolved(trust: trust)
+      cfg = resolved.config
 
       print_header("Running Workflow: #{workflow[:display_name] || name}")
       puts "👤 User: #{identity[:id]} (#{identity[:role]})"
@@ -338,7 +340,13 @@ module Riggs
 
       skill_registry = SkillRegistry.new
       mcp_manager = begin
-        MCP::Manager.from_config(cfg[:mcp_servers])
+        MCP::Manager.from_config(
+          cfg[:mcp_servers],
+          provenance: resolved.provenance[:mcp_servers],
+          trust: trust,
+          project_path: resolved.project_path,
+          interactive: $stdin.tty?
+        )
       rescue StandardError => e
         warn "⚠️  MCP disabled for this run — mcp_servers config error: #{e.message}"
         nil
@@ -366,7 +374,9 @@ module Riggs
     desc "workflow:resume SESSION_ID", "Resume a workflow session paused at a HITL gate."
     def workflow_resume(session_id)
       require_permission! %w[run_workflow]
-      cfg = load_config
+      trust = Trust.default
+      resolved = Identity.resolved(trust: trust)
+      cfg = resolved.config
       db_path = cfg[:sqlite_path] || "./db/riggs.sqlite3"
 
       storage = Storage.new(db_path: db_path)
@@ -383,7 +393,13 @@ module Riggs
       puts "🔁 Session: #{session_id} (status=#{session['status']})"
 
       mcp_manager = begin
-        MCP::Manager.from_config(cfg[:mcp_servers])
+        MCP::Manager.from_config(
+          cfg[:mcp_servers],
+          provenance: resolved.provenance[:mcp_servers],
+          trust: trust,
+          project_path: resolved.project_path,
+          interactive: $stdin.tty?
+        )
       rescue StandardError => e
         warn "⚠️  MCP disabled for this run — mcp_servers config error: #{e.message}"
         nil
@@ -515,8 +531,16 @@ module Riggs
     desc "mcp:list", "List configured MCP servers and their tools."
     def mcp_list
       require_permission! %w[manage_mcp run_workflow]
-      cfg = load_config
-      mgr = MCP::Manager.from_config(cfg[:mcp_servers])
+      trust = Trust.default
+      resolved = Identity.resolved(trust: trust)
+      cfg = resolved.config
+      mgr = MCP::Manager.from_config(
+        cfg[:mcp_servers],
+        provenance: resolved.provenance[:mcp_servers],
+        trust: trust,
+        project_path: resolved.project_path,
+        interactive: false
+      )
       if mgr.server_names.empty?
         puts "No mcp_servers configured in .agent_hubrc"
         return
@@ -534,8 +558,16 @@ module Riggs
     desc "mcp:ping [SERVER]", "Ping MCP server(s) and report tool counts."
     def mcp_ping(server = nil)
       require_permission! %w[manage_mcp run_workflow]
-      cfg = load_config
-      mgr = MCP::Manager.from_config(cfg[:mcp_servers])
+      trust = Trust.default
+      resolved = Identity.resolved(trust: trust)
+      cfg = resolved.config
+      mgr = MCP::Manager.from_config(
+        cfg[:mcp_servers],
+        provenance: resolved.provenance[:mcp_servers],
+        trust: trust,
+        project_path: resolved.project_path,
+        interactive: false
+      )
       abort "No mcp_servers configured" if mgr.server_names.empty?
 
       print_header("MCP Ping")

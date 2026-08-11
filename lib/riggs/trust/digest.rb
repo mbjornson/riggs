@@ -55,7 +55,10 @@ module Riggs
       # Sorted, so the order variables happen to be declared in does not change
       # a server's identity.
       def env_keys
-        @env.keys.map(&:to_s).sort
+        # Client starts with unsetenv_others, so PATH is always explicitly
+        # forwarded for a shebang using /usr/bin/env. Include that same name in
+        # the digest: an approval must bind every environment name the child gets.
+        (["PATH"] + @env.keys.map(&:to_s)).uniq.sort
       end
     end
   end

@@ -51,8 +51,11 @@ class TestMCPManager < Minitest::Test
       write_fake_server(b, "beta")
 
       mgr = Riggs::MCP::Manager.from_config(
-        "srv_a" => { command: RbConfig.ruby, args: [a] },
-        "srv_b" => { command: RbConfig.ruby, args: [b] }
+        {
+          "srv_a" => { command: RbConfig.ruby, args: [a] },
+          "srv_b" => { command: RbConfig.ruby, args: [b] }
+        },
+        provenance: { srv_a: :global, srv_b: :global }
       )
 
       tools = mgr.list_tools
@@ -68,7 +71,7 @@ class TestMCPManager < Minitest::Test
 
   def test_ping_reports_dead_server_as_not_ok
     mgr = Riggs::MCP::Manager.from_config(
-      "dead" => { command: "riggs-nonexistent-binary-xyz", args: [] }
+      { "dead" => { command: "riggs-nonexistent-binary-xyz", args: [] } }, provenance: { dead: :global }
     )
     result = mgr.ping("dead").first
     refute result[:ok], "ping must report an unreachable server as not ok"

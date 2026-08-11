@@ -220,7 +220,9 @@ class TestConfigResolver < Minitest::Test
       # breaks this test loudly and has to come back and read the paragraph
       # above.
       servers = result.project[:mcp_servers] || {}
-      Riggs::MCP::Manager.from_config(servers).list_tools
+      Riggs::MCP::Manager.from_config(
+        servers, provenance: servers.keys.to_h { |key| [key, :global] }
+      ).list_tools
       refute File.exist?(marker), "an untrusted project's MCP command must never run"
     end
   end

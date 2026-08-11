@@ -20,19 +20,11 @@ module Riggs
         @initialized = false
       end
 
-      def self.from_config(servers)
-        return nil if servers.nil? || servers.empty?
-
-        _name, cfg = servers.first
-        cfg = Identity.deep_symbolize(cfg)
-        new(command: cfg[:command], args: cfg[:args] || [], env: cfg[:env] || {})
-      end
-
       def start!
         return self if @wait_thr&.alive?
 
         @initialized = false
-        @stdin, @stdout, @wait_thr = Open3.popen2(@env.transform_keys(&:to_s), @command, *@args)
+        @stdin, @stdout, @wait_thr = Open3.popen2(spawn_environment, @command, *@args, unsetenv_others: true)
         initialize_session!
         self
       end
@@ -63,6 +55,24 @@ module Riggs
       end
 
       private
+
+      def spawn_environment
+        declared_environment.merge("PATH" => path)
+      end
+
+      def declared_environment
+        @env.transform_keys(&:to_s)
+      end
+
+      # PATH is forwarded even for an absolute command because an MCP server
+      # may use a #!/usr/bin/env shebang or spawn a documented helper. No other
+      # Riggs environment variable is needed by the child; every other entry is
+      # named explicitly by the server declaration and is bound into its digest.
+      def path
+        return declared_environment["PATH"] if declared_environment.key?("PATH")
+
+        ENV.fetch("PATH", "/bin:/usr/bin")
+      end
 
       def initialize_session!
         return if @initialized
