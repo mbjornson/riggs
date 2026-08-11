@@ -15,6 +15,7 @@ require_relative "../mcp/manager"
 require_relative "../providers/router"
 require_relative "../triggers"
 require_relative "setup"
+require_relative "trust_commands"
 
 module Riggs
   class CLI < Thor
@@ -38,7 +39,11 @@ module Riggs
     map "skills:show" => :skills_show
     map "providers:ping" => :providers_ping
     map "mcp:list" => :mcp_list
+    map "mcp:approve" => :mcp_approve
     map "mcp:ping" => :mcp_ping
+    map "trust:grant" => :trust
+    map "trust:list" => :trust_list
+    map "trust:forget" => :trust_forget
     map "triggers:match" => :triggers_match
     map "triggers:list" => :triggers_list
 
@@ -49,6 +54,25 @@ module Riggs
       # deriving it separately here wrote a tier that nothing would read
       # whenever RIGGS_HOME was set.
       Setup.new(riggs_home: Trust.home, cwd: Dir.pwd).call
+    end
+
+    desc "trust", "Grant trust for the current project path."
+    def trust
+      require_permission! %w[run_workflow manage_mcp]
+      trust_commands.grant!(current_resolved.project_path)
+    end
+
+    desc "trust:list", "List trusted project paths and mark missing directories."
+    def trust_list
+      require_permission! %w[run_workflow manage_mcp]
+      print_header("Trusted Projects")
+      trust_commands.list
+    end
+
+    desc "trust:forget PATH", "Forget a trusted project path."
+    def trust_forget(path)
+      require_permission! %w[run_workflow manage_mcp]
+      trust_commands.forget!(path)
     end
 
     desc "identity:show", "Show current user, role, GitHub handle, and memory scope."
@@ -234,8 +258,8 @@ module Riggs
       require_permission! %w[run_workflow]
       workflow = load_workflow(name)
       identity = current_identity
-      trust = Trust.default
-      resolved = Identity.resolved(trust: trust)
+      trust = current_trust
+      resolved = current_resolved
       cfg = resolved.config
 
       print_header("Running Workflow: #{workflow[:display_name] || name}")
@@ -289,8 +313,8 @@ module Riggs
     desc "workflow:resume SESSION_ID", "Resume a workflow session paused at a HITL gate."
     def workflow_resume(session_id)
       require_permission! %w[run_workflow]
-      trust = Trust.default
-      resolved = Identity.resolved(trust: trust)
+      trust = current_trust
+      resolved = current_resolved
       cfg = resolved.config
       db_path = cfg[:sqlite_path] || "./db/riggs.sqlite3"
 
@@ -446,8 +470,8 @@ module Riggs
     desc "mcp:list", "List configured MCP servers and their tools."
     def mcp_list
       require_permission! %w[manage_mcp run_workflow]
-      trust = Trust.default
-      resolved = Identity.resolved(trust: trust)
+      trust = current_trust
+      resolved = current_resolved
       cfg = resolved.config
       mgr = MCP::Manager.from_config(
         cfg[:mcp_servers],
@@ -470,11 +494,19 @@ module Riggs
       mgr.close
     end
 
+    desc "mcp:approve NAME", "Approve a project-declared MCP server command."
+    def mcp_approve(name)
+      require_permission! %w[manage_mcp run_workflow]
+      mcp_approval.approve!(name)
+    rescue Error => e
+      abort "❌ #{e.message}"
+    end
+
     desc "mcp:ping [SERVER]", "Ping MCP server(s) and report tool counts."
     def mcp_ping(server = nil)
       require_permission! %w[manage_mcp run_workflow]
-      trust = Trust.default
-      resolved = Identity.resolved(trust: trust)
+      trust = current_trust
+      resolved = current_resolved
       cfg = resolved.config
       mgr = MCP::Manager.from_config(
         cfg[:mcp_servers],
@@ -543,8 +575,66 @@ module Riggs
         Identity.load_config
       end
 
+      def trust_commands
+        @trust_commands ||= TrustCommands.new(trust: current_trust, io: $stdout)
+      end
+
+      def mcp_approval
+        @mcp_approval ||= MCPApproval.new(trust: current_trust, resolved: current_resolved, io: $stdout)
+      end
+
+      def current_trust
+        @current_trust ||= Trust.default
+      end
+
+      def current_resolved
+        @current_resolved ||= Identity.resolved(trust: current_trust)
+      end
+
       def current_identity
-        @current_identity ||= Identity.resolve(cli_user: options[:user])
+        return @current_identity if @current_identity
+
+        @current_identity = Identity.resolve(cli_user: options[:user], config: current_resolved.config)
+        puts "▸ running as #{@current_identity[:id]} (#{@current_identity[:role]}) " \
+             "— from #{identity_source_path(@current_identity)}"
+        @current_identity
+      end
+
+      def identity_source_path(identity)
+        return project_source_path if identity_source_tier(identity) == :project
+
+        Config::Resolver.global_config
+      end
+
+      def project_source_path
+        current_resolved.project_config_path || Config::Resolver.global_config
+      end
+
+      # The user map is the direct provenance for who is running. default_user
+      # only selects which key is used when no explicit user was passed.
+      def identity_source_tier(identity)
+        found = user_source_tier(identity)
+        return found unless found.nil?
+
+        current_resolved.provenance[:default_user]
+      end
+
+      def user_source_tier(identity)
+        users = current_resolved.provenance[:users] || {}
+        by_id = lookup_tier(users, identity[:id])
+        return by_id unless by_id.nil?
+
+        lookup_tier(users, selected_user_key)
+      end
+
+      def selected_user_key
+        options[:user] || current_resolved.config[:default_user]
+      end
+
+      def lookup_tier(tiers, key)
+        return nil if key.nil?
+
+        tiers[key.to_sym] || tiers[key.to_s]
       end
 
       # Pass an array to require ANY of the listed permissions; use require_all_permissions! for ALL.
