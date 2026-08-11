@@ -1,8 +1,16 @@
 <h1>Configuration</h1>
-<p class="lead">Safe merge into <code>.agent_hubrc</code> (backup on write; secrets masked).</p>
+<p class="lead">Safe merge into one tier (validated, then backed up on write; secrets masked).</p>
 
 <div class="panel">
-  <p class="muted" style="margin:0">Path: <code><%= h(@store.path) %></code></p>
+  <p class="muted" style="margin:0">
+    Tier: <code><%= h(view['_tier'].to_s) %></code> &mdash; Path: <code><%= h(view['_path'].to_s) %></code>
+  </p>
+  <% if view['_tier'].to_s == 'project' %>
+    <p class="muted" style="margin:.4em 0 0">
+      This repository&rsquo;s tier. It may set default_user, roles, users, providers and mcp_servers;
+      anything else belongs in the global tier and is refused here.
+    </p>
+  <% end %>
 </div>
 
 <h2>Users &amp; roles</h2>
@@ -99,7 +107,7 @@
 <h2>Raw YAML (advanced)</h2>
 <form method="post" action="<%= h(url('/config')) %>" class="panel">
   <input type="hidden" name="section" value="yaml">
-  <textarea name="yaml"><%= h(Psych.dump(view)) %></textarea>
+  <textarea name="yaml"><%= h(Psych.dump(@store.public_document)) %></textarea>
   <p class="muted">Full replace with backup. Prefer section forms above.</p>
   <p><button type="submit" class="danger">Write YAML</button></p>
 </form>

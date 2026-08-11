@@ -23,7 +23,7 @@ class TestConfigStore < Minitest::Test
             api_key: "sk-secret-value"
       YAML
 
-      view = Riggs::ConfigStore.new.public_view
+      view = default_store.public_view
       assert_equal "••••••••", view.dig("providers", "claude", "api_key")
       assert_equal "anthropic", view.dig("providers", "claude", "type")
     end
@@ -31,7 +31,7 @@ class TestConfigStore < Minitest::Test
 
   def test_merge_writes_backup_and_preserves_unrelated_keys
     with_tmp_project do
-      store = Riggs::ConfigStore.new
+      store = default_store
       before = store.read
       store.merge!("providers" => { "mock" => { "type" => "mock" }, "extra" => { "type" => "ollama" } })
 
@@ -41,5 +41,147 @@ class TestConfigStore < Minitest::Test
       backups = Dir.glob("#{store.path}.bak.*")
       assert backups.any?, "expected backup file"
     end
+  end
+
+  def test_default_reads_the_global_tier_when_the_project_declares_no_config
+    with_tmp_project do
+      store = default_store
+
+      assert_equal :global, store.tier
+      assert_equal Riggs::Config::Resolver.global_config, store.path
+    end
+  end
+
+  def test_default_reads_the_trusted_project_tier_when_one_exists
+    with_tmp_project do |dir|
+      write_project_config("users" => { "eng_bob" => { "role" => "engineer" } })
+
+      store = default_store
+
+      assert_equal :project, store.tier
+      assert_equal File.join(Riggs::Config::Resolver.project_path(dir), ".riggs", "config.yml"), store.path
+    end
+  end
+
+  # Identity.config_path returns nil for an untrusted project, but a caller can
+  # still name the file explicitly -- web/app.rb hands ConfigStore a path, and
+  # ConfigStore#read reaches Identity.load_file!, which never consults trust.
+  # The refusal has to live here too or the gate has a second door.
+  def test_a_store_pointed_at_an_untrusted_project_config_refuses_to_read_it
+    with_tmp_project do |dir|
+      path = untrusted_project_config(dir, "users" => { "mallory" => { "role" => "engineer" } })
+
+      error = assert_raises(Riggs::Error) do
+        Riggs::ConfigStore.new(path: path, tier: :project, trust: Riggs::Trust.default).read
+      end
+
+      assert_match(/not trusted/i, error.message)
+      assert_match(/riggs trust/i, error.message)
+    end
+  end
+
+  # A stated tier is checked, not believed. Labelling a project path :global is
+  # how a caller would otherwise route untrusted content around every
+  # project-tier guard below.
+  def test_a_project_path_cannot_be_written_under_the_global_label
+    with_tmp_project do |dir|
+      path = untrusted_project_config(dir, "users" => {})
+
+      assert_raises(Riggs::Error) do
+        Riggs::ConfigStore.new(path: path, tier: :global, trust: Riggs::Trust.default)
+      end
+    end
+  end
+
+  def test_public_view_reports_the_tier_and_path_it_read
+    with_tmp_project do
+      view = default_store.public_view
+
+      assert_equal "global", view["_tier"]
+      assert_equal Riggs::Config::Resolver.global_config, view["_path"]
+    end
+  end
+
+  # The write path is reachable over HTTP from POST /config, so a rejected key
+  # must be rejected BEFORE backup! and File.write. Asserting the raise alone
+  # would pass against an implementation that writes first and raises after.
+  def test_a_forbidden_project_key_is_rejected_before_the_file_is_touched
+    with_tmp_project do
+      path = write_project_config("users" => { "eng_bob" => { "role" => "engineer" } })
+      before = File.binread(path)
+
+      assert_raises(Riggs::Error) { default_store.merge!("sqlite_path" => "/tmp/evil.db") }
+
+      assert_equal before, File.binread(path), "the project config must be byte-identical after a refusal"
+      assert_empty Dir.glob("#{path}.bak.*"), "a refused write must not leave a backup behind"
+    end
+  end
+
+  def test_a_provider_credential_is_rejected_before_the_file_is_touched
+    with_tmp_project do
+      path = write_project_config("providers" => { "mock" => { "model" => "m" } })
+      before = File.binread(path)
+
+      assert_raises(Riggs::Error) do
+        default_store.merge!("providers" => { "mock" => { "api_key" => "sk-leak" } })
+      end
+
+      assert_equal before, File.binread(path)
+      assert_empty Dir.glob("#{path}.bak.*")
+    end
+  end
+
+  # The guarantee, not the mechanism: before this validation the write
+  # succeeded and every later command in the repository raised on the file the
+  # web UI had just written -- a self-inflicted outage reachable from a form.
+  def test_a_refused_write_leaves_the_repository_usable
+    with_tmp_project do |dir|
+      write_project_config("users" => { "eng_bob" => { "role" => "engineer" } })
+
+      assert_raises(Riggs::Error) { default_store.merge!("sqlite_memory" => { "vector_path" => "/tmp/x.so" }) }
+
+      resolved = Riggs::Identity.resolved(cwd: dir, trust: Riggs::Trust.default)
+      assert_equal "eng_bob", resolved.config[:default_user].to_s
+    end
+  end
+
+  # public_view is what GET /api/config returns and what the raw-YAML textarea
+  # renders, so its metadata travels back in on the next write. Persisting it
+  # would put an unmergeable key in the project tier -- the very failure the
+  # validation above exists to prevent, introduced by the label.
+  def test_view_metadata_is_never_written_back_to_disk
+    with_tmp_project do
+      store = default_store
+      store.write!(store.public_view)
+
+      written = Psych.safe_load(File.read(store.path), aliases: true)
+      refute written.key?("_tier"), "_tier is a view label, not configuration"
+      refute written.key?("_path"), "_path is a view label, not configuration"
+    end
+  end
+
+  private
+
+  def default_store
+    Riggs::ConfigStore.default(cwd: Dir.pwd, trust: Riggs::Trust.default)
+  end
+
+  def write_project_config(values)
+    FileUtils.mkdir_p(".riggs")
+    File.write(File.join(".riggs", "config.yml"), Psych.dump(values))
+    File.expand_path(File.join(".riggs", "config.yml"))
+  end
+
+  # A nested directory carrying its own .riggs/config.yml resolves to itself as
+  # a project (ProjectPaths#marked_ancestor), and with_tmp_project granted
+  # trust only to the outer directory -- so this path is a real untrusted
+  # project rather than a directory that merely lacks a grant.
+  def untrusted_project_config(dir, values)
+    nested = File.join(dir, "vendor", "cloned")
+    FileUtils.mkdir_p(File.join(nested, ".riggs"))
+    path = File.join(nested, ".riggs", "config.yml")
+    File.write(path, Psych.dump(values))
+    Riggs::Config::Resolver.reset_cache!
+    path
   end
 end

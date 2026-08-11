@@ -95,7 +95,7 @@ module Riggs
         begin
           @config = Identity.load_config
           @identity = Auth.resolve(req, config: @config)
-          @store = ConfigStore.new(path: Identity.config_path)
+          @store = ConfigStore.default(cwd: Dir.pwd, trust: Trust.default)
           dispatch(req) || respond_error(req, 404, "Not found")
         rescue Forbidden => e
           respond_error(req, 403, e.message)

@@ -89,7 +89,7 @@ module Riggs
     desc "config:show", "Show .agent_hubrc with secrets masked."
     def config_show
       require_permission! %w[read_workflow edit_workflow configure_memory]
-      store = ConfigStore.new
+      store = ConfigStore.default(cwd: Dir.pwd, trust: Trust.default)
       print_header("Config (#{store.path})")
       puts Psych.dump(store.public_view)
     end
