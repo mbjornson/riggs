@@ -131,7 +131,7 @@ module Riggs
 
         if m == "GET" && p == "/workflows"
           Auth.require!(@identity, "read_workflow")
-          return html(:workflows, title: "Playbooks", workflows: Triggers.list_declared.map { |workflow| workflow[:name] })
+          return html(:workflows, title: "Playbooks", workflows: Triggers.list_declared)
         end
         if m == "GET" && (wm = p.match(%r{\A/workflows/([^/]+)\z}))
           return show_workflow(wm[1])

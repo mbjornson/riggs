@@ -11,6 +11,30 @@ class TestWebApp < Minitest::Test
     Riggs::Web::App
   end
 
+  # The page mapped list_declared down to bare names, discarding the tier each
+  # entry carries, so a global workflow and a project one rendered
+  # identically -- the operator could not tell which file a name came from,
+  # which is the whole reason the tier is on the entry. No test covered this
+  # route at all, so the contract change went unnoticed.
+  def test_workflows_page_labels_the_tier_each_playbook_came_from
+    with_tmp_project do
+      global = File.join(Riggs::Trust.home, "workflows")
+      FileUtils.mkdir_p(global)
+      File.write(File.join(global, "deploy.yml"), Psych.dump(
+                                                    "name" => "deploy", "display_name" => "Deploy",
+                                                    "triggers" => [{ "type" => "manual" }],
+                                                    "steps" => [{ "id" => "a", "kind" => "prompt", "prompt" => "hi" }]
+                                                  ))
+      header "X-Riggs-User", "eng_bob"
+
+      get "/workflows"
+
+      assert_equal 200, last_response.status
+      assert_match(%r{deploy</a></td>\s*<td><code>global</code>}, last_response.body)
+      assert_match(%r{example_triage</a></td>\s*<td><code>project</code>}, last_response.body)
+    end
+  end
+
   def test_health_and_config_get
     with_tmp_project do
       header "X-Riggs-User", "eng_bob"

@@ -135,7 +135,7 @@ module Riggs
       rows = Triggers.list_declared
       print_header("Playbook Triggers")
       if rows.empty?
-        puts "No playbooks found in config/riggs/workflows/."
+        puts "No playbooks found. Searched: #{Triggers.default_roots.join(', ')}"
         return
       end
       rows.each do |row|
