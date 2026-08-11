@@ -14,6 +14,7 @@ require_relative "../mcp/client"
 require_relative "../mcp/manager"
 require_relative "../providers/router"
 require_relative "../triggers"
+require_relative "setup"
 
 module Riggs
   class CLI < Thor
@@ -41,99 +42,13 @@ module Riggs
     map "triggers:match" => :triggers_match
     map "triggers:list" => :triggers_list
 
-    desc "setup", "Create .agent_hubrc, db/, config/riggs/workflows/, and SQLite database."
+    desc "setup", "Create Riggs global and project configuration tiers."
     def setup
-      require "sqlite3"
-
-      puts "🔧 Starting Riggs setup…"
-      base_dir = Dir.pwd
-      db_dir = File.expand_path("db", base_dir)
-      workflows_dir = File.expand_path("config/riggs/workflows", base_dir)
-      skills_dir = File.expand_path("config/riggs/skills", base_dir)
-
-      [db_dir, workflows_dir, skills_dir].each { |d| FileUtils.mkdir_p(d) }
-      puts "✅ Created dirs: #{db_dir}, #{workflows_dir}, #{skills_dir}"
-
-      hub_cfg = {
-        "default_user" => "pm_alice",
-        "users" => {
-          "pm_alice" => {
-            "id" => "pm_alice",
-            "name" => "Alice PM",
-            "role" => "pm",
-            "github_username" => "@alicepm",
-            "memory_namespace" => "team_shared"
-          },
-          "eng_bob" => {
-            "id" => "eng_bob",
-            "name" => "Bob Eng",
-            "role" => "engineer",
-            "github_username" => "@bobbuilder",
-            "memory_namespace" => "eng_bob_private"
-          },
-          "view_cara" => {
-            "id" => "view_cara",
-            "name" => "Cara Viewer",
-            "role" => "viewer",
-            "memory_namespace" => "readonly"
-          }
-        },
-        "roles" => {
-          "pm" => %w[edit_workflow manage_skills configure_memory publish read_workflow inspect_run],
-          "engineer" => %w[run_workflow approve_gates read_workflow inspect_run manage_mcp],
-          "viewer" => %w[read_workflow inspect_run]
-        },
-        "sqlite_path" => File.join(db_dir, "riggs.sqlite3"),
-        "sqlite_memory" => {
-          "vector_path" => ENV.fetch("RIGGS_VECTOR_EXT", nil),
-          "memory_path" => ENV.fetch("RIGGS_MEMORY_EXT", nil),
-          "embed_model" => ENV.fetch("RIGGS_EMBED_MODEL", nil)
-        },
-        "providers" => {
-          "mock" => { "type" => "mock" },
-          "claude" => { "type" => "anthropic" },
-          "openai" => { "type" => "openai" },
-          "ollama" => { "type" => "ollama", "base_url" => "http://127.0.0.1:11434/v1", "model" => "llama3" },
-          "cursor" => { "type" => "cursor" },
-          "claude_cli" => { "type" => "claude_cli" },
-          "codex" => { "type" => "codex" },
-          "cursor_cloud" => {
-            "type" => "cursor_cloud",
-            "model" => "composer-2.5",
-            "repos" => [],
-            "poll_interval_seconds" => 5
-          }
-        },
-        "mcp_servers" => {}
-      }
-
-      config_file = File.expand_path(".agent_hubrc", base_dir)
-      if File.exist?(config_file)
-        puts "⏭️  Keeping existing #{config_file} (delete it and re-run setup to regenerate)"
-      else
-        File.write(config_file, Psych.dump(hub_cfg))
-        puts "✅ Created #{config_file}"
-      end
-
-      # Copy example playbook + skill into the project if missing
-      example_src = File.expand_path("../../../config/riggs/workflows/example_triage.yml", __dir__)
-      example_dst = File.join(workflows_dir, "example_triage.yml")
-      if File.exist?(example_src) && !File.exist?(example_dst)
-        FileUtils.cp(example_src, example_dst)
-        puts "✅ Installed example playbook → #{example_dst}"
-      end
-
-      skill_src = File.expand_path("../../../config/riggs/skills/triage_v1/SKILL.yml", __dir__)
-      skill_dst_dir = File.join(skills_dir, "triage_v1")
-      if File.exist?(skill_src)
-        FileUtils.mkdir_p(skill_dst_dir)
-        FileUtils.cp(skill_src, File.join(skill_dst_dir, "SKILL.yml")) unless File.exist?(File.join(skill_dst_dir, "SKILL.yml"))
-      end
-
-      db_path = File.join(db_dir, "riggs.sqlite3")
-      Storage.new(db_path: db_path).close
-      puts "✅ Database ready at #{db_path}"
-      puts "\n🎉 Riggs setup complete!"
+      # Trust.home, not Dir.home. It is the one place the global tier's
+      # location is decided, and every reader already goes through it, so
+      # deriving it separately here wrote a tier that nothing would read
+      # whenever RIGGS_HOME was set.
+      Setup.new(riggs_home: Trust.home, cwd: Dir.pwd).call
     end
 
     desc "identity:show", "Show current user, role, GitHub handle, and memory scope."

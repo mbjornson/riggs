@@ -12,9 +12,12 @@ class TestCLI < Minitest::Test
             id: custom_marker_user
             role: pm
       YAML
-      capture_io { Riggs::CLI.start(["setup"]) }
+      home = File.dirname(ENV.fetch("RIGGS_HOME"))
+      capture_io { Riggs::CLI::Setup.new(riggs_home: File.join(home, ".riggs"), cwd: Dir.pwd).call }
       assert_includes File.read(".agent_hubrc"), "custom_marker_user",
                       "setup must not overwrite an existing .agent_hubrc"
+      assert File.exist?(File.join(home, ".riggs", "config.yml")),
+             "setup must leave the existing global tier available"
     end
   end
 
