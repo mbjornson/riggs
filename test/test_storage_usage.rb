@@ -10,7 +10,7 @@ class TestStorageUsage < Minitest::Test
     @dir = Dir.mktmpdir("riggs-storage-usage")
     @storage = Riggs::Storage.new(db_path: File.join(@dir, "db", "riggs.sqlite3"))
     @session_id = @storage.create_session(
-      workflow_name: "example_triage", user_id: "eng_bob", memory_namespace: "ns"
+      workflow_name: "example_triage", identity: { id: "eng_bob", memory_namespace: "ns" }
     )
   end
 

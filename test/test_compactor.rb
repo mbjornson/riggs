@@ -284,7 +284,7 @@ class TestCompactor < Minitest::Test
     Dir.mktmpdir("riggs-compactor-audit") do |dir|
       db_path = File.join(dir, "db", "riggs.sqlite3")
       storage = Riggs::Storage.new(db_path: db_path)
-      session_id = storage.create_session(workflow_name: "wf", user_id: "u", memory_namespace: "ns")
+      session_id = storage.create_session(workflow_name: "wf", identity: { id: "u", memory_namespace: "ns" })
 
       router = Riggs::Providers::Router.new(
         hub_providers: { mock: { type: "mock" } },

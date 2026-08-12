@@ -234,7 +234,7 @@ class TestGraphEngine < Minitest::Test
     storage = engine.instance_variable_get(:@storage)
     engine.instance_variable_set(
       :@session_id,
-      storage.create_session(workflow_name: "budget_test", user_id: "test_user", memory_namespace: "test")
+      storage.create_session(workflow_name: "budget_test", identity: { id: "test_user", memory_namespace: "test" })
     )
     engine
   end

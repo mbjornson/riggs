@@ -24,6 +24,10 @@ module Riggs
       FROM riggs_provider_calls
     SQL
 
+    # Columns riggs_sessions gained after the table shipped. A database in the
+    # field predates each of them independently, so every entry is checked.
+    SESSION_COLUMNS = { "resume_state" => "TEXT", "project_path" => "TEXT" }.freeze
+
     def initialize(db_path:)
       @db_path = db_path
       FileUtils.mkdir_p(File.dirname(db_path))
@@ -36,9 +40,15 @@ module Riggs
 
     # CREATE TABLE IF NOT EXISTS never alters a table that already exists, so
     # columns added after a database is in the field need an explicit backfill.
+    # Declared rather than hardcoded per column: the one-ALTER version stopped
+    # at the first absent name, so a database missing two columns got one.
     def ensure_columns!
       cols = @db.execute("PRAGMA table_info(riggs_sessions)").map { |r| r["name"] }
-      @db.execute("ALTER TABLE riggs_sessions ADD COLUMN resume_state TEXT") unless cols.include?("resume_state")
+      SESSION_COLUMNS.each { |name, type| add_session_column(name, type) unless cols.include?(name) }
+    end
+
+    def add_session_column(name, type)
+      @db.execute("ALTER TABLE riggs_sessions ADD COLUMN #{name} #{type}")
     end
 
     def ensure_schema!
@@ -66,12 +76,17 @@ module Riggs
       end
     end
 
-    def create_session(workflow_name:, user_id:, memory_namespace:, config_snapshot: {})
+    # Takes the identity rather than its three fields unpacked. They describe
+    # one thing -- who ran this and where -- always travel together, and the
+    # caller already holds them as one object. Unpacking them here would also
+    # put this method at five parameters.
+    def create_session(workflow_name:, identity:, config_snapshot: {})
       id = SecureRandom.uuid
       @db.execute(
-        "INSERT INTO riggs_sessions (id, workflow_name, user_id, status, memory_namespace, config_snapshot) " \
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        [id, workflow_name, user_id, "running", memory_namespace, JSON.generate(config_snapshot)]
+        "INSERT INTO riggs_sessions (id, workflow_name, user_id, status, memory_namespace, project_path, " \
+        "config_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [id, workflow_name, identity[:id], "running", identity[:memory_namespace],
+         identity[:project_path], JSON.generate(config_snapshot)]
       )
       id
     end
@@ -300,6 +315,7 @@ module Riggs
             started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             ended_at DATETIME,
             memory_namespace TEXT,
+            project_path TEXT,
             config_snapshot TEXT
           );
           CREATE TABLE IF NOT EXISTS riggs_steps (

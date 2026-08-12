@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS riggs_sessions (
   started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   ended_at DATETIME,
   memory_namespace TEXT,
+  project_path TEXT,
   config_snapshot TEXT
 );
 

@@ -594,7 +594,10 @@ module Riggs
       def current_identity
         return @current_identity if @current_identity
 
-        @current_identity = Identity.resolve(cli_user: options[:user], config: current_resolved.config)
+        @current_identity = Identity.resolve(
+          cli_user: options[:user], config: current_resolved.config,
+          project_path: current_resolved.project_path
+        )
         puts "▸ running as #{@current_identity[:id]} (#{@current_identity[:role]}) " \
              "— from #{identity_source_path(@current_identity)}"
         @current_identity

@@ -72,7 +72,11 @@ module Riggs
       deep_symbolize(raw)
     end
 
-    def self.resolve(cli_user: nil, config: nil)
+    # project_path is carried on the identity so the session column and the
+    # memory namespace read ONE resolution. Callers that already resolved it --
+    # the CLI holds it on current_resolved -- pass it in rather than asking
+    # again; the default is the same pure function, keyed by the same cwd.
+    def self.resolve(cli_user: nil, config: nil, project_path: nil)
       cfg = config || load_config
       raw = cli_user || cfg[:default_user]
       raise Error, "No user specified and no default_user in .agent_hubrc" if raw.nil? || raw.to_s.empty?
@@ -92,6 +96,7 @@ module Riggs
         role: role,
         github_username: user_cfg[:github_username] || user_cfg["github_username"],
         memory_namespace: (user_cfg[:memory_namespace] || user_cfg["memory_namespace"] || user_key).to_s,
+        project_path: project_path || Config::Resolver.project_path,
         permissions: permissions.map(&:to_s)
       }
     end

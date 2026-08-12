@@ -96,7 +96,7 @@ class TestWorkflowAccess < Minitest::Test
     with_tmp_project do
       storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
       session_id = storage.create_session(
-        workflow_name: "example_triage", user_id: "eng_bob", memory_namespace: "ns"
+        workflow_name: "example_triage", identity: { id: "eng_bob", memory_namespace: "ns" }
       )
       storage.close
 

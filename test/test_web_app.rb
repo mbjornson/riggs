@@ -102,8 +102,7 @@ class TestWebApp < Minitest::Test
       storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
       sid = storage.create_session(
         workflow_name: "example_triage",
-        user_id: "eng_bob",
-        memory_namespace: "eng_bob_private"
+        identity: { id: "eng_bob", memory_namespace: "eng_bob_private" }
       )
       storage.update_session(sid, status: "awaiting_approval")
       storage.close
@@ -185,8 +184,7 @@ class TestWebApp < Minitest::Test
     storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
     sid = storage.create_session(
       workflow_name: "example_triage",
-      user_id: "eng_bob",
-      memory_namespace: "eng_bob_private"
+      identity: { id: "eng_bob", memory_namespace: "eng_bob_private" }
     )
     events.times { |i| storage.audit(session_id: sid, event_type: "step_start", payload: { "n" => i }) }
     storage.update_session(sid, status: status)
@@ -566,7 +564,7 @@ class TestWebApp < Minitest::Test
 
   def create_session_with_usage
     storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
-    id = storage.create_session(workflow_name: "example_triage", user_id: "eng_bob", memory_namespace: "ns")
+    id = storage.create_session(workflow_name: "example_triage", identity: { id: "eng_bob", memory_namespace: "ns" })
     storage.record_provider_call(
       session_id: id, step_key: "triage", provider: "mock", model: "m", relay_attempt: 1,
       usage: { input_tokens: 10, output_tokens: 5, cache_read_tokens: nil,
