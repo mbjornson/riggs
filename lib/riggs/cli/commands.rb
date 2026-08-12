@@ -403,7 +403,9 @@ module Riggs
       storage.close
     end
 
-    desc "memory:recall QUERY", "Search long-term memory for current user."
+    desc "memory:recall QUERY", "Search long-term memory for current user in this project."
+    method_option :legacy, type: :boolean, default: false,
+                           desc: "Read the uncomposed namespace memories written before project scoping."
     def memory_recall(query)
       require_permission! %w[configure_memory run_workflow]
       identity = current_identity
@@ -412,10 +414,10 @@ module Riggs
 
       print_header("Memory Recall")
       puts "🔍 Query: #{query}"
-      puts "🧠 Scope: #{identity[:memory_namespace]}"
+      puts "🧠 Scope: #{recall_namespace(identity)}"
 
       memory = MemoryService.new(
-        namespace: identity[:memory_namespace],
+        namespace: recall_namespace(identity),
         db_path: db_path,
         config: cfg[:sqlite_memory] || {}
       )
@@ -691,6 +693,15 @@ module Riggs
         abort "⛔ Access denied. #{denial}" if denial
 
         workflow
+      end
+
+      # Memories written before R11.7 carry an uncomposed namespace and match no
+      # project. They are deliberately not migrated, so --legacy is the only
+      # thing standing between them and being stranded.
+      def recall_namespace(identity)
+        return identity[:legacy_memory_namespace] if options[:legacy]
+
+        identity[:memory_namespace]
       end
 
       def project_rows

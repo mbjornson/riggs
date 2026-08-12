@@ -3,6 +3,7 @@
 require "psych"
 require_relative "config/resolver"
 require_relative "config/merge"
+require_relative "memory/scope"
 
 module Riggs
   class Identity
@@ -89,14 +90,17 @@ module Riggs
       role = (user_cfg[:role] || user_cfg["role"]).to_s.to_sym
       roles = cfg[:roles] || {}
       permissions = Array(roles[role] || roles[role.to_s] || DEFAULT_ROLES[role] || [])
+      project = project_path || Config::Resolver.project_path
+      declared_namespace = (user_cfg[:memory_namespace] || user_cfg["memory_namespace"] || user_key).to_s
 
       {
         id: (user_cfg[:id] || user_cfg["id"] || user_key).to_s,
         name: (user_cfg[:name] || user_cfg["name"] || user_key).to_s,
         role: role,
         github_username: user_cfg[:github_username] || user_cfg["github_username"],
-        memory_namespace: (user_cfg[:memory_namespace] || user_cfg["memory_namespace"] || user_key).to_s,
-        project_path: project_path || Config::Resolver.project_path,
+        memory_namespace: MemoryScope.compose(namespace: declared_namespace, project_path: project),
+        legacy_memory_namespace: declared_namespace,
+        project_path: project,
         permissions: permissions.map(&:to_s)
       }
     end
