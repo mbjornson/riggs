@@ -537,14 +537,25 @@ module Riggs
         resume_session_run(id, workflow_name)
       end
 
+      # Approving a paused gate RESUMES the engine, so this executes the
+      # remaining steps -- it is an execution entry point, not a bookkeeping
+      # one, and the approve routes ask only for approve_gates. Without this
+      # check a role holding approve_gates alone ran workflows it was refused
+      # 403 for starting, one route over.
       def resume_session_run(id, workflow_name)
         path = Triggers.find_path(workflow_name)
         raise Error, "Workflow not found: #{workflow_name}" unless path
 
-        engine = Workflow::GraphEngine.resume(
+        workflow = Workflow::Loader.load(path: path)
+        require_workflow_access!(workflow, path)
+        resume_engine(id, workflow).status.to_s
+      end
+
+      def resume_engine(id, workflow)
+        Workflow::GraphEngine.resume(
           session_id: id,
           user_identity: @identity,
-          workflow: Workflow::Loader.load(path: path),
+          workflow: workflow,
           db_path: sqlite_path,
           hub_config: @config,
           # Later gates in the resumed run auto-approve, matching how the web
@@ -553,7 +564,6 @@ module Riggs
           skill_registry: SkillRegistry.new,
           io: StringIO.new
         )
-        engine.status.to_s
       end
 
       def trigger_matches(query)

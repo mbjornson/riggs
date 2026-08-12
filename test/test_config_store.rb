@@ -93,6 +93,45 @@ class TestConfigStore < Minitest::Test
     end
   end
 
+  # TierGuard compared raw strings, so `.`, `..` and symlink spellings of the
+  # global config were labelled :project -- and write! then truncated the
+  # operator's own file, api_key and all, to the project candidate. Trust is
+  # granted for each derived path first, so the refusal has to come from the
+  # tier check and cannot pass for the untrusted-path reason instead.
+  def test_a_respelled_global_config_cannot_be_written_as_the_project_tier
+    with_tmp_project do |dir|
+      global = Riggs::Config::Resolver.global_config
+      link = File.join(dir, "linked-home")
+      File.symlink(File.dirname(global), link)
+
+      { "dot-dot" => File.join(File.dirname(global), "..", ".riggs", "config.yml"),
+        "dot" => File.join(File.dirname(global), ".", "config.yml"),
+        "symlink" => File.join(link, "config.yml") }.each do |label, spelling|
+        before = File.binread(global)
+        Riggs::Trust.default.grant!(Riggs::Config::Resolver.project_path(File.dirname(spelling)))
+
+        error = assert_raises(Riggs::Error, "#{label} must be refused") do
+          Riggs::ConfigStore.new(path: spelling, tier: :project, trust: Riggs::Trust.default).write!({})
+        end
+
+        assert_match(/global tier, not the project tier/, error.message, label)
+        assert_equal before, File.binread(global), "#{label} must leave the global config untouched"
+      end
+    end
+  end
+
+  def test_the_global_tier_is_still_writable_under_a_respelled_path
+    with_tmp_project do
+      global = Riggs::Config::Resolver.global_config
+      spelling = File.join(File.dirname(global), ".", "config.yml")
+
+      store = Riggs::ConfigStore.new(path: spelling, tier: :global, trust: Riggs::Trust.default)
+
+      assert_equal :global, store.tier
+      assert store.read.key?(:users), "a respelled global path must still read the global tier"
+    end
+  end
+
   def test_public_view_reports_the_tier_and_path_it_read
     with_tmp_project do
       view = default_store.public_view

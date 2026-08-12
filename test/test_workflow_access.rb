@@ -2,6 +2,7 @@
 
 require "test_helper"
 require "rack/mock"
+require "stringio"
 
 class TestWorkflowAccess < Minitest::Test
   def test_run_workflow_still_runs_anything
@@ -107,6 +108,36 @@ class TestWorkflowAccess < Minitest::Test
     end
   end
 
+  # POST /api/sessions/:id/approve resumes the GraphEngine and runs the
+  # remaining steps, so it executes -- but it asked only for approve_gates and
+  # never consulted the rule. The same user, refused 403 when STARTING the
+  # workflow, ran it to completion by approving it instead. Found by review;
+  # my own enumeration of the execution entry points missed this one.
+  def test_approving_a_paused_session_cannot_execute_a_workflow_the_role_may_not_run
+    with_tmp_project do
+      add_global_role("gatekeeper", %w[approve_gates read_workflow inspect_run], user: "gate_gail")
+      session_id = paused_session
+      app = Rack::MockRequest.new(Riggs::Web::App)
+
+      refused = app.post("/api/sessions/#{session_id}/approve", "HTTP_X_RIGGS_USER" => "gate_gail")
+
+      assert_equal 403, refused.status
+      assert_equal 0, executed_steps(session_id), "no step may run for a role that cannot run this workflow"
+    end
+  end
+
+  def test_an_approver_who_may_run_the_workflow_still_resumes_it
+    with_tmp_project do
+      session_id = paused_session
+      app = Rack::MockRequest.new(Riggs::Web::App)
+
+      allowed = app.post("/api/sessions/#{session_id}/approve", "HTTP_X_RIGGS_USER" => "eng_bob")
+
+      assert_equal 200, allowed.status
+      assert_operator executed_steps(session_id), :>, 0, "a permitted approver must still resume the run"
+    end
+  end
+
   def test_the_web_run_route_asks_the_same_rule
     with_tmp_project do
       app = Rack::MockRequest.new(Riggs::Web::App)
@@ -122,6 +153,36 @@ class TestWorkflowAccess < Minitest::Test
   end
 
   private
+
+  def add_global_role(role, permissions, user:)
+    path = Riggs::Config::Resolver.global_config
+    config = Psych.safe_load(File.read(path), aliases: true)
+    config["roles"][role] = permissions
+    config["users"][user] = { "id" => user, "role" => role }
+    File.write(path, Psych.dump(config))
+    Riggs::Config::Resolver.reset_cache!
+  end
+
+  # example_triage pauses at the `debug` step's approval gate when the
+  # classification comes back ERROR, which is the state the approve endpoints
+  # exist to act on.
+  def paused_session
+    engine = Riggs::Workflow::GraphEngine.new(
+      workflow: Riggs::Workflow::Loader.load(path: "config/riggs/workflows/example_triage.yml"),
+      user_identity: Riggs::Identity.resolve(cli_user: "eng_bob"),
+      db_path: "./db/riggs.sqlite3", hub_config: Riggs::Identity.load_config,
+      gate_handler: ->(*) { :paused }, skill_registry: Riggs::SkillRegistry.new
+    )
+    engine.execute(StringIO.new, input: { ticket: "Production outage ERROR database down" })
+    engine.session_id
+  end
+
+  def executed_steps(session_id)
+    storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
+    count = storage.list_messages(session_id, step_key: "debug").size
+    storage.close
+    count
+  end
 
   def write_project_workflow(name, owner_role:)
     dir = Riggs::Triggers.project_workflows_dir

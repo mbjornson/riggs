@@ -125,10 +125,31 @@ module Riggs
         raise Error, "#{@path} is the #{actual} tier, not the #{@tier} tier"
       end
 
+      # Compared as FILES, not as strings. `.`, `..` and symlink spellings all
+      # name the global config while comparing unequal to it, and the raw
+      # string comparison labelled every one of them :project -- which write!
+      # then honoured, truncating the operator's own config, credentials and
+      # all, under project rules. It failed the other way too: a respelled
+      # global path stated as :global was refused as a project file.
       def actual
-        return :global if @path == Config::Resolver.global_config
+        return :global if canonical(@path) == canonical(Config::Resolver.global_config)
 
         :project
+      end
+
+      # realpath resolves symlinks but requires the file to exist, and a config
+      # that has not been created yet is ordinary here -- so a missing file
+      # falls back to resolving the directory it would live in.
+      def canonical(path)
+        return File.realpath(path) if File.exist?(path)
+
+        File.join(canonical_dir(File.dirname(path)), File.basename(path))
+      end
+
+      def canonical_dir(dir)
+        return File.realpath(dir) if File.exist?(dir)
+
+        File.expand_path(dir)
       end
 
       def reject_untrusted!
