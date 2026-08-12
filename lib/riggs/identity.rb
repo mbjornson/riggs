@@ -10,7 +10,10 @@ module Riggs
                           :trusted, :legacy, keyword_init: true)
 
     DEFAULT_ROLES = {
-      pm: %w[edit_workflow manage_skills configure_memory publish read_workflow inspect_run],
+      # run_owned_workflow, not run_workflow: a PM runs the workflows a PM
+      # owns -- PRD review, triage, roadmap -- and not delivery, security or
+      # infrastructure ones, which carry another role's owner_role.
+      pm: %w[edit_workflow manage_skills configure_memory publish read_workflow inspect_run run_owned_workflow],
       engineer: %w[run_workflow approve_gates read_workflow inspect_run manage_mcp],
       viewer: %w[read_workflow inspect_run]
     }.freeze

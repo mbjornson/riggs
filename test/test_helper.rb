@@ -57,7 +57,7 @@ module RiggsTestHelpers
           role: viewer
           memory_namespace: readonly
       roles:
-        pm: [edit_workflow, manage_skills, configure_memory, publish, read_workflow, inspect_run]
+        pm: [edit_workflow, manage_skills, configure_memory, publish, read_workflow, inspect_run, run_owned_workflow]
         engineer: [run_workflow, approve_gates, read_workflow, inspect_run, manage_mcp]
         viewer: [read_workflow, inspect_run]
       sqlite_path: "#{File.join(dir, 'db', 'riggs.sqlite3')}"
@@ -87,7 +87,7 @@ module RiggsTestHelpers
           role: viewer
           memory_namespace: readonly
       roles:
-        pm: [edit_workflow, manage_skills, configure_memory, publish, read_workflow, inspect_run]
+        pm: [edit_workflow, manage_skills, configure_memory, publish, read_workflow, inspect_run, run_owned_workflow]
         engineer: [run_workflow, approve_gates, read_workflow, inspect_run, manage_mcp]
         viewer: [read_workflow, inspect_run]
       sqlite_path: "./db/riggs.sqlite3"

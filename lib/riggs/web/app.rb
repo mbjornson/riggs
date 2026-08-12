@@ -284,7 +284,7 @@ module Riggs
       end
 
       def run_workflow_web(req, name)
-        Auth.require!(@identity, "run_workflow")
+        Auth.require!(@identity, "run_workflow", "run_owned_workflow")
         result = execute_workflow(name, input: form_input(req), auto_approve: truthy?(req.params["auto_approve"]))
         res = Rack::Response.new
         res.redirect(url("/sessions/#{result[:session_id]}"))
@@ -334,7 +334,7 @@ module Riggs
       end
 
       def api_run_workflow(req, name)
-        Auth.require!(@identity, "run_workflow")
+        Auth.require!(@identity, "run_workflow", "run_owned_workflow")
         body = parse_json_body(req)
         raw_input = body["input"] || body[:input] || {}
         input = raw_input.each_with_object({}) { |(k, v), h| h[k.to_sym] = v }
@@ -469,11 +469,20 @@ module Riggs
         json_ok(ok: true, decision: decision, status: status)
       end
 
+      # Both web run routes reach execution through execute_workflow, so the
+      # rule is applied there once rather than restated at each route.
+      def require_workflow_access!(workflow, path)
+        denial = WorkflowAccess.denial(identity: @identity, workflow: workflow,
+                                       tier: Triggers.tier_for(File.dirname(path)))
+        raise Forbidden, denial if denial
+      end
+
       def execute_workflow(name, input:, auto_approve:)
         path = Triggers.find_path(name)
         raise Error, "Workflow not found: #{name}" unless path
 
         workflow = Workflow::Loader.load(path: path)
+        require_workflow_access!(workflow, path)
         gate_handler = ->(_step, _io) { :approved }
 
         engine = Workflow::GraphEngine.new(

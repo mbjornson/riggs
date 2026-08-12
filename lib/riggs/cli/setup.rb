@@ -219,7 +219,8 @@ module Riggs
       end
 
       def roles
-        { "pm" => %w[edit_workflow manage_skills configure_memory publish read_workflow inspect_run],
+        { "pm" => %w[edit_workflow manage_skills configure_memory publish read_workflow inspect_run
+                     run_owned_workflow],
           "engineer" => engineer_permissions, "viewer" => %w[read_workflow inspect_run] }
       end
 

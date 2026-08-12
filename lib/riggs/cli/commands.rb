@@ -255,8 +255,8 @@ module Riggs
     method_option :ticket, type: :string, desc: "Shorthand for input ticket text"
     method_option :auto_approve, type: :boolean, default: false, desc: "Auto-approve HITL gates (CI)"
     def workflow_run(name)
-      require_permission! %w[run_workflow]
-      workflow = load_workflow(name)
+      require_permission! %w[run_workflow run_owned_workflow]
+      workflow = load_runnable_workflow(name)
       identity = current_identity
       trust = current_trust
       resolved = current_resolved
@@ -312,7 +312,7 @@ module Riggs
 
     desc "workflow:resume SESSION_ID", "Resume a workflow session paused at a HITL gate."
     def workflow_resume(session_id)
-      require_permission! %w[run_workflow]
+      require_permission! %w[run_workflow run_owned_workflow]
       trust = current_trust
       resolved = current_resolved
       cfg = resolved.config
@@ -323,7 +323,7 @@ module Riggs
       storage.close
       abort "❌ Session not found: #{session_id}" unless session
 
-      workflow = load_workflow(session["workflow_name"])
+      workflow = load_runnable_workflow(session["workflow_name"])
       identity = current_identity
 
       print_header("Resuming Workflow: #{workflow[:display_name] || session['workflow_name']}")
@@ -651,6 +651,24 @@ module Riggs
         abort "❌ Workflow not found: #{name}.yml" unless path
 
         Workflow::Loader.load(path: path)
+      end
+
+      # Resolves the path ONCE and gates on the tier of that same file. Asking
+      # Triggers again after loading would gate a different resolution than the
+      # one that was loaded, which is the whole shape of a TOCTOU.
+      def load_runnable_workflow(name)
+        path = Triggers.find_path(name)
+        abort "❌ Workflow not found: #{name}.yml" unless path
+
+        runnable(Workflow::Loader.load(path: path), path)
+      end
+
+      def runnable(workflow, path)
+        denial = WorkflowAccess.denial(identity: current_identity, workflow: workflow,
+                                       tier: Triggers.tier_for(File.dirname(path)))
+        abort "⛔ Access denied. #{denial}" if denial
+
+        workflow
       end
 
       def print_header(title)

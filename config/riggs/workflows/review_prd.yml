@@ -1,0 +1,61 @@
+name: review_prd
+display_name: Review PRD
+description: Assess a PRD against PM review criteria, draft revision requests when it is not ready, then summarize.
+# Owned by the PM role. WorkflowAccess honours this for a role the operator's
+# own config granted run_owned_workflow; delivery, security and infrastructure
+# workflows carry owner_role: engineer instead.
+owner_role: pm
+triggers:
+  - type: manual
+  - type: keyword
+    keywords: ["prd", "review prd", "spec review"]
+context_window: medium
+max_llm_calls: 20
+timeout_seconds: 300
+memory_scope:
+  isolation: namespaced
+providers:
+  default:
+    relay_chain: [mock]
+
+audit_log: true
+steps:
+  - id: assess
+    label: Assess PRD
+    agent: pm_reviewer
+    input: |
+      Review this PRD as a product manager. Check that it states, specifically:
+      the problem and who has it, the target user, success metrics that can
+      actually be measured, what is in scope and the explicit non-goals, the
+      key risks, and the open questions.
+      Reply with verdict=READY only if every one of those is present and
+      specific. Otherwise reply verdict=REVISE and name what is missing.
+      PRD: {{workflow.input.prd}}
+    output_var: assessment
+    next: "if contains REVISE: revisions; else: summarize"
+
+  - id: revisions
+    label: Draft Revision Requests
+    agent: pm_reviewer
+    gates: [approval]
+    input: |
+      The PRD is not ready: {{workflow.assess.assessment}}
+      Write one specific question to the author for each missing or vague item.
+      Ask for the decision, do not make it: this step does not rewrite the PRD.
+    output_var: revision_requests
+    next: "if gate.approved: summarize; if gate.rejected: withdraw_note"
+
+  - id: summarize
+    label: Summarize Review
+    agent: pm_reviewer
+    input: |
+      Write the review to post back to the author.
+      Verdict: {{workflow.assess.assessment}}
+      Requests: {{workflow.revisions.revision_requests}}
+    output_var: review_summary
+
+  - id: withdraw_note
+    label: Withdraw Note
+    agent: pm_reviewer
+    input: "Record that the review was withheld before sending, for PRD: {{workflow.input.prd}}"
+    output_var: withdraw_summary
