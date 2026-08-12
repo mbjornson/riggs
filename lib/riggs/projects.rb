@@ -46,8 +46,6 @@ module Riggs
       File.directory?(path)
     end
 
-    # Widths are measured from the content rather than fixed, so a long
-    # checkout path does not silently shift every column right of it.
     class Table
       HEADER = ["PATH", "TRUST", "RUNS", "LAST RUN", "SPEND", ""].freeze
 
@@ -56,37 +54,12 @@ module Riggs
       RIGHT_ALIGNED = [HEADER.index("RUNS")].freeze
 
       def self.render(rows)
-        new(rows).lines
-      end
-
-      def initialize(rows)
-        @cells = [HEADER] + rows.map { |row| Row.new(row).cells }
-      end
-
-      def lines
-        @cells.map { |cells| padded(cells) }
-      end
-
-      private
-
-      def padded(cells)
-        cells.each_with_index.map { |cell, i| justified(cell, i) }.join("  ").rstrip
-      end
-
-      def justified(cell, index)
-        return cell.rjust(widths[index]) if RIGHT_ALIGNED.include?(index)
-
-        cell.ljust(widths[index])
-      end
-
-      def widths
-        @widths ||= @cells.transpose.map { |column| column.map(&:length).max }
+        TextTable.render(header: HEADER, right_aligned: RIGHT_ALIGNED,
+                         rows: rows.map { |row| Row.new(row).cells })
       end
     end
 
-    # One report row rendered. Every cost figure carries its denominator:
-    # priced work as a dollar amount, unmetered work counted beside it and
-    # never folded in.
+    # One report row rendered.
     class Row
       UNATTRIBUTED = "(unattributed)"
       NONE = "—"
@@ -121,21 +94,8 @@ module Riggs
         Ago.of(@row[:last_run])
       end
 
-      # A project running entirely on a CLI subscription sums to NULL. Printing
-      # that as $0.00 would report work really billed to a subscription as
-      # billed to nobody -- the same false record as `auth: none` on a CLI
-      # provider, which Phase 10 removed for this reason.
       def spend
-        return "#{NONE}#{unmetered}" if @row[:cost_usd].nil?
-
-        "$#{format('%.4f', @row[:cost_usd])}#{unmetered}"
-      end
-
-      def unmetered
-        return "" if @row[:unmetered_calls].zero?
-        return " (#{@row[:unmetered_calls]} unmetered)" if @row[:cost_usd].nil?
-
-        " + #{@row[:unmetered_calls]} unmetered"
+        Spend.of(cost_usd: @row[:cost_usd], unmetered_calls: @row[:unmetered_calls])
       end
 
       def warning

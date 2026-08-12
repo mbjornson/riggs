@@ -248,6 +248,25 @@ module Riggs
       @db.execute(PROJECT_TOTALS)
     end
 
+    # `IS`, not `=`: the (unattributed) bucket is a NULL project_path, and
+    # `= NULL` is never true, so an equality test would report that bucket as
+    # having no provider calls at all.
+    PROVIDER_TOTALS = <<~SQL
+      SELECT c.provider AS provider,
+             COUNT(c.id) AS calls,
+             SUM(CASE WHEN c.cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS priced_calls,
+             SUM(c.cost_usd) AS cost_usd
+      FROM riggs_provider_calls c
+      JOIN riggs_sessions s ON s.id = c.session_id
+      WHERE s.project_path IS ?
+      GROUP BY c.provider
+      ORDER BY c.provider
+    SQL
+
+    def provider_totals(project_path)
+      @db.execute(PROVIDER_TOTALS, [project_path])
+    end
+
     def session_usage(session_id)
       row = @db.get_first_row("#{USAGE_SELECT} WHERE session_id = ?", [utf8(session_id)])
       usage_row(row)

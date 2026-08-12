@@ -44,6 +44,7 @@ module Riggs
     map "trust:grant" => :trust
     map "trust:list" => :trust_list
     map "projects:list" => :projects
+    map "cost:show" => :cost
     map "trust:forget" => :trust_forget
     map "triggers:match" => :triggers_match
     map "triggers:list" => :triggers_list
@@ -75,6 +76,16 @@ module Riggs
       require_permission! %w[inspect_run read_workflow]
       print_header("Projects")
       Projects::Table.render(project_rows).each { |line| puts line }
+    end
+
+    # The optional argument is the spec'd interface: with no argument the
+    # roll-up IS the command, and naming one project narrows it to that
+    # project's providers.
+    desc "cost [PROJECT]", "Report spend per project, or one project broken down by provider."
+    def cost(project = nil)
+      require_permission! %w[inspect_run read_workflow]
+      print_header("Cost")
+      cost_lines(project).each { |line| puts line }
     end
 
     desc "trust:forget PATH", "Forget a trusted project path."
@@ -682,13 +693,27 @@ module Riggs
         workflow
       end
 
-      # Opened and closed here rather than memoized: these commands report and
-      # exit, and a held handle on the shared database outlives the answer.
       def project_rows
+        with_storage { |storage| Projects.new(storage: storage, trust: Trust.default).rows }
+      end
+
+      # An ambiguous or unknown selector must report no figure at all -- a
+      # misreported number is worse than a refusal, because nothing about it
+      # looks wrong.
+      def cost_lines(project)
+        with_storage { |storage| Cost.new(storage: storage, trust: Trust.default, cwd: Dir.pwd).lines(project) }
+      rescue Error => e
+        abort "❌ #{e.message}"
+      end
+
+      # Opened and closed around the report rather than memoized: these
+      # commands answer and exit, and a held handle on the shared database
+      # outlives the answer.
+      def with_storage
         storage = Storage.new(db_path: load_config[:sqlite_path] || "./db/riggs.sqlite3")
-        rows = Projects.new(storage: storage, trust: Trust.default).rows
-        storage.close
-        rows
+        yield storage
+      ensure
+        storage&.close
       end
 
       def print_header(title)
