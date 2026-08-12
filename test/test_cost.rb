@@ -84,6 +84,21 @@ class TestCost < Minitest::Test
     end
   end
 
+  # abort writes to stderr, which is unbuffered, so a header printed before the
+  # selector resolves reaches the terminal AFTER the error: the operator sees a
+  # refusal followed by a bare "== COST ==", which reads like a report that came
+  # back empty rather than a command that declined to answer. Found by running
+  # it, not by reading it.
+  def test_a_refused_selector_prints_no_report_header
+    with_tmp_project do
+      seed("/Products/one", cost: 1.0)
+
+      out, = capture_io { assert_raises(SystemExit) { Riggs::CLI.start(%w[cost nope]) } }
+
+      refute_match(/COST/, out)
+    end
+  end
+
   def test_a_scoped_report_breaks_down_by_provider
     with_tmp_project do
       seed("/Products/one", cost: 1.0, provider: "openai")

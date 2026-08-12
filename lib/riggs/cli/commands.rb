@@ -84,8 +84,9 @@ module Riggs
     desc "cost [PROJECT]", "Report spend per project, or one project broken down by provider."
     def cost(project = nil)
       require_permission! %w[inspect_run read_workflow]
+      lines = cost_lines(project)
       print_header("Cost")
-      cost_lines(project).each { |line| puts line }
+      lines.each { |line| puts line }
     end
 
     desc "trust:forget PATH", "Forget a trusted project path."
