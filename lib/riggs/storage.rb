@@ -228,6 +228,26 @@ module Riggs
       @db.last_insert_row_id
     end
 
+    # LEFT JOIN, not INNER: a project whose sessions made no provider call at
+    # all still ran, and an inner join would drop it from the roll-up entirely.
+    # Grouped on the session's project because a call reaches a project only
+    # through its session -- the column deliberately lives on one table.
+    PROJECT_TOTALS = <<~SQL
+      SELECT s.project_path AS project_path,
+             COUNT(DISTINCT s.id) AS runs,
+             MAX(s.started_at) AS last_run,
+             COUNT(c.id) AS calls,
+             SUM(CASE WHEN c.cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS priced_calls,
+             SUM(c.cost_usd) AS cost_usd
+      FROM riggs_sessions s
+      LEFT JOIN riggs_provider_calls c ON c.session_id = s.id
+      GROUP BY s.project_path
+    SQL
+
+    def project_totals
+      @db.execute(PROJECT_TOTALS)
+    end
+
     def session_usage(session_id)
       row = @db.get_first_row("#{USAGE_SELECT} WHERE session_id = ?", [utf8(session_id)])
       usage_row(row)

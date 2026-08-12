@@ -43,6 +43,7 @@ module Riggs
     map "mcp:ping" => :mcp_ping
     map "trust:grant" => :trust
     map "trust:list" => :trust_list
+    map "projects:list" => :projects
     map "trust:forget" => :trust_forget
     map "triggers:match" => :triggers_match
     map "triggers:list" => :triggers_list
@@ -67,6 +68,13 @@ module Riggs
       require_permission! %w[run_workflow manage_mcp]
       print_header("Trusted Projects")
       trust_commands.list
+    end
+
+    desc "projects", "List every project riggs knows about, with runs and spend."
+    def projects
+      require_permission! %w[inspect_run read_workflow]
+      print_header("Projects")
+      Projects::Table.render(project_rows).each { |line| puts line }
     end
 
     desc "trust:forget PATH", "Forget a trusted project path."
@@ -672,6 +680,15 @@ module Riggs
         abort "⛔ Access denied. #{denial}" if denial
 
         workflow
+      end
+
+      # Opened and closed here rather than memoized: these commands report and
+      # exit, and a held handle on the shared database outlives the answer.
+      def project_rows
+        storage = Storage.new(db_path: load_config[:sqlite_path] || "./db/riggs.sqlite3")
+        rows = Projects.new(storage: storage, trust: Trust.default).rows
+        storage.close
+        rows
       end
 
       def print_header(title)
