@@ -190,6 +190,7 @@ module Riggs
         "INSERT INTO riggs_audit (session_id, event_type, payload) VALUES (?, ?, ?)",
         [utf8(session_id), event_type, JSON.generate(payload)]
       )
+      @db.last_insert_row_id
     end
 
     def list_audit(session_id)

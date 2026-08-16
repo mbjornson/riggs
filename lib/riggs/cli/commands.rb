@@ -4,6 +4,7 @@ require "thor"
 require "psych"
 require "fileutils"
 require "json"
+require "stringio"
 require_relative "../identity"
 require_relative "../workflow/loader"
 require_relative "../workflow/graph_engine"
@@ -22,6 +23,8 @@ module Riggs
     end
 
     class_option :user, type: :string, desc: "Override default user from .agent_hubrc"
+    class_option :mode, type: :string, default: "text", enum: %w[text json],
+                        desc: "Output mode: text (default) or json (JSONL audit events on stdout)"
 
     map "identity:show" => :identity_show
     map "config:show" => :config_show
@@ -40,6 +43,7 @@ module Riggs
     map "mcp:ping" => :mcp_ping
     map "triggers:match" => :triggers_match
     map "triggers:list" => :triggers_list
+    map "trust" => :trust_project
 
     desc "setup", "Create .agent_hubrc, db/, config/riggs/workflows/, and SQLite database."
     def setup
@@ -114,6 +118,8 @@ module Riggs
         File.write(config_file, Psych.dump(hub_cfg))
         puts "✅ Created #{config_file}"
       end
+      ProjectTrust.trust!(base_dir, config_path: config_file)
+      puts "✅ Trusted #{config_file} for this machine"
 
       # Copy example playbook + skill into the project if missing
       example_src = File.expand_path("../../../config/riggs/workflows/example_triage.yml", __dir__)
@@ -134,6 +140,24 @@ module Riggs
       Storage.new(db_path: db_path).close
       puts "✅ Database ready at #{db_path}"
       puts "\n🎉 Riggs setup complete!"
+    end
+
+    desc "trust", "Trust this project's .agent_hubrc (users, roles, MCP) on this machine."
+    def trust_project
+      path = Identity.config_path
+      abort "❌ Missing .agent_hubrc in #{Dir.pwd}. Run 'riggs setup' first." unless path
+
+      # Show a short summary from the untrusted read so the operator knows what
+      # they are approving, without granting the process identity yet.
+      cfg = Identity.load_config_untrusted(path)
+      users = (cfg[:users] || {}).keys.map(&:to_s).sort
+      mcp = (cfg[:mcp_servers] || {}).keys.map(&:to_s).sort
+      print_header("Trust project config")
+      puts "Config: #{File.expand_path(path)}"
+      puts "Users:  #{users.empty? ? '(none)' : users.join(', ')}"
+      puts "MCP:    #{mcp.empty? ? '(none)' : mcp.join(', ')}"
+      ProjectTrust.trust!(Dir.pwd, config_path: path)
+      puts "✅ Trusted. Re-run `riggs trust` after editing .agent_hubrc."
     end
 
     desc "identity:show", "Show current user, role, GitHub handle, and memory scope."
@@ -317,18 +341,21 @@ module Riggs
       workflow = load_workflow(name)
       identity = current_identity
       cfg = load_config
+      json_mode = options[:mode].to_s == "json"
 
-      print_header("Running Workflow: #{workflow[:display_name] || name}")
-      puts "👤 User: #{identity[:id]} (#{identity[:role]})"
-      puts "🧠 Memory Scope: #{identity[:memory_namespace]}"
-      puts "⏱️  Max Calls: #{workflow[:max_llm_calls]}"
+      unless json_mode
+        print_header("Running Workflow: #{workflow[:display_name] || name}")
+        puts "👤 User: #{identity[:id]} (#{identity[:role]})"
+        puts "🧠 Memory Scope: #{identity[:memory_namespace]}"
+        puts "⏱️  Max Calls: #{workflow[:max_llm_calls]}"
+      end
 
       input = (options[:input] || {}).transform_keys(&:to_sym)
       input[:ticket] = options[:ticket] if options[:ticket]
 
       gate_handler = if options[:auto_approve]
                        lambda { |step, io|
-                         io.puts "⏸ Auto-approving gate on '#{step.id}'"
+                         io.puts "⏸ Auto-approving gate on '#{step.id}'" unless json_mode
                          :approved
                        }
                      end
@@ -337,10 +364,18 @@ module Riggs
       mcp_manager = begin
         MCP::Manager.from_config(cfg[:mcp_servers])
       rescue StandardError => e
-        warn "⚠️  MCP disabled for this run — mcp_servers config error: #{e.message}"
+        warn "⚠️  MCP disabled for this run — mcp_servers config error: #{e.message}" unless json_mode
         nil
       end
 
+      event_sink = if json_mode
+                     lambda { |row|
+                       $stdout.puts Events.to_jsonl(row, session_id: row["session_id"])
+                       $stdout.flush
+                     }
+                   end
+
+      run_io = json_mode ? StringIO.new : $stdout
       engine = Workflow::GraphEngine.new(
         workflow: workflow,
         user_identity: identity,
@@ -348,9 +383,12 @@ module Riggs
         hub_config: cfg,
         gate_handler: gate_handler,
         skill_registry: skill_registry,
-        mcp_manager: mcp_manager
+        mcp_manager: mcp_manager,
+        event_sink: event_sink
       )
-      engine.execute($stdout, input: input)
+      engine.execute(run_io, input: input)
+
+      return if json_mode
 
       FileUtils.mkdir_p("./db/audit")
       File.write(

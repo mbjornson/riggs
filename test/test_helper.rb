@@ -12,6 +12,7 @@ module RiggsTestHelpers
   def with_tmp_project
     Dir.mktmpdir("riggs-test") do |dir|
       Dir.chdir(dir) do
+        previous_trust_home = ENV.fetch("RIGGS_TRUST_HOME", nil)
         FileUtils.mkdir_p("config/riggs/workflows")
         FileUtils.mkdir_p("config/riggs/skills/triage_v1")
         FileUtils.mkdir_p("db")
@@ -20,6 +21,12 @@ module RiggsTestHelpers
         copy_skill
         Riggs::Storage.new(db_path: "./db/riggs.sqlite3").close
         yield dir
+      ensure
+        if previous_trust_home
+          ENV["RIGGS_TRUST_HOME"] = previous_trust_home
+        else
+          ENV.delete("RIGGS_TRUST_HOME")
+        end
       end
     end
   end
@@ -52,6 +59,19 @@ module RiggsTestHelpers
         mock:
           type: mock
     YAML
+    trust_dir = File.join(dir_for_trust_home, "trust-home")
+    FileUtils.mkdir_p(trust_dir)
+    ENV["RIGGS_TRUST_HOME"] = trust_dir
+    trust_hubrc!
+  end
+
+  def trust_hubrc!(path = ".agent_hubrc")
+    Riggs::ProjectTrust.trust!(Dir.pwd, config_path: path)
+  end
+
+  def dir_for_trust_home
+    # Prefer the tmp project root when available; fall back to a nested path.
+    Dir.pwd
   end
 
   def copy_example_workflow

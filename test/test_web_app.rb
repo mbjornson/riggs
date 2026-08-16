@@ -308,6 +308,7 @@ class TestWebApp < Minitest::Test
     }
     cfg["roles"]["blind"] = ["read_workflow"]
     File.write(".agent_hubrc", Psych.dump(cfg))
+    trust_hubrc!
   end
 
   def test_stream_endpoint_emits_sse_frames_and_closes_on_terminal_status

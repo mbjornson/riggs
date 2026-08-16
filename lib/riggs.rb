@@ -28,6 +28,9 @@ end
 
 require_relative "riggs/version"
 require_relative "riggs/identity"
+require_relative "riggs/project_trust"
+require_relative "riggs/hooks"
+require_relative "riggs/builtin_tools"
 require_relative "riggs/config_store"
 require_relative "riggs/storage"
 require_relative "riggs/usage"
