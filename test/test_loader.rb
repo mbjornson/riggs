@@ -158,7 +158,7 @@ class TestLoader < Minitest::Test
     lines << "steps:"
     lines << "  - id: a"
     lines << "    input: *#{prev}"
-    lines.join("\n") + "\n"
+    "#{lines.join("\n")}\n"
   end
 
   # Aliases are disabled so Psych raises before deep_symbolize can expand

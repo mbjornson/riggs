@@ -69,7 +69,7 @@ class TestIdentity < Minitest::Test
       prev = key
     end
     lines << "default_user: *#{prev}"
-    lines.join("\n") + "\n"
+    "#{lines.join("\n")}\n"
   end
 
   # Aliases are disabled so Psych raises before deep_symbolize can expand
