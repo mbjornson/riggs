@@ -12,6 +12,17 @@ class TestWebApp < Minitest::Test
     Riggs::Web::App
   end
 
+  def setup
+    @prev_insecure_identity = Riggs::Web::App.insecure_identity
+    @prev_identity_mapper = Riggs.identity_mapper
+    Riggs::Web::App.insecure_identity = true
+  end
+
+  def teardown
+    Riggs::Web::App.insecure_identity = @prev_insecure_identity
+    Riggs.identity_mapper = @prev_identity_mapper
+  end
+
   def test_health_and_config_get
     with_tmp_project do
       header "X-Riggs-User", "eng_bob"
@@ -640,6 +651,56 @@ class TestWebApp < Minitest::Test
       described = JSON.parse(last_response.body).find { |s| s["name"] == "spoof" }
       assert_equal "helper\e[2K\r", described["description"],
                    "the API must round-trip exactly what the skill file declares"
+    end
+  end
+
+  def test_secure_identity_rejects_x_riggs_user_without_mapper
+    with_tmp_project do
+      Riggs::Web::App.insecure_identity = false
+      Riggs.identity_mapper = nil
+      header "X-Riggs-User", "pm_alice"
+      get "/health"
+
+      assert_includes [401, 403], last_response.status
+      refute_match(/pm_alice/, last_response.body)
+    end
+  end
+
+  def test_secure_identity_uses_mapper_user
+    with_tmp_project do
+      Riggs::Web::App.insecure_identity = false
+      Riggs.identity_mapper = ->(_req) { "pm_alice" }
+      get "/health"
+
+      assert_equal 200, last_response.status
+      assert_equal "pm_alice", JSON.parse(last_response.body)["identity"]
+    end
+  end
+
+  def test_secure_identity_rejects_post_without_origin
+    with_tmp_project do
+      Riggs::Web::App.insecure_identity = false
+      Riggs.identity_mapper = ->(_req) { "eng_bob" }
+      header "Content-Type", "application/json"
+      post "/api/workflows/example_triage/run",
+           JSON.generate("input" => { "ticket" => "Login ERROR timeout" }, "auto_approve" => true)
+
+      assert_equal 403, last_response.status
+    end
+  end
+
+  def test_secure_identity_allows_post_with_matching_origin
+    with_tmp_project do
+      Riggs::Web::App.insecure_identity = false
+      Riggs.identity_mapper = ->(_req) { "eng_bob" }
+      header "Content-Type", "application/json"
+      header "Origin", "http://example.org"
+      post "/api/workflows/example_triage/run",
+           JSON.generate("input" => { "ticket" => "Login ERROR timeout" }, "auto_approve" => true)
+
+      assert_equal 200, last_response.status, last_response.body
+      result = JSON.parse(last_response.body)
+      assert result["session_id"]
     end
   end
 

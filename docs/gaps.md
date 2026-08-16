@@ -176,14 +176,13 @@ Not from the Pi comparison. Surfaced by the whole-branch review of Phase 8,
 which found and fixed this pattern in the skill loader and then noticed the same
 two lines elsewhere.
 
-**Now:** Phase 8 hardened both skill-loading call sites to
-`permitted_classes: [Symbol, Date, Time], aliases: false`, and widened the
-rescue around them to `Psych::Exception`. Three other call sites still read
-`permitted_classes: [Symbol], aliases: true`, with no equivalent rescue:
+**Now:** Phase 8 hardened both skill-loading call sites. The three other
+sites (identity, workflow loader, web YAML) now use the same
+`permitted_classes: [Symbol, Date, Time], aliases: false` treatment. The web
+YAML path is also size-capped and key-scoped by permission. Left as residual:
+JSON request bodies still have no middleware size cap, and MCP stdout lines
+are still unbounded.
 
-- `lib/riggs/identity.rb:23` — `.agent_hubrc`
-- `lib/riggs/workflow/loader.rb:23` — workflow YAML
-- `lib/riggs/web/app.rb:265` — `req.params["yaml"]`, i.e. YAML posted over HTTP
 
 **Why it matters:** two distinct failure modes, both demonstrated on the skill
 path before Phase 8 closed them there.

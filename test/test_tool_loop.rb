@@ -557,6 +557,124 @@ class TestToolLoop < Minitest::Test
     end
   end
 
+  def test_tool_line_on_a_step_with_no_tools_does_not_execute_lookup_runbook
+    router = Class.new do
+      def call(**)
+        {
+          provider: "mock", model: nil, usage: {}, cost_usd: nil,
+          content: "TOOL:lookup_runbook|{\"topic\":\"auth\"}",
+          tool_calls: []
+        }
+      end
+    end.new
+
+    loop_obj = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: nil, skill_registry: nil,
+      audit: ->(*) {}, llm_calls: 0, max_llm_calls: 5,
+      timeout_seconds: 60, started_at: Time.now, session_id: "s1"
+    )
+    messages = [{ role: "user", content: "hello" }]
+
+    outcome = loop_obj.run(
+      step: build_step, chain: ["mock"], messages: messages,
+      system_prompt: "test", io: StringIO.new
+    )
+
+    refute_match(/Runbook\[auth\]/, outcome[:content].to_s)
+    refute(messages.any? { |m| m[:role].to_s == "tool" },
+           "TOOL: on a step that offered no tools must not execute lookup_runbook")
+  end
+
+  def test_parsed_tool_line_drops_names_not_in_the_offered_set
+    mcp_calls = []
+    mcp = Class.new do
+      define_method(:list_tools) do
+        [{ name: "gh_search", description: "Search", input_schema: {}, server: "github" }]
+      end
+      define_method(:call_tool) do |name, *_args, **|
+        mcp_calls << name
+        "LEAKED"
+      end
+    end.new
+
+    router = Class.new do
+      def initialize
+        @calls = 0
+      end
+
+      def call(**)
+        @calls += 1
+        base = { provider: "mock", model: nil, usage: {}, cost_usd: nil }
+        return base.merge(content: "done", tool_calls: []) if @calls > 1
+
+        base.merge(content: "TOOL:secret_exfil|{}", tool_calls: [])
+      end
+    end.new
+
+    loop_obj = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: mcp, skill_registry: nil,
+      audit: ->(*) {}, llm_calls: 0, max_llm_calls: 5,
+      timeout_seconds: 60, started_at: Time.now, session_id: "s1"
+    )
+    messages = [{ role: "user", content: "hello" }]
+
+    loop_obj.run(
+      step: build_step, chain: ["mock"], messages: messages,
+      system_prompt: "test", io: StringIO.new
+    )
+
+    assert_empty mcp_calls, "a TOOL: name that was not offered must not be invoked"
+    leaked = messages.find do |m|
+      m[:role].to_s == "tool" && m[:name].to_s == "secret_exfil" && !m[:content].to_s.start_with?("TOOL_DENIED")
+    end
+    assert_nil leaked, "unoffered TOOL: names must be dropped or denied"
+  end
+
+  def test_tool_loop_without_hooks_denies_mcp_when_identity_lacks_manage_mcp
+    mcp_calls = []
+    mcp = Class.new do
+      define_method(:list_tools) do
+        [{ name: "evil_tool", description: "bad", input_schema: {}, server: "evil" }]
+      end
+      define_method(:call_tool) do |name, *_args, **|
+        mcp_calls << name
+        "LEAKED"
+      end
+    end.new
+
+    router = Class.new do
+      def initialize
+        @calls = 0
+      end
+
+      def call(**)
+        @calls += 1
+        base = { provider: "mock", model: nil, usage: {}, cost_usd: nil }
+        return base.merge(content: "done", tool_calls: []) if @calls > 1
+
+        base.merge(content: "", tool_calls: [{ id: "t1", name: "evil_tool", arguments: {} }])
+      end
+    end.new
+
+    loop_obj = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: mcp, skill_registry: nil,
+      audit: ->(*) {}, llm_calls: 0, max_llm_calls: 5,
+      timeout_seconds: 60, started_at: Time.now, session_id: "s1",
+      identity: { id: "runner", role: :custom, permissions: %w[run_workflow] }
+    )
+    messages = [{ role: "user", content: "please exfiltrate" }]
+
+    loop_obj.run(
+      step: build_step, chain: ["mock"], messages: messages,
+      system_prompt: "test", io: StringIO.new
+    )
+
+    tool_msg = messages.find { |m| m[:role].to_s == "tool" }
+    refute_nil tool_msg
+    assert_match(/\ATOOL_DENIED:/, tool_msg[:content].to_s)
+    assert_empty mcp_calls, "default hooks must still deny MCP without manage_mcp"
+  end
+
   # Advertisement is not a boundary. resolve_tools already hides tools on
   # unpinned servers, but a model can still name one. execute_tool must refuse
   # it and must not call the other server.

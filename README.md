@@ -30,16 +30,18 @@ riggs serve --port 4567
 # open http://127.0.0.1:4567 — switch user, edit config, run playbooks
 ```
 
-Auth for the web app: logged-in cookie (User page), `X-Riggs-User` header, `?user=`, or `Riggs.identity_mapper` in a host process.
+Auth for the web app: set `Riggs.identity_mapper` in a host process. Header/cookie/`?user=`
+identity is only honored when `riggs serve --insecure-identity` is on (the default
+on 127.0.0.1/localhost). Bind a non-loopback address without that flag and those
+inputs are ignored; mutating requests also need a matching `Origin` or `Referer`.
 
 ## Identity & RBAC
 
 `.agent_hubrc` defines users and roles. Before Riggs will load that file (users,
 roles, providers, MCP servers), the project must be **trusted** on this machine —
-an input-loading guard, not a sandbox. `riggs setup` trusts the config it writes;
-after cloning a repo, review `.agent_hubrc` and run `riggs trust`. A content
-change invalidates trust until you trust again (writes through `ConfigStore` /
-the web Config UI refresh the fingerprint automatically).
+an input-loading guard, not a sandbox. `riggs setup` trusts only a file it just
+wrote. After cloning a repo, review `.agent_hubrc` and run `riggs trust` (`--yes`
+for scripts). A content change invalidates trust; config writes do not re-trust.
 
 | Role | Permissions |
 |------|-------------|

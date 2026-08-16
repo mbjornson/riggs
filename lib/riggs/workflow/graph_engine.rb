@@ -28,7 +28,8 @@ module Riggs
         @gate_handler = gate_handler || method(:default_gate_handler)
         @skill_registry = skill_registry
         @mcp_manager = mcp_manager || (mcp_client ? MCP::Manager.wrap_client(mcp_client) : nil)
-        @hooks = hooks || Hooks.default(identity: user_identity)
+        @hooks = Hooks.default(identity: user_identity)
+        @hooks.merge!(hooks) if hooks
         # Optional live consumer of audit rows (e.g. CLI --mode json → JSONL).
         @event_sink = event_sink
         @router = provider_router || Providers::Router.new(
@@ -429,7 +430,8 @@ module Riggs
           # So a summarization failure the Compactor rescues lands in this
           # run's event stream rather than only on stderr.
           audit: method(:audit_bridge),
-          session_id: @session_id
+          session_id: @session_id,
+          hooks: @hooks
         )
       end
 

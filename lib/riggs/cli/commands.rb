@@ -240,6 +240,8 @@ module Riggs
     desc "serve", "Start the Riggs web UI / JSON API (Rack) against the current project."
     method_option :port, type: :numeric, default: 4567, aliases: "-p"
     method_option :bind, type: :string, default: "127.0.0.1", aliases: "-b"
+    method_option :insecure_identity, type: :boolean, default: nil,
+                                      desc: "Trust X-Riggs-User, cookie, and ?user= (default: on for loopback)"
     def serve
       require "rack"
       require "rackup"
@@ -249,8 +251,16 @@ module Riggs
 
       port = options[:port]
       bind = options[:bind]
+      insecure = options[:insecure_identity]
+      insecure = %w[127.0.0.1 localhost].include?(bind.to_s) if insecure.nil?
+      Web::App.insecure_identity = insecure
       puts "🌐 Riggs web UI on http://#{bind}:#{port} (cwd=#{Dir.pwd})"
-      puts "   Auth: cookie user picker, X-Riggs-User header, or ?user="
+      if insecure
+        puts "   Auth: cookie user picker, X-Riggs-User header, or ?user="
+        puts "⚠️  Insecure identity enabled; X-Riggs-User, cookie, and ?user= are trusted"
+      else
+        puts "   Auth: Riggs.identity_mapper only"
+      end
       Rackup::Server.start(
         app: Riggs::Web::App,
         Host: bind,

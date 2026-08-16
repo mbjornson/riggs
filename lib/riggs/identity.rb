@@ -60,7 +60,12 @@ module Riggs
     end
 
     def self.permitted?(identity, *needed)
-      needed.flatten.map(&:to_s).all? { |p| identity[:permissions].include?(p) }
+      return false if identity.nil?
+
+      perms = identity[:permissions]
+      return false if perms.nil?
+
+      needed.flatten.map(&:to_s).all? { |p| perms.include?(p) }
     end
 
     def self.deep_symbolize(obj)

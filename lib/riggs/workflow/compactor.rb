@@ -17,7 +17,8 @@ module Riggs
       DEFAULT_SUMMARY_TIMEOUT = 60
 
       def initialize(router:, chain:, budget:, reserve:, keep_recent:,
-                     model_overrides: {}, record_call: nil, audit: nil, session_id: nil)
+                     model_overrides: {}, record_call: nil, audit: nil, session_id: nil,
+                     hooks: nil)
         @router = router
         @chain = chain
         @budget = budget.to_i
@@ -35,6 +36,7 @@ module Riggs
         # foreign key and gets silently swallowed by call_router's rescue,
         # degrading every real compaction to "truncated" (see Task 12 review).
         @session_id = session_id
+        @hooks = hooks
       end
 
       # The lower of the workflow budget and the model's own window, less the
@@ -144,10 +146,22 @@ module Riggs
       # failing. The caller charges this against max_llm_calls, which is the
       # run's only hard stop on runaway spend.
       def call_router(transcript, timeout = nil, step_key = nil)
+        messages = [{ role: "user", content: "#{SUMMARY_PROMPT}\n\n#{transcript}" }]
+        if @hooks
+          request = @hooks.fire(:before_provider_request, {
+                                  chain: @chain,
+                                  messages: messages
+                                })
+          if request[:deny]
+            report_degrade(StandardError.new(request[:deny].to_s))
+            return nil
+          end
+          messages = request[:messages] if request[:messages]
+        end
         @llm_calls = @llm_calls.to_i + 1
         @router.call(
           chain: @chain,
-          messages: [{ role: "user", content: "#{SUMMARY_PROMPT}\n\n#{transcript}" }],
+          messages: messages,
           timeout: timeout || DEFAULT_SUMMARY_TIMEOUT,
           session_id: @session_id,
           # A summarization runs through a relay chain like any other call, so

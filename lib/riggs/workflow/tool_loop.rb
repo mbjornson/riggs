@@ -19,8 +19,8 @@ module Riggs
         @record_call = record_call
         # Same contract again — a loop with no compactor never trims messages.
         @compactor = compactor
-        @hooks = hooks || Hooks.new
         @identity = identity
+        @hooks = hooks || Hooks.default(identity: @identity)
         @llm_calls = llm_calls
         @max_llm_calls = max_llm_calls.to_i
         @timeout_seconds = timeout_seconds
@@ -91,7 +91,10 @@ module Riggs
           @last_model = result[:model]
 
           tool_calls = Array(result[:tool_calls])
-          tool_calls = parse_tool_line(result[:content]) if tool_calls.empty? && result[:content].to_s.start_with?("TOOL:")
+          if tools.any? && tool_calls.empty? && result[:content].to_s.start_with?("TOOL:")
+            offered = offered_tool_names(tools)
+            tool_calls = parse_tool_line(result[:content]).select { |tc| offered.include?(tc[:name].to_s) }
+          end
 
           if tool_calls.empty?
             persist_turn(role: "assistant", content: result[:content].to_s, step_key: step.id, provider: result[:provider])
@@ -288,6 +291,10 @@ module Riggs
 
       def cli_only_chain?(chain)
         Providers::Router.unmetered_chain?(chain)
+      end
+
+      def offered_tool_names(tools)
+        BuiltinTools.names | Array(tools).map { |t| (t[:name] || t["name"]).to_s }
       end
 
       def parse_tool_line(content)

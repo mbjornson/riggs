@@ -115,4 +115,71 @@ class TestHooks < Minitest::Test
     assert_match(/Runbook\[auth\]/, Riggs::BuiltinTools.call("lookup_runbook", { topic: "auth" }))
     assert_nil Riggs::BuiltinTools.call("nope", {})
   end
+
+  def test_merge_appends_other_handlers_per_event
+    left = Riggs::Hooks.new
+    right = Riggs::Hooks.new
+    order = []
+    left.on(:tool_result) { order << :left }
+    right.on(:tool_result) { order << :right }
+
+    left.merge!(right)
+    left.fire(:tool_result, { result: "x" })
+
+    assert_equal %i[left right], order
+  end
+
+  def test_default_with_nil_identity_denies_non_builtin_tools
+    hooks = Riggs::Hooks.default(identity: nil)
+    out = hooks.fire(:tool_call, { name: "evil_tool", arguments: {}, builtin: false })
+
+    assert out[:deny], "Hooks.default(identity: nil) must deny MCP tools (fail closed)"
+  end
+
+  def test_default_with_nil_identity_still_allows_builtins
+    hooks = Riggs::Hooks.default(identity: nil)
+    out = hooks.fire(:tool_call, { name: "lookup_runbook", arguments: { topic: "x" }, builtin: true })
+
+    refute out[:deny]
+  end
+
+  def test_permitted_is_false_when_identity_is_nil
+    refute Riggs::Identity.permitted?(nil, "manage_mcp")
+  end
+
+  def test_permitted_is_false_when_permissions_are_missing
+    refute Riggs::Identity.permitted?({ id: "x", role: :custom }, "manage_mcp")
+  end
+
+  def test_custom_log_only_hook_does_not_allow_mcp_without_manage_mcp
+    with_tmp_project do
+      logged = []
+      custom = Riggs::Hooks.new
+      custom.on(:tool_call) { |ctx| logged << ctx[:name] }
+
+      identity = {
+        id: "runner",
+        role: :custom,
+        permissions: %w[run_workflow],
+        memory_namespace: "test"
+      }
+      workflow = Riggs::Workflow::Loader.load(path: "config/riggs/workflows/example_triage.yml")
+      engine = Riggs::Workflow::GraphEngine.new(
+        workflow: workflow,
+        user_identity: identity,
+        db_path: "./db/riggs.sqlite3",
+        hub_config: Riggs::Identity.load_config,
+        skill_registry: Riggs::SkillRegistry.new(roots: ["./config/riggs/skills"]),
+        hooks: custom
+      )
+
+      out = engine.instance_variable_get(:@hooks).fire(:tool_call, {
+                                                         name: "evil_tool",
+                                                         arguments: {},
+                                                         builtin: false
+                                                       })
+      assert out[:deny],
+             "a custom log-only hook must not replace the default MCP deny"
+    end
+  end
 end
