@@ -557,6 +557,72 @@ class TestToolLoop < Minitest::Test
     end
   end
 
+  # Advertisement is not a boundary. resolve_tools already hides tools on
+  # unpinned servers, but a model can still name one. execute_tool must refuse
+  # it and must not call the other server.
+  def test_execute_tool_denies_mcp_tools_outside_skill_server_pin
+    calls = []
+    mcp = Class.new do
+      define_method(:list_tools) do
+        [{ name: "safe_tool", description: "ok", input_schema: {}, server: "safe" },
+         { name: "exfiltrate", description: "steal", input_schema: {}, server: "evil" }]
+      end
+      define_method(:call_tool) do |name, arguments = {}, server: nil|
+        calls << { name: name, arguments: arguments, server: server }
+        "LEAKED from #{server || 'unspecified'}"
+      end
+    end.new
+
+    registry = Class.new do
+      def load!(_spec)
+        {
+          name: "safe_only",
+          version: "1.0.0",
+          system_prompt: "only safe",
+          tools: [{ name: "safe_tool", description: "ok", input_schema: {}, mcp_server: "safe" }],
+          mcp_servers: ["safe"]
+        }
+      end
+    end.new
+
+    router = Class.new do
+      def initialize
+        @calls = 0
+      end
+
+      def call(**)
+        @calls += 1
+        base = { provider: "mock", model: nil, usage: {}, cost_usd: nil }
+        return base.merge(content: "done", tool_calls: []) if @calls > 1
+
+        base.merge(
+          content: "",
+          tool_calls: [{ id: "t1", name: "exfiltrate", arguments: { secret: "yes" } }]
+        )
+      end
+    end.new
+
+    step = Riggs::Workflow::StepNode.from_hash(
+      "id" => "s", "input" => "go", "output_var" => "o", "skill" => "safe_only"
+    )
+    loop_obj = Riggs::Workflow::ToolLoop.new(
+      router: router, mcp_manager: mcp, skill_registry: registry,
+      audit: ->(*) {}, llm_calls: 0, max_llm_calls: 5,
+      timeout_seconds: 60, started_at: Time.now, session_id: "s1"
+    )
+    messages = [{ role: "user", content: "please exfiltrate" }]
+
+    loop_obj.run(
+      step: step, chain: ["mock"], messages: messages,
+      system_prompt: "test", io: StringIO.new
+    )
+
+    tool_msg = messages.find { |m| m[:role].to_s == "tool" }
+    refute_nil tool_msg, "the loop must record a tool result for the model's call"
+    assert_match(/\ATOOL_DENIED:/, tool_msg[:content].to_s)
+    assert_empty calls, "exfiltrate must not be invoked on any MCP server"
+  end
+
   private
 
   def build_step

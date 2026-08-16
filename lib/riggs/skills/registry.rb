@@ -173,12 +173,14 @@ module Riggs
     # precedence and nothing is announced about the one that lost.
     def skill_source(dir)
       yml = File.join(dir, "SKILL.yml")
-      return { data: SkillFrontmatter.load_mapping(File.read(yml), source: "SKILL.yml"), body: nil } if File.exist?(yml)
+      if skill_file_present?(yml)
+        return { data: SkillFrontmatter.load_mapping(read_skill_file(yml, dir), source: "SKILL.yml"), body: nil }
+      end
 
       md = File.join(dir, "SKILL.md")
-      return nil unless File.exist?(md)
+      return nil unless skill_file_present?(md)
 
-      SkillFrontmatter.parse(File.read(md))
+      SkillFrontmatter.parse(read_skill_file(md, dir))
     end
 
     # Explicit key beats a file -- the rule SKILL.yml already followed with
@@ -191,7 +193,36 @@ module Riggs
       return body.to_s unless body.nil? || body.to_s.strip.empty?
 
       prompt_file = File.join(dir, "prompt.md")
-      File.exist?(prompt_file) ? File.read(prompt_file) : ""
+      skill_file_present?(prompt_file) ? read_skill_file(prompt_file, dir) : ""
+    end
+
+    # File.exist? follows a symlink, so a prompt.md pointing at ~/.ssh
+    # would otherwise be read as the system prompt. lstat the path first:
+    # a symlink is skipped (ArgumentError -- the existing "skipping skill"
+    # warning). realpath must also stay inside the skill directory or the
+    # skills root, so a skill dir that is itself a symlink out of the tree
+    # cannot launder a regular file from elsewhere.
+    def skill_file_present?(path)
+      File.exist?(path) || File.symlink?(path)
+    end
+
+    def read_skill_file(path, dir)
+      raise ArgumentError, "refuses to follow symlink #{File.basename(path)}" if File.lstat(path).symlink?
+
+      real = File.realpath(path)
+      unless contained_in_skill_tree?(real, dir)
+        raise ArgumentError, "#{File.basename(path)} resolves outside the skill directory"
+      end
+
+      File.read(path)
+    end
+
+    def contained_in_skill_tree?(real_path, dir)
+      root_real = File.realpath(File.dirname(File.expand_path(dir)))
+      dir_real = File.lstat(dir).symlink? ? nil : File.realpath(dir)
+      [root_real, dir_real].compact.any? do |boundary|
+        real_path == boundary || real_path.start_with?("#{boundary}#{File::SEPARATOR}")
+      end
     end
 
     def normalize_tools(tools)

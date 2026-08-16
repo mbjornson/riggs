@@ -114,12 +114,13 @@ module Riggs
       config_file = File.expand_path(".agent_hubrc", base_dir)
       if File.exist?(config_file)
         puts "⏭️  Keeping existing #{config_file} (delete it and re-run setup to regenerate)"
+        puts "Review #{config_file}, then run `riggs trust` to trust this project."
       else
         File.write(config_file, Psych.dump(hub_cfg))
         puts "✅ Created #{config_file}"
+        ProjectTrust.trust!(base_dir, config_path: config_file)
+        puts "✅ Trusted #{config_file} for this machine"
       end
-      ProjectTrust.trust!(base_dir, config_path: config_file)
-      puts "✅ Trusted #{config_file} for this machine"
 
       # Copy example playbook + skill into the project if missing
       example_src = File.expand_path("../../../config/riggs/workflows/example_triage.yml", __dir__)
@@ -143,6 +144,8 @@ module Riggs
     end
 
     desc "trust", "Trust this project's .agent_hubrc (users, roles, MCP) on this machine."
+    method_option :yes, type: :boolean, default: false, aliases: "-y",
+                        desc: "Trust without prompting (for scripts)"
     def trust_project
       path = Identity.config_path
       abort "❌ Missing .agent_hubrc in #{Dir.pwd}. Run 'riggs setup' first." unless path
@@ -151,11 +154,66 @@ module Riggs
       # they are approving, without granting the process identity yet.
       cfg = Identity.load_config_untrusted(path)
       users = (cfg[:users] || {}).keys.map(&:to_s).sort
-      mcp = (cfg[:mcp_servers] || {}).keys.map(&:to_s).sort
       print_header("Trust project config")
       puts "Config: #{File.expand_path(path)}"
       puts "Users:  #{users.empty? ? '(none)' : users.join(', ')}"
-      puts "MCP:    #{mcp.empty? ? '(none)' : mcp.join(', ')}"
+
+      puts "MCP:"
+      mcp = cfg[:mcp_servers]
+      if mcp.is_a?(Hash) && !mcp.empty?
+        mcp.each do |name, spec|
+          spec = {} unless spec.is_a?(Hash)
+          puts "  #{sanitize_for_terminal(name)}:"
+          puts "    command: #{sanitize_for_terminal(spec[:command])}"
+          args = Array(spec[:args]).map { |a| sanitize_for_terminal(a) }
+          puts "    args: #{args.join(' ')}"
+          env = spec[:env]
+          keys = env.is_a?(Hash) ? env.keys.map { |k| sanitize_for_terminal(k) } : []
+          puts "    env keys: #{keys.empty? ? '(none)' : keys.join(', ')}"
+        end
+      else
+        puts "  (none)"
+      end
+
+      puts "Providers:"
+      providers = cfg[:providers]
+      if providers.is_a?(Hash) && !providers.empty?
+        providers.each do |name, spec|
+          spec = {} unless spec.is_a?(Hash)
+          label = sanitize_for_terminal(name)
+          url = spec[:base_url]
+          if url
+            puts "  #{label}: base_url=#{sanitize_for_terminal(url)}"
+          else
+            puts "  #{label}: (no base_url)"
+          end
+        end
+      else
+        puts "  (none)"
+      end
+
+      puts "Roles:"
+      roles = cfg[:roles]
+      if roles.is_a?(Hash) && !roles.empty?
+        roles.each do |name, perms|
+          list = Array(perms).map { |p| sanitize_for_terminal(p) }.join(", ")
+          puts "  #{sanitize_for_terminal(name)}: #{list.empty? ? '(none)' : list}"
+        end
+      else
+        puts "  (none)"
+      end
+
+      confirmed =
+        if options[:yes]
+          true
+        elsif $stdin.respond_to?(:tty?) && $stdin.tty?
+          print "Trust this project's .agent_hubrc? [y/N] "
+          $stdin.gets.to_s.strip.match?(/\Ay(es)?\z/i)
+        else
+          false
+        end
+      abort "❌ Trust aborted. Review .agent_hubrc, then re-run `riggs trust` (use --yes in scripts)." unless confirmed
+
       ProjectTrust.trust!(Dir.pwd, config_path: path)
       puts "✅ Trusted. Re-run `riggs trust` after editing .agent_hubrc."
     end

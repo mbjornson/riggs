@@ -236,17 +236,54 @@ module Riggs
         return builtin unless builtin.nil?
 
         if @mcp_manager
-          server = nil
-          if skill
-            ref = Array(skill[:tools]).find { |t| t[:name].to_s == name }
-            server = ref[:mcp_server] if ref
-          end
+          server = resolve_mcp_server(name, skill)
+          return mcp_pin_denied(name) if server == :denied
+
           return @mcp_manager.call_tool(name, args, server: server)
         end
 
         "TOOL_ERROR: no MCP manager and no built-in for #{name}"
       rescue StandardError => e
         "TOOL_ERROR: #{e.message}"
+      end
+
+      # Skill-listed mcp_server for this tool, or nil if the skill does not
+      # name one. Used both when the pin is empty (current behavior) and when
+      # it is not (the listed server must itself be in the pin).
+      def listed_mcp_server(skill, name)
+        return nil unless skill
+
+        ref = Array(skill[:tools]).find { |t| t[:name].to_s == name }
+        return nil unless ref
+
+        server = ref[:mcp_server].to_s
+        server.empty? ? nil : server
+      end
+
+      # When the skill pins mcp_servers, only those servers may be invoked, and
+      # call_tool must receive that server explicitly -- never nil, which would
+      # let Manager resolve the name across every configured server.
+      def resolve_mcp_server(name, skill)
+        listed = listed_mcp_server(skill, name)
+        pin = skill ? Array(skill[:mcp_servers]).map(&:to_s).reject(&:empty?) : []
+        return listed if pin.empty?
+
+        if listed
+          return listed if pin.include?(listed)
+
+          return :denied
+        end
+
+        match = @mcp_manager.list_tools.find do |mt|
+          mt[:name].to_s == name && pin.include?(mt[:server].to_s)
+        end
+        return match[:server].to_s if match
+
+        :denied
+      end
+
+      def mcp_pin_denied(name)
+        "TOOL_DENIED: tool '#{name}' is not on a server in the skill mcp_servers allow-list"
       end
 
       def cli_only_chain?(chain)

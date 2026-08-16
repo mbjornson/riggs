@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "test_helper"
+require "timeout"
 
 class TestLoader < Minitest::Test
   def test_loads_example_triage
@@ -120,6 +121,62 @@ class TestLoader < Minitest::Test
                  "steps" => [{ "id" => "a", "input" => "x", "output_var" => "out" }] }.merge(overrides)
       File.write("config/riggs/workflows/budget_test.yml", YAML.dump(config))
       return Riggs::Workflow::Loader.load(path: "config/riggs/workflows/budget_test.yml")
+    end
+  end
+
+  # Psych auto-types an unquoted date. permitted_classes must include Date
+  # or a routine `created:` line raises Psych::DisallowedClass.
+  def test_loads_workflow_with_unquoted_date
+    with_tmp_project do
+      File.write("config/riggs/workflows/dated.yml", <<~YAML)
+        name: dated
+        created: 2026-08-05
+        steps:
+          - id: a
+            input: "x"
+      YAML
+
+      workflow = Riggs::Workflow::Loader.load(path: "config/riggs/workflows/dated.yml")
+
+      assert_equal "dated", workflow[:name]
+    end
+  end
+
+  def alias_bomb_workflow_yaml
+    lines = []
+    prev = nil
+    10.times do |i|
+      key = "a#{i}"
+      lines << if prev.nil?
+                 "#{key}: &#{key} [\"leaf\"]"
+               else
+                 "#{key}: &#{key} [#{Array.new(9) { "*#{prev}" }.join(', ')}]"
+               end
+      prev = key
+    end
+    lines << "name: bomb"
+    lines << "steps:"
+    lines << "  - id: a"
+    lines << "    input: *#{prev}"
+    lines.join("\n") + "\n"
+  end
+
+  # Aliases are disabled so Psych raises before deep_symbolize can expand
+  # shared references into a hang. The error must be a WorkflowError the
+  # caller can report, not a raw Psych exception.
+  def test_rejects_workflow_yaml_aliases_without_hanging
+    with_tmp_project do
+      File.write("config/riggs/workflows/bomb.yml", alias_bomb_workflow_yaml)
+
+      error = nil
+      Timeout.timeout(10) do
+        error = assert_raises(Riggs::WorkflowError) do
+          Riggs::Workflow::Loader.load(path: "config/riggs/workflows/bomb.yml")
+        end
+      end
+
+      refute_empty error.message
+      assert_match(/alias|Invalid workflow|Psych/i, error.message)
     end
   end
 end
