@@ -3,6 +3,7 @@
 require "json"
 require "open3"
 require "securerandom"
+require_relative "../providers/cli_runner"
 
 module Riggs
   module MCP
@@ -31,8 +32,14 @@ module Riggs
       def start!
         return self if @wait_thr&.alive?
 
+        raise Error, "MCP command is blank" if @command.nil? || @command.to_s.strip.empty?
+
+        binary = Providers::CliRunner.resolve_binary(@command)
+        raise Error, "MCP binary not found on PATH: #{@command}" unless binary
+
         @initialized = false
-        @stdin, @stdout, @wait_thr = Open3.popen2(@env.transform_keys(&:to_s), @command, *@args)
+        env = @env.transform_keys(&:to_s)
+        @stdin, @stdout, @wait_thr = Open3.popen2(env, binary, *@args)
         initialize_session!
         self
       end
@@ -91,6 +98,8 @@ module Riggs
       def write(obj)
         @stdin.write("#{JSON.generate(obj)}\n")
         @stdin.flush
+      rescue Errno::EPIPE
+        raise Error, "MCP server closed unexpectedly"
       end
 
       def read_response(expected_id)

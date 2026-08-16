@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "date"
 require "psych"
 
 module Riggs
@@ -20,7 +21,7 @@ module Riggs
       }.freeze
 
       def self.load(path:)
-        raw = Psych.safe_load(File.read(path), permitted_classes: [Symbol], aliases: true) || {}
+        raw = parse_yaml(File.read(path))
         cfg = Riggs::Identity.deep_symbolize(raw)
         raise WorkflowError, "Missing required field: name" unless cfg[:name]
         raise WorkflowError, "Workflow must include at least one step" if Array(cfg[:steps]).empty?
@@ -167,7 +168,17 @@ module Riggs
 
         steps.map { |s| dfs.call(s.id, []) }.max || 0
       end
-      private_class_method :detect_cycle, :estimate_max_depth, :dig_context
+
+      # Same treatment as SkillFrontmatter: Date/Time are ordinary workflow
+      # scalars, aliases are not. Rescue names Psych::Exception so a date
+      # field or an alias bomb becomes a WorkflowError the caller can report
+      # instead of a hang inside Identity.deep_symbolize.
+      def self.parse_yaml(contents)
+        Psych.safe_load(contents, permitted_classes: [Symbol, Date, Time], aliases: false) || {}
+      rescue Psych::Exception => e
+        raise WorkflowError, "Invalid workflow YAML (#{e.class}: #{e.message})"
+      end
+      private_class_method :detect_cycle, :estimate_max_depth, :dig_context, :parse_yaml
     end
 
     class NextResolver

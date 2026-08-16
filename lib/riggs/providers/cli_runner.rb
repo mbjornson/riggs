@@ -22,6 +22,8 @@ module Riggs
         argv = [binary, *Array(args).map(&:to_s)]
 
         stdin, stdout, stderr, wait_thr = Open3.popen3(full_env, *argv)
+        out_reader = nil
+        err_reader = nil
         begin
           begin
             stdin.write(stdin_data.to_s)
@@ -46,6 +48,8 @@ module Riggs
           raise_for_failure!(result, argv)
           result
         ensure
+          finish_reader(out_reader)
+          finish_reader(err_reader)
           [stdin, stdout, stderr].each do |io|
             io.close unless io.closed?
           rescue StandardError
@@ -71,6 +75,19 @@ module Riggs
         end
         nil
       end
+
+      def finish_reader(thread)
+        return unless thread
+
+        thread.join(1)
+        return unless thread.alive?
+
+        thread.kill
+        thread.join
+      rescue StandardError
+        nil
+      end
+      private_class_method :finish_reader
 
       def raise_for_failure!(result, argv)
         return if result.status&.success?

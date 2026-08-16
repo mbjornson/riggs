@@ -11,6 +11,15 @@ class TestTriggersSurface < Minitest::Test
     Riggs::Web::App
   end
 
+  def setup
+    @prev_insecure_identity = Riggs::Web::App.insecure_identity
+    Riggs::Web::App.insecure_identity = true
+  end
+
+  def teardown
+    Riggs::Web::App.insecure_identity = @prev_insecure_identity
+  end
+
   def test_triggers_match_cli
     with_tmp_project do
       out, = capture_io { Riggs::CLI.start(["triggers:match", "please triage this"]) }

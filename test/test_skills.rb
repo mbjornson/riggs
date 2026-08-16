@@ -603,4 +603,42 @@ class TestSkills < Minitest::Test
       assert_equal :failed, engine.status
     end
   end
+
+  # prompt.md is read after SKILL.yml. A symlink to a file outside the
+  # skill directory (or the skills root) must not be followed -- that is
+  # how a hostile skill would exfiltrate ~/.ssh or similar. Skip the
+  # whole skill with the existing warning; a sibling in the same root
+  # still loads.
+  def test_a_skill_whose_prompt_md_is_a_symlink_outside_the_dir_is_skipped
+    with_tmp_project do |project|
+      FileUtils.mkdir_p("config/riggs/skills/linked")
+      File.write("config/riggs/skills/linked/SKILL.yml", <<~YAML)
+        name: linked
+        version: "1.0.0"
+      YAML
+      outside = File.join(File.dirname(project), "secret-#{File.basename(project)}.txt")
+      File.write(outside, "SECRET FROM OUTSIDE")
+      File.symlink(outside, File.expand_path("config/riggs/skills/linked/prompt.md"))
+      write_skill_md("healthy", "---\nname: healthy\n---\nSibling body.\n")
+
+      names = nil
+      linked = nil
+      stdout, stderr = capture_io do
+        names = registry.list_names
+        linked = registry.load("linked")
+      end
+
+      refute_includes names, "linked"
+      assert_includes names, "healthy"
+      assert_nil linked
+      refute_equal "SECRET FROM OUTSIDE", linked&.[](:system_prompt)
+      assert_match(/skipping skill/, stderr)
+      assert_match(%r{config/riggs/skills/linked}, stderr)
+      assert_empty stdout
+
+      sibling = nil
+      capture_io { sibling = registry.load("healthy") }
+      assert_equal "Sibling body.\n", sibling[:system_prompt]
+    end
+  end
 end

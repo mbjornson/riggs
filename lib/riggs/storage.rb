@@ -24,6 +24,35 @@ module Riggs
       FROM riggs_provider_calls
     SQL
 
+    # Columns CREATE TABLE IF NOT EXISTS will not add to a table that already
+    # exists. Only ALTER-safe types (no PK, no CURRENT_TIMESTAMP default, NOT
+    # NULL only with a constant default). Empty hashes mean that table has
+    # never gained a column after first ship; keep the key so the next one is
+    # a one-line addition.
+    EXPECTED_COLUMNS = {
+      "riggs_sessions" => { "resume_state" => "TEXT" }.freeze,
+      "riggs_steps" => {}.freeze,
+      "riggs_audit" => {}.freeze,
+      "riggs_messages" => {
+        "content" => "TEXT",
+        "tool_call_id" => "TEXT",
+        "tool_name" => "TEXT",
+        "tool_calls" => "TEXT",
+        "provider" => "TEXT"
+      }.freeze,
+      "riggs_provider_calls" => {
+        "model" => "TEXT",
+        "relay_attempt" => "INTEGER NOT NULL DEFAULT 1",
+        "measured" => "INTEGER NOT NULL DEFAULT 0",
+        "input_tokens" => "INTEGER",
+        "output_tokens" => "INTEGER",
+        "cache_read_tokens" => "INTEGER",
+        "cache_write_tokens" => "INTEGER",
+        "cost_usd" => "REAL"
+      }.freeze,
+      "riggs_memories" => { "context" => "TEXT" }.freeze
+    }.freeze
+
     def initialize(db_path:)
       @db_path = db_path
       FileUtils.mkdir_p(File.dirname(db_path))
@@ -37,8 +66,14 @@ module Riggs
     # CREATE TABLE IF NOT EXISTS never alters a table that already exists, so
     # columns added after a database is in the field need an explicit backfill.
     def ensure_columns!
-      cols = @db.execute("PRAGMA table_info(riggs_sessions)").map { |r| r["name"] }
-      @db.execute("ALTER TABLE riggs_sessions ADD COLUMN resume_state TEXT") unless cols.include?("resume_state")
+      EXPECTED_COLUMNS.each do |table, expected|
+        cols = @db.execute("PRAGMA table_info(#{table})").map { |r| r["name"] }
+        next if cols.empty?
+
+        expected.each do |name, sql_type|
+          @db.execute("ALTER TABLE #{table} ADD COLUMN #{name} #{sql_type}") unless cols.include?(name)
+        end
+      end
     end
 
     def ensure_schema!

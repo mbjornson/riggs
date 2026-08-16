@@ -35,6 +35,12 @@ module Riggs
       # or compact a conversation running on them.
       UNMETERED = %w[cursor cursor_cli cursor_cloud claude_cli anthropic_cli codex openai_cli cli].freeze
 
+      # Keys that choose how a provider is invoked. A workflow may set type,
+      # model, auth, relay_chain, pricing, and other non-invocation keys, but
+      # it must not pick the binary, its args, the HTTP endpoint, the
+      # credential, or the child environment -- those stay hub-only.
+      INVOCATION_KEYS = %i[command args base_url api_key env].freeze
+
       def self.unmetered_chain?(chain)
         names = Array(chain).map(&:to_s)
         !names.empty? && names.all? { |n| UNMETERED.include?(n) }
@@ -220,14 +226,17 @@ module Riggs
         end
       end
 
-      # Merge: hub ← workflow (workflow wins on conflict)
+      # Merge: hub ← workflow (workflow wins), except INVOCATION_KEYS, which
+      # are taken from hub only. A workflow value for those keys is ignored.
       def provider_config(name)
         key = name.to_s
         hub = @hub_providers[key.to_sym] || @hub_providers[key] || {}
         wf = @workflow_providers[key.to_sym] || @workflow_providers[key] || {}
         hub = {} unless hub.is_a?(Hash)
         wf = {} unless wf.is_a?(Hash)
-        Identity.deep_symbolize(hub).merge(Identity.deep_symbolize(wf))
+        hub = Identity.deep_symbolize(hub)
+        wf = Identity.deep_symbolize(wf)
+        hub.merge(wf.except(*INVOCATION_KEYS))
       end
 
       # Non-CLI providers take an API key by definition, so a stray `auth:` on
