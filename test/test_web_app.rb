@@ -3,6 +3,7 @@
 require "test_helper"
 require "rack/test"
 require "json"
+require "timeout"
 
 class TestWebApp < Minitest::Test
   include Rack::Test::Methods
@@ -43,6 +44,82 @@ class TestWebApp < Minitest::Test
       assert_equal 200, last_response.status
       cfg = JSON.parse(last_response.body)
       assert cfg.dig("providers", "x")
+    end
+  end
+
+  def test_config_patch_memory_role_cannot_change_roles_or_mcp
+    with_tmp_project do
+      write_memory_only_user
+      before = File.read(".agent_hubrc")
+
+      header "X-Riggs-User", "mem_erin"
+      header "Content-Type", "application/json"
+      patch "/api/config", JSON.generate("roles" => { "admin" => ["edit_workflow"] })
+      assert_equal 403, last_response.status, last_response.body
+
+      patch "/api/config", JSON.generate("mcp_servers" => { "evil" => { "command" => "true" } })
+      assert_equal 403, last_response.status, last_response.body
+
+      assert_equal before, File.read(".agent_hubrc"), "unauthorized keys must not be written"
+    end
+  end
+
+  def test_config_section_mcp_without_manage_mcp_is_forbidden
+    with_tmp_project do
+      header "X-Riggs-User", "pm_alice"
+      post "/config", {
+        "section" => "mcp",
+        "mcp_name" => ["evil"],
+        "mcp_command" => ["true"],
+        "mcp_args" => [""]
+      }
+      assert_equal 403, last_response.status, last_response.body
+      refute_match(/mcp_servers:\s*\n\s*evil:/, File.read(".agent_hubrc"))
+    end
+  end
+
+  def test_config_yaml_section_rejects_alias_bomb
+    with_tmp_project do
+      header "X-Riggs-User", "pm_alice"
+      Timeout.timeout(10) do
+        post "/config", { "section" => "yaml", "yaml" => alias_bomb_config_yaml }
+      end
+      assert_equal 400, last_response.status, last_response.body
+      assert_match(/alias|Invalid YAML|Psych/i, last_response.body)
+    end
+  end
+
+  def test_config_yaml_section_rejects_non_hash
+    with_tmp_project do
+      header "X-Riggs-User", "pm_alice"
+      post "/config", { "section" => "yaml", "yaml" => "- not\n- a\n- mapping\n" }
+      assert_equal 400, last_response.status, last_response.body
+      assert_match(/mapping|Hash|YAML/i, last_response.body)
+    end
+  end
+
+  def test_api_run_without_auto_approve_pauses_at_gate
+    with_tmp_project do
+      header "X-Riggs-User", "eng_bob"
+      header "Content-Type", "application/json"
+      post "/api/workflows/example_triage/run",
+           JSON.generate("input" => { "ticket" => "Login ERROR timeout" }, "auto_approve" => false)
+      assert_equal 200, last_response.status, last_response.body
+      result = JSON.parse(last_response.body)
+      assert result["session_id"]
+      assert_equal "paused", result["status"]
+    end
+  end
+
+  def test_approving_a_completed_session_is_rejected
+    with_tmp_project do
+      sid = seed_session(status: "completed", events: 1)
+      header "X-Riggs-User", "eng_bob"
+      post "/api/sessions/#{sid}/approve"
+      assert_equal 400, last_response.status, last_response.body
+
+      get "/api/sessions/#{sid}"
+      assert_equal "completed", JSON.parse(last_response.body)["status"]
     end
   end
 
@@ -309,6 +386,32 @@ class TestWebApp < Minitest::Test
     cfg["roles"]["blind"] = ["read_workflow"]
     File.write(".agent_hubrc", Psych.dump(cfg))
     trust_hubrc!
+  end
+
+  def write_memory_only_user
+    cfg = Psych.safe_load(File.read(".agent_hubrc"), permitted_classes: [Symbol, Date, Time], aliases: false)
+    cfg["users"]["mem_erin"] = {
+      "id" => "mem_erin", "name" => "Erin", "role" => "memory", "memory_namespace" => "mem_erin_private"
+    }
+    cfg["roles"]["memory"] = ["configure_memory"]
+    File.write(".agent_hubrc", Psych.dump(cfg))
+    trust_hubrc!
+  end
+
+  def alias_bomb_config_yaml
+    lines = []
+    prev = nil
+    10.times do |i|
+      key = "a#{i}"
+      lines << if prev.nil?
+                 "#{key}: &#{key} [\"leaf\"]"
+               else
+                 "#{key}: &#{key} [#{Array.new(9) { "*#{prev}" }.join(', ')}]"
+               end
+      prev = key
+    end
+    lines << "providers: *#{prev}"
+    "#{lines.join("\n")}\n"
   end
 
   def test_stream_endpoint_emits_sse_frames_and_closes_on_terminal_status

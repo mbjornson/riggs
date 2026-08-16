@@ -178,7 +178,64 @@ class TestResume < Minitest::Test
       storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
       assert_empty storage.list_messages(paused.session_id, step_key: "debug"),
                    "the loser must not have executed the gated step"
+      session = storage.find_session(paused.session_id)
+      assert_equal "running", session["status"],
+                   "the rival already claimed; the loser must not overwrite that with failed"
+      refute_includes storage.list_audit(paused.session_id).map { |r| r["event_type"] }, "workflow_failed"
       storage.close
+    end
+  end
+
+  def test_losing_claim_does_not_mark_the_session_failed
+    with_tmp_project do
+      paused = build_engine(gate_handler: ->(*) { :paused })
+      paused.execute(StringIO.new, input: { ticket: "Production outage ERROR database down" })
+
+      storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
+      assert storage.claim_paused_session(paused.session_id), "the first claim must win"
+      assert_equal "running", storage.find_session(paused.session_id)["status"]
+
+      error = assert_raises(Riggs::WorkflowError) { resume_session(paused.session_id) }
+      assert_match(/claim|already|not paused/i, error.message)
+
+      session = storage.find_session(paused.session_id)
+      assert_equal "running", session["status"],
+                   "a losing resume_session must not write failed onto a session it never claimed"
+      refute_includes storage.list_audit(paused.session_id).map { |r| r["event_type"] }, "workflow_failed"
+      storage.close
+    end
+  end
+
+  def test_resume_persists_memory_to_the_session_namespace_not_the_resumer
+    with_tmp_project do
+      paused = build_engine(gate_handler: ->(*) { :paused })
+      paused.execute(StringIO.new, input: { ticket: "Production outage ERROR database down" })
+
+      approver = Riggs::Identity.resolve(cli_user: "pm_alice")
+      refute_equal paused.instance_variable_get(:@user_identity)[:memory_namespace],
+                   approver[:memory_namespace]
+
+      resumed = Riggs::Workflow::GraphEngine.resume(
+        session_id: paused.session_id,
+        user_identity: approver,
+        workflow: Riggs::Workflow::Loader.load(path: "config/riggs/workflows/example_triage.yml"),
+        db_path: "./db/riggs.sqlite3",
+        hub_config: Riggs::Identity.load_config,
+        skill_registry: Riggs::SkillRegistry.new(roots: ["./config/riggs/skills"]),
+        io: StringIO.new
+      )
+      assert_equal :completed, resumed.status
+
+      storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
+      session = storage.find_session(paused.session_id)
+      assert_equal "eng_bob", session["user_id"], "resume must not rewrite the session owner"
+      assert_equal "eng_bob_private", session["memory_namespace"]
+      storage.close
+
+      namespaces = memory_namespaces
+      assert_includes namespaces, "eng_bob_private"
+      refute_includes namespaces, "team_shared",
+                      "an approver resuming must not persist into their own memory namespace"
     end
   end
 
@@ -199,6 +256,14 @@ class TestResume < Minitest::Test
       end
       state
     end
+  end
+
+  def memory_namespaces
+    db = SQLite3::Database.new("./db/riggs.sqlite3")
+    db.results_as_hash = true
+    rows = db.execute("SELECT DISTINCT namespace FROM riggs_memories")
+    db.close
+    rows.map { |r| r["namespace"] }
   end
 
   def resume_session(session_id, gate_handler: nil, io: StringIO.new)

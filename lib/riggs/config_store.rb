@@ -27,23 +27,22 @@ module Riggs
     end
 
     # Deep-merge patch into existing config and write with backup.
+    # After write the stored fingerprint no longer matches; return the merged
+    # document without going through trusted load_config.
     def merge!(patch)
       raise Error, "Missing config at #{@path}" unless File.exist?(@path)
 
       merged = deep_merge(deep_stringify(read), normalize_patch(patch))
       write!(merged)
-      read
+      Identity.load_config_untrusted(@path)
     end
 
     def write!(config_hash)
       raise Error, "Missing config at #{@path}" unless File.exist?(@path)
+      raise Error, "Config document must be a Hash" unless config_hash.is_a?(Hash)
 
       backup!
       File.write(@path, Psych.dump(deep_stringify(config_hash)))
-      # Operator-authored write through Riggs: refresh the fingerprint so the
-      # next load_config does not demand a fresh `riggs trust` for a change the
-      # operator just made via ConfigStore / the web UI.
-      ProjectTrust.trust!(Dir.pwd, config_path: @path)
       @path
     end
 

@@ -36,11 +36,44 @@ class TestConfigStore < Minitest::Test
       before = store.read
       store.merge!("providers" => { "mock" => { "type" => "mock" }, "extra" => { "type" => "ollama" } })
 
-      after = store.read
+      after = Riggs::Identity.load_config_untrusted(store.path)
       assert_equal "ollama", after.dig(:providers, :extra, :type) || after.dig("providers", "extra", "type")
       assert before[:users] || before["users"]
       backups = Dir.glob(".agent_hubrc.bak.*")
       assert backups.any?, "expected backup file"
+    end
+  end
+
+  def test_write_and_merge_invalidate_project_trust
+    with_tmp_project do
+      store = Riggs::ConfigStore.new
+      assert Riggs::ProjectTrust.trusted?(Dir.pwd, config_path: store.path)
+
+      store.merge!("providers" => { "mock" => { "type" => "mock" } })
+      refute Riggs::ProjectTrust.trusted?(Dir.pwd, config_path: store.path),
+             "merge! must not re-trust after changing .agent_hubrc bytes"
+
+      trust_hubrc!(store.path)
+      assert Riggs::ProjectTrust.trusted?(Dir.pwd, config_path: store.path)
+
+      store.write!("default_user" => "eng_bob", "users" => {})
+      refute Riggs::ProjectTrust.trusted?(Dir.pwd, config_path: store.path),
+             "write! must not re-trust after changing .agent_hubrc bytes"
+    end
+  end
+
+  def test_write_rejects_non_hash_and_leaves_file_intact
+    with_tmp_project do
+      store = Riggs::ConfigStore.new
+      original = File.read(store.path)
+
+      error = assert_raises(Riggs::Error) { store.write!([{ "users" => {} }]) }
+      assert_match(/hash/i, error.message)
+      assert_equal original, File.read(store.path)
+
+      error = assert_raises(Riggs::Error) { store.write!("not-a-document") }
+      assert_match(/hash/i, error.message)
+      assert_equal original, File.read(store.path)
     end
   end
 end

@@ -472,7 +472,7 @@ module Riggs
 
       print_header("Resuming Workflow: #{workflow[:display_name] || session['workflow_name']}")
       puts "👤 User: #{identity[:id]} (#{identity[:role]})"
-      puts "🧠 Memory Scope: #{identity[:memory_namespace]}"
+      puts "🧠 Memory Scope: #{session['memory_namespace'] || identity[:memory_namespace]}"
       puts "🔁 Session: #{session_id} (status=#{session['status']})"
 
       mcp_manager = begin
