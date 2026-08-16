@@ -20,6 +20,18 @@ module Riggs
       path ||= config_path
       raise Error, "Missing .agent_hubrc. Run 'riggs setup' first." unless path && File.exist?(path)
 
+      ProjectTrust.ensure!(Dir.pwd, config_path: path)
+
+      raw = Psych.safe_load(File.read(path), permitted_classes: [Symbol], aliases: true) || {}
+      deep_symbolize(raw)
+    end
+
+    # Load without the trust gate — used by `riggs trust` / setup so the
+    # operator can inspect or write the file that establish trust.
+    def self.load_config_untrusted(path = nil)
+      path ||= config_path
+      raise Error, "Missing .agent_hubrc. Run 'riggs setup' first." unless path && File.exist?(path)
+
       raw = Psych.safe_load(File.read(path), permitted_classes: [Symbol], aliases: true) || {}
       deep_symbolize(raw)
     end

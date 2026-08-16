@@ -18,7 +18,8 @@ module Riggs
       attr_reader :workflow, :user_identity, :session_id, :audit_log, :outputs, :status, :llm_calls
 
       def initialize(workflow:, user_identity:, storage: nil, db_path: nil, hub_config: {}, gate_handler: nil,
-                     provider_router: nil, skill_registry: nil, mcp_manager: nil, mcp_client: nil)
+                     provider_router: nil, skill_registry: nil, mcp_manager: nil, mcp_client: nil,
+                     hooks: nil, event_sink: nil)
         @workflow = workflow
         @user_identity = user_identity
         @hub_config = hub_config || {}
@@ -27,6 +28,9 @@ module Riggs
         @gate_handler = gate_handler || method(:default_gate_handler)
         @skill_registry = skill_registry
         @mcp_manager = mcp_manager || (mcp_client ? MCP::Manager.wrap_client(mcp_client) : nil)
+        @hooks = hooks || Hooks.default(identity: user_identity)
+        # Optional live consumer of audit rows (e.g. CLI --mode json → JSONL).
+        @event_sink = event_sink
         @router = provider_router || Providers::Router.new(
           workflow_providers: workflow[:providers],
           hub_providers: @hub_config[:providers] || {},
@@ -43,7 +47,8 @@ module Riggs
       # Restarts a paused run from its stored resume_state. The gate that paused
       # the run is treated as already approved, so it does not prompt again.
       def self.resume(session_id:, user_identity:, workflow:, db_path:, hub_config: {}, gate_handler: nil,
-                      skill_registry: nil, mcp_manager: nil, storage: nil, io: $stdout)
+                      skill_registry: nil, mcp_manager: nil, storage: nil, io: $stdout,
+                      hooks: nil, event_sink: nil)
         new(
           workflow: workflow,
           user_identity: user_identity,
@@ -52,7 +57,9 @@ module Riggs
           hub_config: hub_config,
           gate_handler: gate_handler,
           skill_registry: skill_registry,
-          mcp_manager: mcp_manager
+          mcp_manager: mcp_manager,
+          hooks: hooks,
+          event_sink: event_sink
         ).resume_session(session_id, io: io)
       end
 
@@ -215,7 +222,9 @@ module Riggs
             max_llm_calls: @workflow[:max_llm_calls],
             timeout_seconds: @workflow[:timeout_seconds],
             started_at: @started_at,
-            session_id: @session_id
+            session_id: @session_id,
+            hooks: @hooks,
+            identity: @user_identity
           )
 
           outcome = loop_runner.run(
@@ -491,7 +500,16 @@ module Riggs
       def log_event(type, payload)
         entry = { event_type: type, payload: payload, at: Time.now.utc.iso8601 }
         @audit_log << entry
-        @storage.audit(session_id: @session_id, event_type: type, payload: payload) if @session_id
+        row_id = @storage.audit(session_id: @session_id, event_type: type, payload: payload) if @session_id
+        return unless @event_sink
+
+        @event_sink.call(
+          "id" => row_id,
+          "session_id" => @session_id,
+          "event_type" => type.to_s,
+          "payload" => JSON.generate(payload),
+          "created_at" => entry[:at]
+        )
       end
 
       def stringify_keys(hash)

@@ -22,6 +22,7 @@ class TestConfigStore < Minitest::Test
             type: anthropic
             api_key: "sk-secret-value"
       YAML
+      trust_hubrc!
 
       view = Riggs::ConfigStore.new.public_view
       assert_equal "••••••••", view.dig("providers", "claude", "api_key")

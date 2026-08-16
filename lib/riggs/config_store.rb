@@ -40,6 +40,10 @@ module Riggs
 
       backup!
       File.write(@path, Psych.dump(deep_stringify(config_hash)))
+      # Operator-authored write through Riggs: refresh the fingerprint so the
+      # next load_config does not demand a fresh `riggs trust` for a change the
+      # operator just made via ConfigStore / the web UI.
+      ProjectTrust.trust!(Dir.pwd, config_path: @path)
       @path
     end
 

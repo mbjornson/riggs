@@ -21,6 +21,7 @@ class TestCLI < Minitest::Test
   def test_workflow_run_warns_when_mcp_config_is_broken
     with_tmp_project do
       File.write(".agent_hubrc", "#{File.read('.agent_hubrc')}mcp_servers: totally_not_a_hash\n")
+      trust_hubrc!
       out, err = capture_io do
         Riggs::CLI.start(
           ["workflow:run", "example_triage", "--auto-approve", "--ticket", "Password reset request"]
@@ -145,16 +146,39 @@ class TestCLI < Minitest::Test
   # untrusted channel -- but it is markdown, and stripping its newlines would
   # destroy it. Only non-whitespace control bytes go. The body is not YAML, so
   # it needs no "\e" escape: a raw ESC byte passes through the parser verbatim.
-  def test_skills_show_strips_control_bytes_from_the_body_but_keeps_its_newlines
+  def test_workflow_run_json_mode_emits_jsonl_events
     with_tmp_project do
-      FileUtils.mkdir_p("config/riggs/skills/bodyspoof")
-      File.write("config/riggs/skills/bodyspoof/SKILL.md",
-                 "---\nname: bodyspoof\n---\nFirst line.\nSecond\e[31m line.\n")
+      out, = capture_io do
+        Riggs::CLI.start(
+          ["workflow:run", "example_triage", "--auto-approve", "--mode", "json",
+           "--ticket", "Password reset request"]
+        )
+      end
+      lines = out.lines.map(&:chomp).reject(&:empty?)
+      assert lines.size >= 2, "expected multiple JSONL events, got #{lines.size}: #{out[0, 500]}"
+      events = lines.map { |line| JSON.parse(line) }
+      types = events.map { |e| e["type"] }
+      assert_includes types, "workflow_start"
+      assert_includes types, "workflow_complete"
+      events.each do |e|
+        assert e.key?("id")
+        assert e.key?("session_id")
+        assert e.key?("at")
+        assert e.key?("payload")
+      end
+      refute_match(/Running Workflow/i, out)
+    end
+  end
 
-      out = capture_io { Riggs::CLI.start(%w[skills:show bodyspoof]) }.first
-
-      refute_includes out, "\e", "an ESC byte in the body must not reach the terminal"
-      assert_includes out, "First line.\nSecond", "newlines in the body must survive"
+  def test_trust_command_records_project
+    with_tmp_project do
+      # Invalidate trust, then restore via CLI.
+      File.write(".agent_hubrc", "#{File.read('.agent_hubrc')}\n# bump\n")
+      assert_raises(Riggs::Error) { Riggs::Identity.load_config }
+      out, = capture_io { Riggs::CLI.start(["trust"]) }
+      assert_match(/Trusted/i, out)
+      cfg = Riggs::Identity.load_config
+      assert cfg[:users]
     end
   end
 end

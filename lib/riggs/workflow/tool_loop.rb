@@ -8,7 +8,7 @@ module Riggs
     # Multi-turn provider ↔ MCP tool execution until final text or guardrails.
     class ToolLoop
       def initialize(router:, mcp_manager:, skill_registry:, audit:, llm_calls:, max_llm_calls:, timeout_seconds:, started_at:,
-                     session_id:, persist: nil, record_call: nil, compactor: nil)
+                     session_id:, persist: nil, record_call: nil, compactor: nil, hooks: nil, identity: nil)
         @router = router
         @mcp_manager = mcp_manager
         @skill_registry = skill_registry
@@ -19,6 +19,8 @@ module Riggs
         @record_call = record_call
         # Same contract again — a loop with no compactor never trims messages.
         @compactor = compactor
+        @hooks = hooks || Hooks.new
+        @identity = identity
         @llm_calls = llm_calls
         @max_llm_calls = max_llm_calls.to_i
         @timeout_seconds = timeout_seconds
@@ -52,13 +54,26 @@ module Riggs
           # answering call is dispatched. Skipping this let max_llm_calls: 1
           # buy two calls.
           check_guardrails!
+          request = @hooks.fire(:before_provider_request, {
+                                  chain: chain,
+                                  messages: messages,
+                                  system: sys,
+                                  tools: tools.empty? ? nil : tools,
+                                  step: step,
+                                  identity: @identity
+                                })
+          call_tools = if request.key?(:tools)
+                         request[:tools]
+                       else
+                         tools.empty? ? nil : tools
+                       end
           result = @router.call(
-            chain: chain,
-            messages: messages,
-            system: sys,
+            chain: request[:chain] || chain,
+            messages: request[:messages] || messages,
+            system: request.key?(:system) ? request[:system] : sys,
             timeout: remaining_timeout,
             session_id: @session_id,
-            tools: tools.empty? ? nil : tools,
+            tools: call_tools,
             on_failed_attempt: ->(provider:, attempt:, **) { record_failed_attempt(step, provider, attempt) }
           )
           @llm_calls += 1
@@ -93,22 +108,44 @@ module Riggs
                        tool_calls: tool_calls, provider: result[:provider])
 
           tool_calls.each do |tc|
+            name = tc[:name].to_s
+            args = tc[:arguments] || {}
+            decision = @hooks.fire(:tool_call, {
+                                     name: name,
+                                     arguments: args,
+                                     step: step,
+                                     identity: @identity,
+                                     builtin: BuiltinTools.builtin?(name)
+                                   })
+            if decision[:deny]
+              out = "TOOL_DENIED: #{decision[:deny]}"
+            else
+              tc = tc.merge(arguments: decision[:arguments] || args)
+              out = execute_tool(tc, skill)
+              result_ctx = @hooks.fire(:tool_result, {
+                                         name: name,
+                                         arguments: tc[:arguments] || {},
+                                         result: out.to_s,
+                                         step: step,
+                                         identity: @identity
+                                       })
+              out = result_ctx[:result]
+            end
             @audit.call(session_id: @session_id, event_type: "tool_call",
-                        payload: { step: step.id, tool: tc[:name], args: tc[:arguments] })
-            io.puts "  🔧 tool #{tc[:name]}(#{tc[:arguments].inspect[0, 80]})"
-            out = execute_tool(tc, skill)
+                        payload: { step: step.id, tool: name, args: tc[:arguments] })
+            io.puts "  🔧 tool #{name}(#{(tc[:arguments] || {}).inspect[0, 80]})"
             @audit.call(session_id: @session_id, event_type: "tool_result",
-                        payload: { step: step.id, tool: tc[:name], preview: out.to_s[0, 200] })
+                        payload: { step: step.id, tool: name, preview: out.to_s[0, 200] })
             io.puts "     → #{out.to_s[0, 100]}"
             messages << {
               role: "tool",
-              name: tc[:name],
+              name: name,
               tool_call_id: tc[:id],
               id: tc[:id],
               content: out.to_s
             }
             persist_turn(role: "tool", content: out.to_s, step_key: step.id,
-                         tool_call_id: tc[:id], tool_name: tc[:name])
+                         tool_call_id: tc[:id], tool_name: name)
           end
         end
       end
@@ -195,11 +232,8 @@ module Riggs
         name = tc[:name].to_s
         args = tc[:arguments] || {}
 
-        # Built-in local stub
-        if name == "lookup_runbook"
-          topic = args[:topic] || args["topic"] || "general"
-          return "Runbook[#{topic}]: Check credentials, rotate tokens, verify upstream health."
-        end
+        builtin = BuiltinTools.call(name, args)
+        return builtin unless builtin.nil?
 
         if @mcp_manager
           server = nil

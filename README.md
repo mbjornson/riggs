@@ -34,17 +34,25 @@ Auth for the web app: logged-in cookie (User page), `X-Riggs-User` header, `?use
 
 ## Identity & RBAC
 
-`.agent_hubrc` defines users and roles:
+`.agent_hubrc` defines users and roles. Before Riggs will load that file (users,
+roles, providers, MCP servers), the project must be **trusted** on this machine —
+an input-loading guard, not a sandbox. `riggs setup` trusts the config it writes;
+after cloning a repo, review `.agent_hubrc` and run `riggs trust`. A content
+change invalidates trust until you trust again (writes through `ConfigStore` /
+the web Config UI refresh the fingerprint automatically).
 
 | Role | Permissions |
 |------|-------------|
 | pm | edit_workflow, manage_skills, configure_memory, publish, read_workflow, inspect_run |
-| engineer | run_workflow, approve_gates, read_workflow, inspect_run |
+| engineer | run_workflow, approve_gates, read_workflow, inspect_run, manage_mcp |
 | viewer | read_workflow, inspect_run |
 
 ```bash
+riggs trust                 # after reviewing .agent_hubrc
 riggs identity:show --user=pm_alice
 riggs workflow:run example_triage --user=eng_bob --auto-approve
+# JSONL audit events on stdout (for scripting / CI):
+riggs workflow:run example_triage --ticket="…" --auto-approve --mode json
 ```
 
 ## Playbooks
@@ -172,6 +180,18 @@ riggs providers:ping cursor
 
 Configure credentials via env or `.agent_hubrc` `providers:`.
 
+**Custom provider classes.** `Providers::Router.new(..., registry:)` merges extra
+name → class entries with the built-in map (`mock`, `anthropic`, `openai`, …).
+Use it from a host process when injecting a test double or an in-house transport
+without patching Riggs:
+
+```ruby
+router = Riggs::Providers::Router.new(
+  hub_providers: cfg[:providers],
+  registry: Riggs::Providers::Router::BUILTINS.merge("acme" => AcmeProvider)
+)
+```
+
 **Unmetered chains.** `cursor`, `cursor_cli`, `cursor_cloud`, `claude_cli`, `anthropic_cli`, `codex`, and `openai_cli` report no token usage — there is nothing in their response to measure. On a relay chain built entirely from those providers there is never an anchor, so every size Riggs computes on that run is a 4-characters-per-token estimate rather than a measurement. Compaction still runs on those estimates, at both the cross-step and tool-loop sites — a run that would otherwise blow its context degrades better by compacting than by growing unbounded — but `reserve_tokens` is absorbing a much larger error than on a metered chain. The run logs one `compaction_unanchored` audit event (`{chain: [...], basis: "character_estimate"}`) per session to say so.
 
 ### Pricing and context windows
@@ -238,7 +258,23 @@ parse is skipped with a warning naming it; the other skills still load.
 Riggs does not read `.agents/skills/`. Copy the skill directory into
 `config/riggs/skills/`.
 
-Skill YAML may declare `tools:` and optional `mcp_servers:` allow-list. GraphEngine runs a multi-turn tool loop: provider may return native `tool_calls` (Anthropic/OpenAI) or `TOOL:name|{json}` (Mock/CLI fallback), results are executed via MCP or built-ins (`lookup_runbook`), then fed back until final text.
+Skill YAML may declare `tools:` and optional `mcp_servers:` allow-list. GraphEngine runs a multi-turn tool loop: provider may return native `tool_calls` (Anthropic/OpenAI) or `TOOL:name|{json}` (Mock/CLI fallback), results are executed via MCP or built-ins (`lookup_runbook` via `Riggs::BuiltinTools`), then fed back until final text.
+
+### Hooks
+
+`GraphEngine` accepts `hooks:` (`Riggs::Hooks`). Events:
+
+- `before_provider_request` — inspect/mutate `chain`, `messages`, `system`, `tools`
+- `tool_call` — set `ctx[:deny]` to veto, or mutate `ctx[:arguments]`
+- `tool_result` — rewrite `ctx[:result]`
+
+Defaults deny non-builtin (MCP) tools when the run identity lacks `manage_mcp`. A host can add stricter role policy without patching `ToolLoop`:
+
+```ruby
+hooks = Riggs::Hooks.default(identity: identity)
+hooks.on(:tool_call) { |ctx| ctx[:deny] = "nope" if ctx[:name] == "lookup_runbook" }
+GraphEngine.new(..., hooks: hooks)
+```
 
 Configure multiple MCP servers in `.agent_hubrc`:
 
