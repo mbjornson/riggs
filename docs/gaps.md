@@ -246,6 +246,50 @@ loads, and neither is ever passed to `File.read`.
 
 ---
 
+## Subagents — a step cannot call another playbook
+
+Raised while dogfooding riggs against a second repository.
+
+**Now:** `StepNode` carries an `agent:` field, but it is a label, not a spawn. Its
+only runtime use is `graph_engine.rb:352`, which interpolates the name into the
+system prompt: `"You are agent 'triage_bot' in Riggs playbook 'example_triage'."`
+Execution is a single-cursor walk — `while current` (`graph_engine.rb:167`)
+advances one step at a time through `next:` conditional routing, and every step
+writes into one flat `@outputs` hash keyed by both `output_var` and step id.
+Steps can name different skills and different providers, so one playbook already
+spans personas and models; they just share one context, one namespace, and one
+process.
+
+**Why it matters:** two things a PM-centric harness wants are currently
+unreachable. A playbook cannot reuse another playbook, so every composite
+workflow is copy-paste and a fix to the copied steps does not propagate. And
+nothing can fan out: reviewing five files, or asking three providers the same
+question to compare, has to be written as five hand-numbered sequential steps
+whose outputs the author names and re-merges by hand.
+
+**Shape:** nested invocation first, because it needs no new execution model — a
+step that names a playbook instead of carrying a prompt, loaded through
+`Workflow::Loader` and run on a child `GraphEngine`, with the child's terminal
+output bound to the parent's `output_var`. Trust and skills already resolve per
+tier, so a nested playbook is gated by the same rules as the outer one. Three
+things do not come for free. The child needs its own `@outputs`, or a step id
+reused across two playbooks silently overwrites the parent's variable.
+`max_llm_calls` has to be charged against the parent's budget rather than
+restarting at the child, or a nested call is an unbounded spend wearing a
+budget's clothes. And a playbook that eventually calls itself has to be refused
+at load rather than discovered at runtime.
+
+Parallel fan-out is the harder half and belongs in its own entry: `while current`
+assumes exactly one cursor, and joining N results means deciding what a single
+`output_var` holds when N steps wrote to it.
+
+**Done when:** a step can name another playbook, the child's result lands in the
+parent's `output_var`, a child cannot overwrite a parent variable it does not
+own, a nested run's spend counts against the parent's `max_llm_calls`, and a
+cycle is refused with a readable error rather than recursing.
+
+---
+
 ## Decided, not a gap — `/api/skills` reports skill text verbatim
 
 From the same adversarial review. Recorded so it reads as a decision rather
