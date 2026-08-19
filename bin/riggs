@@ -1,14 +1,19 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+# Dev binstub: runs the working tree instead of the installed gem. It must not
+# change the working directory -- commands like `setup` and `trust` read Dir.pwd
+# to decide which project they act on, so a chdir here would point them at the
+# Riggs checkout instead of the project the operator is standing in.
 root = File.expand_path("..", __dir__)
-Dir.chdir(root) do
-  begin
-    require "bundler/setup"
-  rescue LoadError
-    # allow running without bundler if gem is installed
-  end
-  $LOAD_PATH.unshift(File.expand_path("lib", root))
-  require "riggs"
-  Riggs.run(ARGV)
+ENV["BUNDLE_GEMFILE"] ||= File.join(root, "Gemfile")
+
+begin
+  require "bundler/setup"
+rescue LoadError
+  # allow running without bundler if gem is installed
 end
+
+$LOAD_PATH.unshift(File.join(root, "lib"))
+require "riggs"
+Riggs.run(ARGV)
