@@ -8,7 +8,7 @@ module Riggs
     # Multi-turn provider ↔ MCP tool execution until final text or guardrails.
     class ToolLoop
       def initialize(router:, mcp_manager:, skill_registry:, audit:, llm_calls:, max_llm_calls:, timeout_seconds:, started_at:,
-                     session_id:, persist: nil, record_call: nil, compactor: nil)
+                     session_id:, persist: nil, record_call: nil, compactor: nil, hooks: nil, identity: nil)
         @router = router
         @mcp_manager = mcp_manager
         @skill_registry = skill_registry
@@ -19,6 +19,8 @@ module Riggs
         @record_call = record_call
         # Same contract again — a loop with no compactor never trims messages.
         @compactor = compactor
+        @identity = identity
+        @hooks = hooks || Hooks.default(identity: @identity)
         @llm_calls = llm_calls
         @max_llm_calls = max_llm_calls.to_i
         @timeout_seconds = timeout_seconds
@@ -52,13 +54,26 @@ module Riggs
           # answering call is dispatched. Skipping this let max_llm_calls: 1
           # buy two calls.
           check_guardrails!
+          request = @hooks.fire(:before_provider_request, {
+                                  chain: chain,
+                                  messages: messages,
+                                  system: sys,
+                                  tools: tools.empty? ? nil : tools,
+                                  step: step,
+                                  identity: @identity
+                                })
+          call_tools = if request.key?(:tools)
+                         request[:tools]
+                       else
+                         tools.empty? ? nil : tools
+                       end
           result = @router.call(
-            chain: chain,
-            messages: messages,
-            system: sys,
+            chain: request[:chain] || chain,
+            messages: request[:messages] || messages,
+            system: request.key?(:system) ? request[:system] : sys,
             timeout: remaining_timeout,
             session_id: @session_id,
-            tools: tools.empty? ? nil : tools,
+            tools: call_tools,
             on_failed_attempt: ->(provider:, attempt:, **) { record_failed_attempt(step, provider, attempt) }
           )
           @llm_calls += 1
@@ -76,7 +91,10 @@ module Riggs
           @last_model = result[:model]
 
           tool_calls = Array(result[:tool_calls])
-          tool_calls = parse_tool_line(result[:content]) if tool_calls.empty? && result[:content].to_s.start_with?("TOOL:")
+          if tools.any? && tool_calls.empty? && result[:content].to_s.start_with?("TOOL:")
+            offered = offered_tool_names(tools)
+            tool_calls = parse_tool_line(result[:content]).select { |tc| offered.include?(tc[:name].to_s) }
+          end
 
           if tool_calls.empty?
             persist_turn(role: "assistant", content: result[:content].to_s, step_key: step.id, provider: result[:provider])
@@ -93,22 +111,44 @@ module Riggs
                        tool_calls: tool_calls, provider: result[:provider])
 
           tool_calls.each do |tc|
+            name = tc[:name].to_s
+            args = tc[:arguments] || {}
+            decision = @hooks.fire(:tool_call, {
+                                     name: name,
+                                     arguments: args,
+                                     step: step,
+                                     identity: @identity,
+                                     builtin: BuiltinTools.builtin?(name)
+                                   })
+            if decision[:deny]
+              out = "TOOL_DENIED: #{decision[:deny]}"
+            else
+              tc = tc.merge(arguments: decision[:arguments] || args)
+              out = execute_tool(tc, skill)
+              result_ctx = @hooks.fire(:tool_result, {
+                                         name: name,
+                                         arguments: tc[:arguments] || {},
+                                         result: out.to_s,
+                                         step: step,
+                                         identity: @identity
+                                       })
+              out = result_ctx[:result]
+            end
             @audit.call(session_id: @session_id, event_type: "tool_call",
-                        payload: { step: step.id, tool: tc[:name], args: tc[:arguments] })
-            io.puts "  🔧 tool #{tc[:name]}(#{tc[:arguments].inspect[0, 80]})"
-            out = execute_tool(tc, skill)
+                        payload: { step: step.id, tool: name, args: tc[:arguments] })
+            io.puts "  🔧 tool #{name}(#{(tc[:arguments] || {}).inspect[0, 80]})"
             @audit.call(session_id: @session_id, event_type: "tool_result",
-                        payload: { step: step.id, tool: tc[:name], preview: out.to_s[0, 200] })
+                        payload: { step: step.id, tool: name, preview: out.to_s[0, 200] })
             io.puts "     → #{out.to_s[0, 100]}"
             messages << {
               role: "tool",
-              name: tc[:name],
+              name: name,
               tool_call_id: tc[:id],
               id: tc[:id],
               content: out.to_s
             }
             persist_turn(role: "tool", content: out.to_s, step_key: step.id,
-                         tool_call_id: tc[:id], tool_name: tc[:name])
+                         tool_call_id: tc[:id], tool_name: name)
           end
         end
       end
@@ -195,18 +235,13 @@ module Riggs
         name = tc[:name].to_s
         args = tc[:arguments] || {}
 
-        # Built-in local stub
-        if name == "lookup_runbook"
-          topic = args[:topic] || args["topic"] || "general"
-          return "Runbook[#{topic}]: Check credentials, rotate tokens, verify upstream health."
-        end
+        builtin = BuiltinTools.call(name, args)
+        return builtin unless builtin.nil?
 
         if @mcp_manager
-          server = nil
-          if skill
-            ref = Array(skill[:tools]).find { |t| t[:name].to_s == name }
-            server = ref[:mcp_server] if ref
-          end
+          server = resolve_mcp_server(name, skill)
+          return mcp_pin_denied(name) if server == :denied
+
           return @mcp_manager.call_tool(name, args, server: server)
         end
 
@@ -215,8 +250,51 @@ module Riggs
         "TOOL_ERROR: #{e.message}"
       end
 
+      # Skill-listed mcp_server for this tool, or nil if the skill does not
+      # name one. Used both when the pin is empty (current behavior) and when
+      # it is not (the listed server must itself be in the pin).
+      def listed_mcp_server(skill, name)
+        return nil unless skill
+
+        ref = Array(skill[:tools]).find { |t| t[:name].to_s == name }
+        return nil unless ref
+
+        server = ref[:mcp_server].to_s
+        server.empty? ? nil : server
+      end
+
+      # When the skill pins mcp_servers, only those servers may be invoked, and
+      # call_tool must receive that server explicitly -- never nil, which would
+      # let Manager resolve the name across every configured server.
+      def resolve_mcp_server(name, skill)
+        listed = listed_mcp_server(skill, name)
+        pin = skill ? Array(skill[:mcp_servers]).map(&:to_s).reject(&:empty?) : []
+        return listed if pin.empty?
+
+        if listed
+          return listed if pin.include?(listed)
+
+          return :denied
+        end
+
+        match = @mcp_manager.list_tools.find do |mt|
+          mt[:name].to_s == name && pin.include?(mt[:server].to_s)
+        end
+        return match[:server].to_s if match
+
+        :denied
+      end
+
+      def mcp_pin_denied(name)
+        "TOOL_DENIED: tool '#{name}' is not on a server in the skill mcp_servers allow-list"
+      end
+
       def cli_only_chain?(chain)
         Providers::Router.unmetered_chain?(chain)
+      end
+
+      def offered_tool_names(tools)
+        BuiltinTools.names | Array(tools).map { |t| (t[:name] || t["name"]).to_s }
       end
 
       def parse_tool_line(content)

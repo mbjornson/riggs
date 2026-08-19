@@ -393,6 +393,73 @@ class TestCompactor < Minitest::Test
 
   # The summarization call runs through a relay chain like any other, so its
   # failed attempts are spend too. Only ToolLoop's own call reported them.
+  def test_call_router_invokes_before_provider_request_when_hooks_given
+    fired = []
+    hooks = Riggs::Hooks.new
+    hooks.on(:before_provider_request) { |ctx| fired << ctx[:messages] }
+
+    calls = []
+    result = Riggs::Workflow::Compactor.new(
+      router: recording_router(calls), chain: ["mock"], budget: 1_000, reserve: 100,
+      keep_recent: 40, hooks: hooks
+    ).compact(messages: long_messages, step_key: "s", model: nil)
+
+    refute_empty fired, "Compactor#call_router must fire before_provider_request when hooks are given"
+    assert_equal 1, calls.length
+    assert_equal "summarized", result[:strategy]
+  end
+
+  def test_call_router_uses_hooked_messages_array
+    hooked = [{ role: "user", content: "hooked summary payload" }]
+    hooks = Riggs::Hooks.new
+    hooks.on(:before_provider_request) { |ctx| ctx[:messages] = hooked }
+
+    calls = []
+    Riggs::Workflow::Compactor.new(
+      router: recording_router(calls), chain: ["mock"], budget: 1_000, reserve: 100,
+      keep_recent: 40, hooks: hooks
+    ).compact(messages: long_messages, step_key: "s", model: nil)
+
+    assert_equal hooked, calls.first[:messages]
+  end
+
+  def test_call_router_degrades_when_before_provider_request_sets_deny
+    hooks = Riggs::Hooks.new
+    hooks.on(:before_provider_request) { |ctx| ctx[:deny] = "no summarization" }
+
+    calls = []
+    events = []
+    result = Riggs::Workflow::Compactor.new(
+      router: recording_router(calls), chain: ["mock"], budget: 1_000, reserve: 100,
+      keep_recent: 40, hooks: hooks, audit: ->(**kw) { events << kw }
+    ).compact(messages: long_messages, step_key: "s", model: nil)
+
+    assert_equal "truncated", result[:strategy]
+    assert_empty calls, "a denied before_provider_request must not call the router"
+    refute_nil events.find { |e| e[:event_type] == "compaction_degraded" }
+  end
+
+  def test_graph_engine_passes_hooks_to_compactor
+    with_tmp_project do
+      fired = []
+      custom = Riggs::Hooks.new
+      custom.on(:before_provider_request) { |_ctx| fired << :engine }
+
+      engine = Riggs::Workflow::GraphEngine.new(
+        workflow: Riggs::Workflow::Loader.load(path: "config/riggs/workflows/example_triage.yml"),
+        user_identity: { id: "test_user", memory_namespace: "test", permissions: %w[run_workflow] },
+        db_path: "./db/riggs.sqlite3",
+        hub_config: Riggs::Identity.load_config,
+        skill_registry: Riggs::SkillRegistry.new(roots: ["./config/riggs/skills"]),
+        hooks: custom
+      )
+      hooks = engine.send(:compactor_for, ["mock"]).instance_variable_get(:@hooks)
+      refute_nil hooks, "GraphEngine#compactor_for must thread hooks into Compactor"
+      hooks.fire(:before_provider_request, { messages: [] })
+      assert_includes fired, :engine
+    end
+  end
+
   def test_compaction_records_its_own_failed_relay_attempts
     recorded = []
     flaky = Class.new(Riggs::Providers::Base) do

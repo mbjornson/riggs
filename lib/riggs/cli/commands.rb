@@ -4,6 +4,7 @@ require "thor"
 require "psych"
 require "fileutils"
 require "json"
+require "stringio"
 require_relative "../identity"
 require_relative "../workflow/loader"
 require_relative "../workflow/graph_engine"
@@ -24,6 +25,8 @@ module Riggs
     end
 
     class_option :user, type: :string, desc: "Override default user from .agent_hubrc"
+    class_option :mode, type: :string, default: "text", enum: %w[text json],
+                        desc: "Output mode: text (default) or json (JSONL audit events on stdout)"
 
     map "identity:show" => :identity_show
     map "config:show" => :config_show
@@ -58,10 +61,11 @@ module Riggs
       Setup.new(riggs_home: Trust.home, cwd: Dir.pwd).call
     end
 
-    desc "trust", "Grant trust for the current project path."
+    desc "trust", "Trust this project's config (users, roles, MCP) on this machine."
+    method_option :yes, type: :boolean, default: false, aliases: "-y",
+                        desc: "Trust without prompting (for scripts)"
     def trust
-      require_permission! %w[run_workflow manage_mcp]
-      trust_commands.grant!(current_resolved.project_path)
+      trust_commands.review_and_grant!(Config::Resolver.project_path, options[:yes])
     end
 
     desc "trust:list", "List trusted project paths and mark missing directories."
@@ -117,6 +121,8 @@ module Riggs
     desc "serve", "Start the Riggs web UI / JSON API (Rack) against the current project."
     method_option :port, type: :numeric, default: 4567, aliases: "-p"
     method_option :bind, type: :string, default: "127.0.0.1", aliases: "-b"
+    method_option :insecure_identity, type: :boolean, default: nil,
+                                      desc: "Trust X-Riggs-User, cookie, and ?user= (default: on for loopback)"
     def serve
       require "rack"
       require "rackup"
@@ -126,8 +132,16 @@ module Riggs
 
       port = options[:port]
       bind = options[:bind]
+      insecure = options[:insecure_identity]
+      insecure = %w[127.0.0.1 localhost].include?(bind.to_s) if insecure.nil?
+      Web::App.insecure_identity = insecure
       puts "🌐 Riggs web UI on http://#{bind}:#{port} (cwd=#{Dir.pwd})"
-      puts "   Auth: cookie user picker, X-Riggs-User header, or ?user="
+      if insecure
+        puts "   Auth: cookie user picker, X-Riggs-User header, or ?user="
+        puts "⚠️  Insecure identity enabled; X-Riggs-User, cookie, and ?user= are trusted"
+      else
+        puts "   Auth: Riggs.identity_mapper only"
+      end
       Rackup::Server.start(
         app: Riggs::Web::App,
         Host: bind,
@@ -275,24 +289,27 @@ module Riggs
     method_option :ticket, type: :string, desc: "Shorthand for input ticket text"
     method_option :auto_approve, type: :boolean, default: false, desc: "Auto-approve HITL gates (CI)"
     def workflow_run(name)
-      require_permission! %w[run_workflow run_owned_workflow]
+      json_mode = options[:mode].to_s == "json"
+      require_permission_for_run!(json_mode)
       workflow = load_runnable_workflow(name)
-      identity = current_identity
+      identity = identity_for_run(json_mode)
       trust = current_trust
       resolved = current_resolved
       cfg = resolved.config
 
-      print_header("Running Workflow: #{workflow[:display_name] || name}")
-      puts "👤 User: #{identity[:id]} (#{identity[:role]})"
-      puts "🧠 Memory Scope: #{identity[:memory_namespace]}"
-      puts "⏱️  Max Calls: #{workflow[:max_llm_calls]}"
+      unless json_mode
+        print_header("Running Workflow: #{workflow[:display_name] || name}")
+        puts "👤 User: #{identity[:id]} (#{identity[:role]})"
+        puts "🧠 Memory Scope: #{identity[:memory_namespace]}"
+        puts "⏱️  Max Calls: #{workflow[:max_llm_calls]}"
+      end
 
       input = (options[:input] || {}).transform_keys(&:to_sym)
       input[:ticket] = options[:ticket] if options[:ticket]
 
       gate_handler = if options[:auto_approve]
                        lambda { |step, io|
-                         io.puts "⏸ Auto-approving gate on '#{step.id}'"
+                         io.puts "⏸ Auto-approving gate on '#{step.id}'" unless json_mode
                          :approved
                        }
                      end
@@ -307,10 +324,18 @@ module Riggs
           interactive: $stdin.tty?
         )
       rescue StandardError => e
-        warn "⚠️  MCP disabled for this run — mcp_servers config error: #{e.message}"
+        warn "⚠️  MCP disabled for this run — mcp_servers config error: #{e.message}" unless json_mode
         nil
       end
 
+      event_sink = if json_mode
+                     lambda { |row|
+                       $stdout.puts Events.to_jsonl(row, session_id: row["session_id"])
+                       $stdout.flush
+                     }
+                   end
+
+      run_io = json_mode ? StringIO.new : $stdout
       engine = Workflow::GraphEngine.new(
         workflow: workflow,
         user_identity: identity,
@@ -318,9 +343,12 @@ module Riggs
         hub_config: cfg,
         gate_handler: gate_handler,
         skill_registry: skill_registry,
-        mcp_manager: mcp_manager
+        mcp_manager: mcp_manager,
+        event_sink: event_sink
       )
-      engine.execute($stdout, input: input)
+      engine.execute(run_io, input: input)
+
+      return if json_mode
 
       FileUtils.mkdir_p("./db/audit")
       File.write(
@@ -348,7 +376,7 @@ module Riggs
 
       print_header("Resuming Workflow: #{workflow[:display_name] || session['workflow_name']}")
       puts "👤 User: #{identity[:id]} (#{identity[:role]})"
-      puts "🧠 Memory Scope: #{identity[:memory_namespace]}"
+      puts "🧠 Memory Scope: #{session['memory_namespace'] || identity[:memory_namespace]}"
       puts "🔁 Session: #{session_id} (status=#{session['status']})"
 
       mcp_manager = begin
@@ -616,13 +644,23 @@ module Riggs
       def current_identity
         return @current_identity if @current_identity
 
-        @current_identity = Identity.resolve(
-          cli_user: options[:user], config: current_resolved.config,
-          project_path: current_resolved.project_path
-        )
+        @current_identity = resolved_identity
         puts "▸ running as #{@current_identity[:id]} (#{@current_identity[:role]}) " \
              "— from #{identity_source_path(@current_identity)}"
         @current_identity
+      end
+
+      def identity_for_run(json_mode)
+        return current_identity unless json_mode
+
+        resolved_identity
+      end
+
+      def resolved_identity
+        Identity.resolve(
+          cli_user: options[:user], config: current_resolved.config,
+          project_path: current_resolved.project_path
+        )
       end
 
       def identity_source_path(identity)
@@ -671,6 +709,19 @@ module Riggs
         abort "⛔ Access denied. '#{identity[:role]}' lacks required permission(s): #{needed.join(' or ')}"
       end
 
+      def require_permission_for_run!(json_mode)
+        return require_permission!(%w[run_workflow run_owned_workflow]) unless json_mode
+
+        require_permission_for_identity!(identity_for_run(true))
+      end
+
+      def require_permission_for_identity!(identity)
+        needed = %w[run_workflow run_owned_workflow]
+        return if needed.intersect?(identity[:permissions])
+
+        abort "⛔ Access denied. '#{identity[:role]}' lacks required permission(s): #{needed.join(' or ')}"
+      end
+
       def load_workflow(name)
         path = Triggers.find_path(name)
         abort "❌ Workflow not found: #{name}.yml" unless path
@@ -685,11 +736,11 @@ module Riggs
         path = Triggers.find_path(name)
         abort "❌ Workflow not found: #{name}.yml" unless path
 
-        runnable(Workflow::Loader.load(path: path), path)
+        runnable(Workflow::Loader.load(path: path), path, identity_for_run(options[:mode].to_s == "json"))
       end
 
-      def runnable(workflow, path)
-        denial = WorkflowAccess.denial(identity: current_identity, workflow: workflow,
+      def runnable(workflow, path, identity)
+        denial = WorkflowAccess.denial(identity: identity, workflow: workflow,
                                        tier: Triggers.tier_for(File.dirname(path)))
         abort "⛔ Access denied. #{denial}" if denial
 

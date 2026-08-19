@@ -3,6 +3,7 @@
 require "json"
 require "open3"
 require "securerandom"
+require_relative "../providers/cli_runner"
 
 module Riggs
   module MCP
@@ -23,8 +24,13 @@ module Riggs
       def start!
         return self if @wait_thr&.alive?
 
+        raise Error, "MCP command is blank" if @command.nil? || @command.to_s.strip.empty?
+
+        binary = Trust.resolve_executable(command: @command, env: @env)
+        raise Error, "MCP binary not found on PATH: #{@command}" if unresolved?(binary)
+
         @initialized = false
-        @stdin, @stdout, @wait_thr = Open3.popen2(spawn_environment, @command, *@args, unsetenv_others: true)
+        @stdin, @stdout, @wait_thr = Open3.popen2(spawn_environment, binary, *@args, unsetenv_others: true)
         initialize_session!
         self
       end
@@ -55,6 +61,12 @@ module Riggs
       end
 
       private
+
+      # Resolved against the SAME environment the approval digest was taken
+      # over, so the binary that runs is the binary the operator approved.
+      def unresolved?(binary)
+        binary.start_with?(Trust::Executable::UNRESOLVED_PREFIX)
+      end
 
       def spawn_environment
         declared_environment.merge("PATH" => path)
@@ -101,6 +113,8 @@ module Riggs
       def write(obj)
         @stdin.write("#{JSON.generate(obj)}\n")
         @stdin.flush
+      rescue Errno::EPIPE
+        raise Error, "MCP server closed unexpectedly"
       end
 
       def read_response(expected_id)

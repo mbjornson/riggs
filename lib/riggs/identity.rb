@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "date"
 require "psych"
 require_relative "config/resolver"
 require_relative "config/merge"
@@ -69,8 +70,18 @@ module Riggs
     def self.load_file!(path)
       raise Error, "Missing config at #{path}. Run 'riggs setup' first." unless File.exist?(path)
 
-      raw = Psych.safe_load(File.read(path), permitted_classes: [Symbol], aliases: true) || {}
-      deep_symbolize(raw)
+      Trust::ConfigGate.default.ensure_file!(path)
+
+      deep_symbolize(parse_yaml(File.read(path)))
+    end
+
+    # Load without the trust gate — used by `riggs trust` / setup so the
+    # operator can inspect or write the file that establish trust.
+    def self.load_config_untrusted(path = nil)
+      path ||= config_path
+      raise Error, "Missing .agent_hubrc. Run 'riggs setup' first." unless path && File.exist?(path)
+
+      deep_symbolize(parse_yaml(File.read(path)))
     end
 
     # project_path is carried on the identity so the session column and the
@@ -106,7 +117,12 @@ module Riggs
     end
 
     def self.permitted?(identity, *needed)
-      needed.flatten.map(&:to_s).all? { |p| identity[:permissions].include?(p) }
+      return false if identity.nil?
+
+      perms = identity[:permissions]
+      return false if perms.nil?
+
+      needed.flatten.map(&:to_s).all? { |p| perms.include?(p) }
     end
 
     def self.deep_symbolize(obj)
@@ -118,6 +134,17 @@ module Riggs
 
       raise Error, "No riggs configuration found. Run 'riggs setup' to create ~/.riggs/config.yml."
     end
+
+    # Same treatment as SkillFrontmatter: Date/Time are ordinary config
+    # scalars, aliases are not. Psych::Exception (not just SyntaxError)
+    # because DisallowedClass and AliasesNotEnabled are the failures a
+    # date field or an alias bomb actually produce.
+    def self.parse_yaml(contents)
+      Psych.safe_load(contents, permitted_classes: [Symbol, Date, Time], aliases: false) || {}
+    rescue Psych::Exception => e
+      raise Error, "Invalid .agent_hubrc (#{e.class}: #{e.message})"
+    end
+    private_class_method :parse_yaml
   end
 
   class IdentitySymbolizer

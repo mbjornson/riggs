@@ -22,6 +22,110 @@ class TestGraphEngine < Minitest::Test
     end
   end
 
+  def test_default_gate_handler_pauses_when_stdin_is_not_a_tty
+    with_tmp_project do
+      engine = Riggs::Workflow::GraphEngine.new(
+        workflow: Riggs::Workflow::Loader.load(path: "config/riggs/workflows/example_triage.yml"),
+        user_identity: Riggs::Identity.resolve(cli_user: "eng_bob"),
+        db_path: "./db/riggs.sqlite3",
+        hub_config: Riggs::Identity.load_config,
+        skill_registry: Riggs::SkillRegistry.new(roots: ["./config/riggs/skills"])
+      )
+      step = engine.workflow[:steps].find(&:approval_gate?)
+      io = StringIO.new
+      io.write("A\n")
+      io.rewind
+
+      result = with_stdin(tty: false, gets_lines: ["A\n"]) do
+        engine.send(:default_gate_handler, step, io)
+      end
+
+      assert_equal :paused, result
+      refute_equal "A", result
+      refute_equal :approved, result
+    end
+  end
+
+  def test_default_gate_handler_does_not_read_approval_from_io
+    with_tmp_project do
+      engine = Riggs::Workflow::GraphEngine.new(
+        workflow: Riggs::Workflow::Loader.load(path: "config/riggs/workflows/example_triage.yml"),
+        user_identity: Riggs::Identity.resolve(cli_user: "eng_bob"),
+        db_path: "./db/riggs.sqlite3",
+        hub_config: Riggs::Identity.load_config,
+        skill_registry: Riggs::SkillRegistry.new(roots: ["./config/riggs/skills"])
+      )
+      step = engine.workflow[:steps].find(&:approval_gate?)
+      io = StringIO.new
+      def io.gets
+        raise "default_gate_handler must not call io.gets for approval"
+      end
+
+      result = with_stdin(tty: false) do
+        engine.send(:default_gate_handler, step, io)
+      end
+
+      assert_equal :paused, result
+    end
+  end
+
+  def test_default_gate_handler_maps_explicit_tty_answers
+    with_tmp_project do
+      engine = Riggs::Workflow::GraphEngine.new(
+        workflow: Riggs::Workflow::Loader.load(path: "config/riggs/workflows/example_triage.yml"),
+        user_identity: Riggs::Identity.resolve(cli_user: "eng_bob"),
+        db_path: "./db/riggs.sqlite3",
+        hub_config: Riggs::Identity.load_config,
+        skill_registry: Riggs::SkillRegistry.new(roots: ["./config/riggs/skills"])
+      )
+      step = engine.workflow[:steps].find(&:approval_gate?)
+
+      approved = with_stdin(tty: true, gets_lines: ["A\n"]) do
+        engine.send(:default_gate_handler, step, StringIO.new)
+      end
+      rejected = with_stdin(tty: true, gets_lines: ["R\n"]) do
+        engine.send(:default_gate_handler, step, StringIO.new)
+      end
+      edited = with_stdin(tty: true, gets_lines: ["E\n", "rewrite the plan\n"]) do
+        engine.send(:default_gate_handler, step, StringIO.new)
+      end
+      unknown = with_stdin(tty: true, gets_lines: ["maybe\n"]) do
+        engine.send(:default_gate_handler, step, StringIO.new)
+      end
+
+      assert_equal :approved, approved
+      assert_equal :rejected, rejected
+      assert_equal :approved, edited
+      assert_equal "rewrite the plan", engine.outputs[:gate_edit]
+      assert_equal :paused, unknown
+    end
+  end
+
+  def test_cli_workflow_run_without_auto_approve_pauses_at_gates_in_json_mode
+    with_tmp_project do
+      out = nil
+      with_stdin(tty: false) do
+        out, = capture_io do
+          Riggs::CLI.start(
+            ["workflow:run", "example_triage", "--mode", "json",
+             "--ticket", "Production outage ERROR database down"]
+          )
+        end
+      end
+
+      events = out.lines.map(&:chomp).reject(&:empty?).map { |line| JSON.parse(line) }
+      types = events.map { |e| e["type"] }
+      assert_includes types, "gate_pause"
+      refute_includes types, "workflow_complete",
+                      "json mode without --auto-approve must pause, not silent-approve"
+
+      session_id = events.first["session_id"]
+      storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
+      assert_equal "paused", storage.find_session(session_id)["status"]
+      storage.close
+    end
+  end
+
   def test_an_unrecognised_gate_result_is_treated_as_approved
     with_tmp_project do
       engine = Riggs::Workflow::GraphEngine.new(
@@ -431,6 +535,18 @@ class TestGraphEngine < Minitest::Test
     rows = storage.list_audit(paused.session_id).select { |r| r["event_type"] == "compaction_unanchored" }
     assert_equal 1, rows.length,
                  "compaction_unanchored must fire once per SESSION, not once per GraphEngine instance"
+  end
+
+  def with_stdin(tty:, gets_lines: [])
+    fake = Object.new
+    fake.define_singleton_method(:tty?) { tty }
+    lines = Array(gets_lines).dup
+    fake.define_singleton_method(:gets) { lines.shift }
+    original = $stdin
+    $stdin = fake
+    yield
+  ensure
+    $stdin = original
   end
 
   private

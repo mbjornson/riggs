@@ -19,6 +19,11 @@ module Riggs
       # Where exec looks when PATH is unset in the child.
       DEFAULT_PATH = "/bin:/usr/bin"
 
+      # A name PATH does not answer for still has to digest to something
+      # stable, so it resolves to this prefix plus the name. Callers that
+      # spawn -- rather than digest -- check for it and refuse.
+      UNRESOLVED_PREFIX = "unresolved:"
+
       def self.resolve(command:, env:)
         new(command: command, env: env).path
       end
@@ -32,7 +37,7 @@ module Riggs
       # binds something stable and the spawn fails on its own terms, not here.
       def path
         return unresolved unless resolvable?
-        return realpath(File.expand_path(@command)) if qualified?
+        return qualified_path if qualified?
 
         found = candidates.detect { |candidate| runnable?(candidate) }
         return unresolved if found.nil?
@@ -53,7 +58,7 @@ module Riggs
       end
 
       def unresolved
-        "unresolved:#{@command}"
+        "#{UNRESOLVED_PREFIX}#{@command}"
       end
 
       # A declaration whose env is not a mapping forwards no variables. Calling
@@ -66,6 +71,13 @@ module Riggs
 
       def qualified?
         @command.include?(File::SEPARATOR)
+      end
+
+      def qualified_path
+        candidate = File.expand_path(@command)
+        return unresolved unless runnable?(candidate)
+
+        realpath(candidate)
       end
 
       def candidates

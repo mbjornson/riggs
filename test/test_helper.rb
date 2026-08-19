@@ -95,6 +95,13 @@ module RiggsTestHelpers
         mock:
           type: mock
     YAML
+    trust_hubrc!
+  end
+
+  def trust_hubrc!
+    trust = Riggs::Trust.default
+    trust.grant!(Riggs::Config::Resolver.project_path)
+    trust.record_config!(Riggs::Config::Resolver.project_path, ".agent_hubrc")
   end
 
   def copy_example_workflow

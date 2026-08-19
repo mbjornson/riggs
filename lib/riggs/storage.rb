@@ -24,9 +24,34 @@ module Riggs
       FROM riggs_provider_calls
     SQL
 
-    # Columns riggs_sessions gained after the table shipped. A database in the
-    # field predates each of them independently, so every entry is checked.
-    SESSION_COLUMNS = { "resume_state" => "TEXT", "project_path" => "TEXT" }.freeze
+    # Columns CREATE TABLE IF NOT EXISTS will not add to a table that already
+    # exists. Only ALTER-safe types (no PK, no CURRENT_TIMESTAMP default, NOT
+    # NULL only with a constant default). Empty hashes mean that table has
+    # never gained a column after first ship; keep the key so the next one is
+    # a one-line addition.
+    EXPECTED_COLUMNS = {
+      "riggs_sessions" => { "resume_state" => "TEXT", "project_path" => "TEXT" }.freeze,
+      "riggs_steps" => {}.freeze,
+      "riggs_audit" => {}.freeze,
+      "riggs_messages" => {
+        "content" => "TEXT",
+        "tool_call_id" => "TEXT",
+        "tool_name" => "TEXT",
+        "tool_calls" => "TEXT",
+        "provider" => "TEXT"
+      }.freeze,
+      "riggs_provider_calls" => {
+        "model" => "TEXT",
+        "relay_attempt" => "INTEGER NOT NULL DEFAULT 1",
+        "measured" => "INTEGER NOT NULL DEFAULT 0",
+        "input_tokens" => "INTEGER",
+        "output_tokens" => "INTEGER",
+        "cache_read_tokens" => "INTEGER",
+        "cache_write_tokens" => "INTEGER",
+        "cost_usd" => "REAL"
+      }.freeze,
+      "riggs_memories" => { "context" => "TEXT" }.freeze
+    }.freeze
 
     def initialize(db_path:)
       @db_path = db_path
@@ -43,12 +68,14 @@ module Riggs
     # Declared rather than hardcoded per column: the one-ALTER version stopped
     # at the first absent name, so a database missing two columns got one.
     def ensure_columns!
-      cols = @db.execute("PRAGMA table_info(riggs_sessions)").map { |r| r["name"] }
-      SESSION_COLUMNS.each { |name, type| add_session_column(name, type) unless cols.include?(name) }
-    end
+      EXPECTED_COLUMNS.each do |table, expected|
+        cols = @db.execute("PRAGMA table_info(#{table})").map { |r| r["name"] }
+        next if cols.empty?
 
-    def add_session_column(name, type)
-      @db.execute("ALTER TABLE riggs_sessions ADD COLUMN #{name} #{type}")
+        expected.each do |name, sql_type|
+          @db.execute("ALTER TABLE #{table} ADD COLUMN #{name} #{sql_type}") unless cols.include?(name)
+        end
+      end
     end
 
     def ensure_schema!
@@ -205,6 +232,7 @@ module Riggs
         "INSERT INTO riggs_audit (session_id, event_type, payload) VALUES (?, ?, ?)",
         [utf8(session_id), event_type, JSON.generate(payload)]
       )
+      @db.last_insert_row_id
     end
 
     def list_audit(session_id)

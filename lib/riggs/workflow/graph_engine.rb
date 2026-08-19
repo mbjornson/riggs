@@ -18,7 +18,8 @@ module Riggs
       attr_reader :workflow, :user_identity, :session_id, :audit_log, :outputs, :status, :llm_calls
 
       def initialize(workflow:, user_identity:, storage: nil, db_path: nil, hub_config: {}, gate_handler: nil,
-                     provider_router: nil, skill_registry: nil, mcp_manager: nil, mcp_client: nil)
+                     provider_router: nil, skill_registry: nil, mcp_manager: nil, mcp_client: nil,
+                     hooks: nil, event_sink: nil)
         @workflow = workflow
         @user_identity = user_identity
         @hub_config = hub_config || {}
@@ -27,6 +28,10 @@ module Riggs
         @gate_handler = gate_handler || method(:default_gate_handler)
         @skill_registry = skill_registry
         @mcp_manager = mcp_manager || (mcp_client ? MCP::Manager.wrap_client(mcp_client) : nil)
+        @hooks = Hooks.default(identity: user_identity)
+        @hooks.merge!(hooks) if hooks
+        # Optional live consumer of audit rows (e.g. CLI --mode json → JSONL).
+        @event_sink = event_sink
         @router = provider_router || Providers::Router.new(
           workflow_providers: workflow[:providers],
           hub_providers: @hub_config[:providers] || {},
@@ -38,12 +43,15 @@ module Riggs
         @llm_calls = 0
         @started_at = nil
         @compaction_announced = false
+        @claimed = false
+        @memory_namespace = @user_identity[:memory_namespace]
       end
 
       # Restarts a paused run from its stored resume_state. The gate that paused
       # the run is treated as already approved, so it does not prompt again.
       def self.resume(session_id:, user_identity:, workflow:, db_path:, hub_config: {}, gate_handler: nil,
-                      skill_registry: nil, mcp_manager: nil, storage: nil, io: $stdout)
+                      skill_registry: nil, mcp_manager: nil, storage: nil, io: $stdout,
+                      hooks: nil, event_sink: nil)
         new(
           workflow: workflow,
           user_identity: user_identity,
@@ -52,7 +60,9 @@ module Riggs
           hub_config: hub_config,
           gate_handler: gate_handler,
           skill_registry: skill_registry,
-          mcp_manager: mcp_manager
+          mcp_manager: mcp_manager,
+          hooks: hooks,
+          event_sink: event_sink
         ).resume_session(session_id, io: io)
       end
 
@@ -100,7 +110,19 @@ module Riggs
         current = steps_by_id[state[:current_step_id].to_s]
         raise WorkflowError, "Resume step '#{state[:current_step_id]}' is not in workflow '#{@workflow[:name]}'" unless current
 
+        # Atomic paused->running claim. Must happen before @session_id is set:
+        # the rescue below writes workflow_failed only for a winner, and a
+        # loser that already held @session_id would stamp failed onto a run
+        # someone else just claimed.
+        unless @storage.claim_paused_session(session_id)
+          raise WorkflowError, "Session #{session_id} was already claimed by another resumer"
+        end
+
+        @claimed = true
+
         @session_id = session_id
+        ns = session["memory_namespace"]
+        @memory_namespace = ns unless ns.nil? || ns.to_s.empty?
         # timeout_seconds restarts from the resume instant; max_llm_calls does not.
         @started_at = Time.now
         @outputs = state[:outputs].is_a?(Hash) ? state[:outputs] : {}
@@ -113,24 +135,22 @@ module Riggs
         # even for a session paused before this guard existed.
         @compaction_announced = already_announced_unanchored_compaction?
 
-        # Atomic paused->running claim. The checks above give good error
-        # messages, but only this decides who actually runs: a second resumer
-        # that passed those same checks concurrently loses here rather than
-        # executing the gated step a second time.
-        unless @storage.claim_paused_session(session_id)
-          raise WorkflowError, "Session #{session_id} was already claimed by another resumer"
-        end
-
-        @storage.save_resume_state(session_id, nil)
+        # Leave resume_state in place until the run is no longer paused.
+        # claim_paused_session already prevents a second execution; clearing
+        # here would make a failed resume unrestorable.
         log_event("workflow_resume", { step: current.id, llm_calls: @llm_calls })
         io.puts "▶ Resuming session #{session_id} at step '#{current.id}'"
 
-        run_steps(current, io, gate_pre_approved: true)
+        result = run_steps(current, io, gate_pre_approved: true)
+        @storage.save_resume_state(session_id, nil) unless @status == :paused
+        result
       rescue StandardError => e
         @status = :failed
-        # Audit before the status flips, for the same reason as the success path.
-        log_event("workflow_failed", { error: e.message }) if @session_id
-        @storage.update_session(@session_id, status: "failed", ended: true) if @session_id
+        if @claimed && @session_id
+          # Audit before the status flips, for the same reason as the success path.
+          log_event("workflow_failed", { error: e.message })
+          @storage.update_session(@session_id, status: "failed", ended: true)
+        end
         raise
       ensure
         @mcp_manager&.close
@@ -214,7 +234,9 @@ module Riggs
             max_llm_calls: @workflow[:max_llm_calls],
             timeout_seconds: @workflow[:timeout_seconds],
             started_at: @started_at,
-            session_id: @session_id
+            session_id: @session_id,
+            hooks: @hooks,
+            identity: @user_identity
           )
 
           outcome = loop_runner.run(
@@ -407,7 +429,8 @@ module Riggs
           # So a summarization failure the Compactor rescues lands in this
           # run's event stream rather than only on stderr.
           audit: method(:audit_bridge),
-          session_id: @session_id
+          session_id: @session_id,
+          hooks: @hooks
         )
       end
 
@@ -444,7 +467,7 @@ module Riggs
       def persist_memory(step, content)
         mem_cfg = @hub_config[:sqlite_memory] || {}
         memory = MemoryService.new(
-          namespace: @user_identity[:memory_namespace],
+          namespace: @memory_namespace || @user_identity[:memory_namespace],
           db_path: @db_path,
           config: mem_cfg
         )
@@ -467,30 +490,42 @@ module Riggs
       def default_gate_handler(step, io)
         io.puts "⏸ HITL gate on '#{step.id}' — Approve / Edit / Reject? [A/E/R]"
         io.print "> "
-        answer = if io.respond_to?(:gets) && (line = io.gets)
-                   line
-                 elsif $stdin.tty?
-                   $stdin.gets
-                 else
-                   "A"
-                 end
-        case answer.to_s.strip.upcase
+        # Never read `io` for the answer: workflow:run --mode json passes a
+        # StringIO (or $stdout), and $stdout.gets raises IOError. Approval is
+        # a TTY conversation on $stdin, or a pause for unattended runs.
+        return :paused unless $stdin.tty?
+
+        line = $stdin.gets
+        return :paused if line.nil?
+
+        case line.to_s.strip.upcase
         when "E", "EDIT"
           io.puts "Enter edited instruction (single line):"
-          edited = ($stdin.tty? ? $stdin.gets : nil).to_s.strip
+          edited = $stdin.gets.to_s.strip
           @outputs[:gate_edit] = edited unless edited.empty?
           :approved
         when "R", "REJECT"
           :rejected
-        else
+        when "A", "APPROVE"
           :approved
+        else
+          :paused
         end
       end
 
       def log_event(type, payload)
         entry = { event_type: type, payload: payload, at: Time.now.utc.iso8601 }
         @audit_log << entry
-        @storage.audit(session_id: @session_id, event_type: type, payload: payload) if @session_id
+        row_id = @storage.audit(session_id: @session_id, event_type: type, payload: payload) if @session_id
+        return unless @event_sink
+
+        @event_sink.call(
+          "id" => row_id,
+          "session_id" => @session_id,
+          "event_type" => type.to_s,
+          "payload" => JSON.generate(payload),
+          "created_at" => entry[:at]
+        )
       end
 
       def stringify_keys(hash)

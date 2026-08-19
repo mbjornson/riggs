@@ -54,11 +54,15 @@ module Riggs
       Document.mask(Document.stringify(read))
     end
 
+    # Deep-merge patch into existing config and write with backup.
+    # After the write the recorded fingerprint no longer matches the file, so
+    # the merged document is returned by an untrusted read rather than by
+    # going back through the trust gate the write just invalidated.
     def merge!(patch)
       raise Error, "Missing config at #{@path}" unless File.exist?(@path)
 
       write!(Document.deep_merge(Document.stringify(read), Document.stringify(patch)))
-      read
+      Identity.load_config_untrusted(@path)
     end
 
     # Validation precedes backup! deliberately. This is reachable from POST
@@ -67,6 +71,7 @@ module Riggs
     # hand-edited it, an outage a remote form could cause.
     def write!(config_hash)
       raise Error, "Missing config at #{@path}" unless File.exist?(@path)
+      raise Error, "Config document must be a Hash" unless config_hash.is_a?(Hash)
 
       document = Document.without_metadata(Document.stringify(config_hash))
       Validator.new(path: @path, tier: @tier).validate!(document)

@@ -5,86 +5,58 @@ Open items from comparing Riggs against [Pi](https://pi.dev)'s agent harness on
 multi-user playbook orchestrator, so only the shared substrate is comparable —
 context control, session durability, observability, extensibility, and trust.
 
-Seven items came out of that comparison. Five have shipped: two in
-[`specs/phase6-persistence-and-events.md`](specs/phase6-persistence-and-events.md),
-two in
-[`specs/phase7-token-accounting-and-compaction.md`](specs/phase7-token-accounting-and-compaction.md),
-and one in
-[`specs/phase8-skill-md-frontmatter.md`](specs/phase8-skill-md-frontmatter.md):
+Seven items came out of that comparison. All seven have shipped:
 
 - ~~**#1** Message persistence and gate pause/resume~~ — shipped
-- ~~**#4** Audit event stream (poll + SSE)~~ — shipped
-- ~~**#2** Token accounting~~ — shipped. A completed run reports tokens in/out
-  and cost per step and per session, each with coverage on both counters.
-  That is the figure [`token-ledger.md`](token-ledger.md)'s "Tokens in/out"
-  column asks for — what a user spent building a feature — so for a feature
-  built by running Riggs workflows, `riggs workflow:inspect SESSION_ID` now
-  fills the column directly, as the original "done when" anticipated. What it
-  cannot do is populate rows whose work happened outside Riggs: rows 1–3 are
-  Riggs' own features, built in Claude Code sessions rather than through Riggs,
-  so those figures are still read from `/cost` by hand.
-- ~~**#3** Token-based context window and compaction~~ — shipped.
+  ([`specs/phase6-persistence-and-events.md`](specs/phase6-persistence-and-events.md))
+- ~~**#4** Audit event stream (poll + SSE)~~ — shipped (Phase 6)
+- ~~**#2** Token accounting~~ — shipped
+  ([`specs/phase7-token-accounting-and-compaction.md`](specs/phase7-token-accounting-and-compaction.md)).
+  A completed run reports tokens in/out and cost per step and per session, each
+  with coverage on both counters. That is the figure
+  [`token-ledger.md`](token-ledger.md)'s "Tokens in/out" column asks for — what
+  a user spent building a feature — so for a feature built by running Riggs
+  workflows, `riggs workflow:inspect SESSION_ID` now fills the column directly,
+  as the original "done when" anticipated. What it cannot do is populate rows
+  whose work happened outside Riggs: rows 1–3 are Riggs' own features, built in
+  Claude Code sessions rather than through Riggs, so those figures are still
+  read from `/cost` by hand.
+- ~~**#3** Token-based context window and compaction~~ — shipped (Phase 7).
   `context_window` is now a token budget (`short`/`medium`/`full`/an integer),
   not a step count, and a run whose transcript exceeds it compacts instead of
   erroring.
-- ~~**#7** Read `SKILL.md` frontmatter~~ — shipped. A skill bundle may be
-  `SKILL.md` (YAML frontmatter plus a markdown body) or `SKILL.yml`, sharing
-  one key space. Discovery is unchanged: `.agents/skills/` is deliberately not
-  a root, since a repo-local one is gap #6's exposure.
+- ~~**#7** Read `SKILL.md` frontmatter~~ — shipped
+  ([`specs/phase8-skill-md-frontmatter.md`](specs/phase8-skill-md-frontmatter.md)).
+  A skill bundle may be `SKILL.md` (YAML frontmatter plus a markdown body) or
+  `SKILL.yml`, sharing one key space. Discovery is unchanged: `.agents/skills/`
+  is deliberately not a root.
+- ~~**#5** Hook bus~~ — shipped
+  ([`specs/phase11-hook-bus.md`](specs/phase11-hook-bus.md)).
+  `Riggs::Hooks` provides `before_provider_request`, `tool_call` (veto + mutate),
+  and `tool_result`. `lookup_runbook` lives in `Riggs::BuiltinTools`. A host can
+  deny a tool call by role without patching `ToolLoop`. Default policy denies
+  non-builtin (MCP) tools when the identity lacks `manage_mcp`.
+- ~~**#6** Project trust boundary~~ — shipped
+  ([`specs/phase12-project-trust.md`](specs/phase12-project-trust.md)).
+  `Identity.load_config` refuses an untrusted project `.agent_hubrc`. Trust is
+  recorded under `~/.riggs/` (or `RIGGS_TRUST_HOME`) keyed by project path and
+  config fingerprint. `riggs setup` auto-trusts; otherwise run `riggs trust`
+  (TTY prompts once). Cloning a hostile repo cannot grant roles or run MCP
+  commands until the operator trusts the file.
 
-The two below are open. Original numbering is kept so the ranking stays legible.
-Gaps found outside that comparison are collected at the end, labelled as such.
-
----
-
-## #5 — Hook bus
-
-**Now:** No extension points. `lookup_runbook` is hardcoded inside
-`ToolLoop#execute_tool`. RBAC gates *starting* a workflow but has no say in what
-tools that workflow then invokes.
-
-**Why it matters:** Every new cross-cutting behavior currently means editing core.
-Pi's position is "primitives, not features" — it ships interception points
-(`tool_call` can block and mutate arguments, `tool_result` can rewrite output,
-`context` filters messages, `before_provider_request` inspects payloads) and lets
-extensions supply the features.
-
-**Shape:** `gate_handler:` already proves the injectable-callable pattern fits
-this codebase. Generalize it to `before_provider_request`, `tool_call`
-(veto + mutate), and `tool_result`. Then `lookup_runbook` moves out of core, and
-a policy hook can enforce RBAC at tool-call time.
-
-**Also:** `Providers::Router` already accepts `registry:` for custom providers.
-That is undocumented and belongs in the README.
-
-**Done when:** A host can deny a tool call by role without patching `ToolLoop`.
+Gaps found outside that comparison remain below, labelled as such.
 
 ---
 
-## #6 — Project trust boundary
+## ~~#5 — Hook bus~~ — shipped
 
-**Now:** `.agent_hubrc` is read from `Dir.pwd`. It declares users, roles, provider
-credentials, and MCP servers with their `command`, `args`, and `env`.
+See [`specs/phase11-hook-bus.md`](specs/phase11-hook-bus.md).
 
-**Why it matters:** This is the one item here that is a security property rather
-than a feature gap. A cloned repository supplies both the code that runs and the
-identity model that authorizes it — it can declare itself `pm` and register an
-MCP server whose `command` is arbitrary, which `riggs mcp:ping` will execute.
+---
 
-RBAC is not a substitute, because the two answer different questions:
+## ~~#6 — Project trust boundary~~ — shipped
 
-- **RBAC** — "what may this authenticated principal do?"
-- **Trust** — "may this file define principals at all?"
-
-Riggs derives the first from an artifact that has no answer to the second.
-
-**Shape:** Either a one-time trust prompt before loading anything project-local
-(Pi's `project_trust`, which its docs are careful to describe as an input-loading
-guard and explicitly *not* a sandbox), or split the file so identity and roles
-resolve from `~/.riggs/` while only workflows and skills come from the repo.
-
-**Done when:** Cloning a hostile repo and running a Riggs command cannot execute
-attacker-chosen commands or grant attacker-chosen roles.
+See [`specs/phase12-project-trust.md`](specs/phase12-project-trust.md).
 
 **Spec:** `docs/specs/phase11-config-tiers-and-project-trust.md` (approved, not
 yet implemented). Takes both halves of the shape above rather than choosing
@@ -97,13 +69,10 @@ new command silently. Split into 11a (tiers, trust, approval) and 11b
 
 ---
 
-## Deferred from Phase 6
+## ~~Deferred from Phase 6 — CLI `--mode json`~~ — shipped
 
-**CLI `--mode json` event output.** Cut from the event-stream work only because
-it spanned two parallel agents' file ownership (`cli/commands.rb` and
-`events.rb`), not for any design reason. `Riggs::Events.to_jsonl` already exists
-and is tested for exactly this. Pi's equivalent is `pi --mode json`, which emits
-JSONL to stdout for scripting and CI.
+`riggs workflow:run … --mode json` emits one JSONL audit event per line on
+stdout via `Riggs::Events.to_jsonl` (Pi's `pi --mode json` equivalent).
 
 ---
 
@@ -121,7 +90,8 @@ prior intent rather than as untrusted data. This is an escalation of an exposure
 that already exists — tool output reaches the context either way — but the
 role change is what removes the last signal that it came from outside. A
 `role: "user"` summary turn, or an explicit `[untrusted, summarized]` marker,
-would keep the provenance. Related to #6: this repo has no trust boundary yet.
+would keep the provenance. Related to #6: project trust now gates `.agent_hubrc`,
+but compaction still launders tool output into the assistant voice.
 
 **Compaction's summary prompt overpromises on identifiers.** The prompt asks the
 model to "preserve identifiers", but `summarize` serializes only `role` and
@@ -215,14 +185,13 @@ Not from the Pi comparison. Surfaced by the whole-branch review of Phase 8,
 which found and fixed this pattern in the skill loader and then noticed the same
 two lines elsewhere.
 
-**Now:** Phase 8 hardened both skill-loading call sites to
-`permitted_classes: [Symbol, Date, Time], aliases: false`, and widened the
-rescue around them to `Psych::Exception`. Three other call sites still read
-`permitted_classes: [Symbol], aliases: true`, with no equivalent rescue:
+**Now:** Phase 8 hardened both skill-loading call sites. The three other
+sites (identity, workflow loader, web YAML) now use the same
+`permitted_classes: [Symbol, Date, Time], aliases: false` treatment. The web
+YAML path is also size-capped and key-scoped by permission. Left as residual:
+JSON request bodies still have no middleware size cap, and MCP stdout lines
+are still unbounded.
 
-- `lib/riggs/identity.rb:23` — `.agent_hubrc`
-- `lib/riggs/workflow/loader.rb:23` — workflow YAML
-- `lib/riggs/web/app.rb:265` — `req.params["yaml"]`, i.e. YAML posted over HTTP
 
 **Why it matters:** two distinct failure modes, both demonstrated on the skill
 path before Phase 8 closed them there.

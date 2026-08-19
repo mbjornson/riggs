@@ -87,10 +87,20 @@ class TestIdentityTiers < Minitest::Test
 
   def test_load_config_with_an_explicit_path_still_reads_only_that_file
     sandbox do |root, _trust, _global|
-      path = File.join(root, "standalone.yml")
-      File.write(path, Psych.dump("default_user" => "solo", "users" => { "solo" => { "role" => "viewer" } }))
-      cfg = Riggs::Identity.load_config(path)
-      assert_equal "solo", cfg[:default_user]
+      with_riggs_home(root) do
+        path = Riggs::Config::Resolver.global_config
+        File.write(path, Psych.dump("default_user" => "solo", "users" => { "solo" => { "role" => "viewer" } }))
+        cfg = Riggs::Identity.load_config(path)
+        assert_equal "solo", cfg[:default_user]
+      end
     end
+  end
+
+  def with_riggs_home(home)
+    previous = ENV.fetch("RIGGS_HOME", nil)
+    ENV["RIGGS_HOME"] = home
+    yield
+  ensure
+    ENV["RIGGS_HOME"] = previous
   end
 end

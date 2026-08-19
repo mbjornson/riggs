@@ -22,7 +22,6 @@ class TestConfigStore < Minitest::Test
             type: anthropic
             api_key: "sk-secret-value"
       YAML
-
       view = default_store.public_view
       assert_equal "••••••••", view.dig("providers", "claude", "api_key")
       assert_equal "anthropic", view.dig("providers", "claude", "type")
@@ -35,7 +34,7 @@ class TestConfigStore < Minitest::Test
       before = store.read
       store.merge!("providers" => { "mock" => { "type" => "mock" }, "extra" => { "type" => "ollama" } })
 
-      after = store.read
+      after = Riggs::Identity.load_config_untrusted(store.path)
       assert_equal "ollama", after.dig(:providers, :extra, :type) || after.dig("providers", "extra", "type")
       assert before[:users] || before["users"]
       backups = Dir.glob("#{store.path}.bak.*")
@@ -199,6 +198,38 @@ class TestConfigStore < Minitest::Test
     end
   end
 
+  def test_write_and_merge_invalidate_project_trust
+    with_tmp_project do |dir|
+      path = write_project_config("users" => { "eng_bob" => { "role" => "engineer" } })
+      trust = Riggs::Trust.default
+      project_path = Riggs::Config::Resolver.project_path(dir)
+      store = default_store
+
+      assert trust.config_current?(project_path, path)
+      store.merge!("providers" => { "mock" => { "model" => "updated" } })
+      refute trust.config_current?(project_path, path), "merge! must not re-trust changed config bytes"
+
+      trust.record_config!(project_path, path)
+      store.write!("users" => { "eng_bob" => { "role" => "engineer" } })
+      refute trust.config_current?(project_path, path), "write! must not re-trust changed config bytes"
+    end
+  end
+
+  def test_write_rejects_non_hash_and_leaves_file_intact
+    with_tmp_project do
+      store = default_store
+      original = File.read(store.path)
+
+      error = assert_raises(Riggs::Error) { store.write!([{ "users" => {} }]) }
+      assert_match(/hash/i, error.message)
+      assert_equal original, File.read(store.path)
+
+      error = assert_raises(Riggs::Error) { store.write!("not-a-document") }
+      assert_match(/hash/i, error.message)
+      assert_equal original, File.read(store.path)
+    end
+  end
+
   private
 
   def default_store
@@ -207,8 +238,10 @@ class TestConfigStore < Minitest::Test
 
   def write_project_config(values)
     FileUtils.mkdir_p(".riggs")
-    File.write(File.join(".riggs", "config.yml"), Psych.dump(values))
-    File.expand_path(File.join(".riggs", "config.yml"))
+    path = File.expand_path(File.join(".riggs", "config.yml"))
+    File.write(path, Psych.dump(values))
+    Riggs::Trust.default.record_config!(Riggs::Config::Resolver.project_path, path)
+    path
   end
 
   # A nested directory carrying its own .riggs/config.yml resolves to itself as

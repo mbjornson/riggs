@@ -16,6 +16,10 @@ module Riggs
         @io.puts "✅ Trusted project: #{project_path}"
       end
 
+      def review_and_grant!(project_path, yes)
+        ConfigReview.new(trust: @trust, io: @io, stdin: $stdin).call(project_path, yes)
+      end
+
       def list
         projects = @trust.projects
         return @io.puts("📭 No trusted projects.") if projects.empty?
@@ -54,6 +58,112 @@ module Riggs
         return "• #{path}" if Dir.exist?(path)
 
         "• #{path} (missing)"
+      end
+    end
+
+    class ConfigReview
+      def initialize(trust:, io:, stdin:)
+        @trust = trust
+        @io = io
+        @stdin = stdin
+      end
+
+      def call(project_path, yes)
+        path = Config::ProjectConfig.new(project_path).path
+        ensure_config!(path)
+        review(path)
+        confirm!(yes)
+        grant!(project_path, path)
+      end
+
+      private
+
+      def ensure_config!(path)
+        return unless path.nil?
+
+        abort "❌ Missing project config in #{Dir.pwd}. Run 'riggs setup' first."
+      end
+
+      def review(path)
+        config = Identity.load_config_untrusted(path)
+        header(path, config)
+        summary("MCP", config[:mcp_servers]) { |name, spec| mcp(name, spec) }
+        summary("Providers", config[:providers]) { |name, spec| provider(name, spec) }
+        summary("Roles", config[:roles]) { |name, permissions| role(name, permissions) }
+      end
+
+      def header(path, config)
+        @io.puts "\n== TRUST PROJECT CONFIG =="
+        @io.puts "─" * 40
+        @io.puts "Config: #{File.expand_path(path)}"
+        @io.puts "Users:  #{names(config[:users])}"
+      end
+
+      def summary(label, values, &)
+        @io.puts "#{label}:"
+        return @io.puts("  (none)") unless values.is_a?(Hash) && !values.empty?
+
+        values.each(&)
+      end
+
+      def mcp(name, spec)
+        spec = mapping(spec)
+        @io.puts "  #{clean(name)}:"
+        @io.puts "    command: #{clean(spec[:command])}"
+        @io.puts "    args: #{Array(spec[:args]).map { |arg| clean(arg) }.join(' ')}"
+        @io.puts "    env keys: #{names(spec[:env])}"
+      end
+
+      def provider(name, spec)
+        url = mapping(spec)[:base_url]
+        return @io.puts "  #{clean(name)}: (no base_url)" unless url
+
+        @io.puts "  #{clean(name)}: base_url=#{clean(url)}"
+      end
+
+      def role(name, permissions)
+        @io.puts "  #{clean(name)}: #{names(permissions)}"
+      end
+
+      def confirm!(yes)
+        return true if yes
+        return true if @stdin.respond_to?(:tty?) && @stdin.tty? && prompt?
+
+        abort "❌ Trust aborted. Review the config, then re-run `riggs trust` (use --yes in scripts)."
+      end
+
+      def prompt?
+        @io.print "Trust this project's config? [y/N] "
+        @stdin.gets.to_s.strip.match?(/\Ay(es)?\z/i)
+      end
+
+      def grant!(project_path, path)
+        @trust.grant!(project_path)
+        @trust.record_config!(project_path, path)
+        @io.puts "✅ Trusted. Re-run `riggs trust` after editing this file."
+      end
+
+      def mapping(value)
+        return value if value.is_a?(Hash)
+
+        {}
+      end
+
+      def names(values)
+        list = list_for(values)
+        return "(none)" if list.empty?
+
+        list.map { |value| clean(value) }.join(", ")
+      end
+
+      def list_for(values)
+        return values.keys if values.is_a?(Hash)
+
+        Array(values)
+      end
+
+      def clean(value)
+        Riggs.sanitize_for_terminal(value)
       end
     end
 

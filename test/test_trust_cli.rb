@@ -8,11 +8,12 @@ class TestTrustCLI < Minitest::Test
     with_tmp_project do |repo|
       project_path = Riggs::Config::Resolver.project_path(repo)
       Riggs::Trust.default.forget!(project_path)
+      write_project_override({})
 
-      out, = run_cli(%w[trust])
+      out, = run_cli(%w[trust --yes])
 
-      assert Riggs::Trust.default.trusted?(project_path)
-      assert_includes out, project_path
+      assert Riggs::Trust.default.config_current?(project_path, ".riggs/config.yml")
+      assert_includes out, "Config:"
     end
   end
 
@@ -191,6 +192,9 @@ class TestTrustCLI < Minitest::Test
 
   def write_project_override(values)
     FileUtils.mkdir_p(".riggs")
-    File.write(".riggs/config.yml", Psych.dump(values))
+    path = ".riggs/config.yml"
+    File.write(path, Psych.dump(values))
+    trust = Riggs::Trust.default
+    trust.record_config!(Riggs::Config::Resolver.project_path, path)
   end
 end

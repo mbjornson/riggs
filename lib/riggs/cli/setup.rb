@@ -12,13 +12,17 @@ module Riggs
       def initialize(riggs_home:, cwd:)
         @riggs_home = riggs_home
         @cwd = cwd
+        # Read BEFORE prepare_project_tier runs: afterwards the file is there
+        # either way, and setup can no longer tell the config it just wrote
+        # from one the repository shipped.
+        @preexisting_config = !config_path.nil?
       end
 
       def call
         puts "🔧 Starting Riggs setup…"
         prepare_global_tier
         prepare_project_tier
-        record_trust
+        settle_trust
         puts "\n🎉 Riggs setup complete!"
       end
 
@@ -33,12 +37,32 @@ module Riggs
       end
 
       def record_trust
-        Trust.new(path: File.join(@riggs_home, "trust.yml")).grant!(project_path)
+        trust.grant!(project_path)
+        trust.record_config!(project_path, config_path) if config_path
         puts "✅ Recorded trust for #{project_path}"
       end
 
       def project_path
         @project_path ||= Config::Resolver.project_path(@cwd)
+      end
+
+      def trust
+        @trust ||= Trust.new(path: File.join(@riggs_home, "trust.yml"))
+      end
+
+      def config_path
+        Config::ProjectConfig.new(project_path).path
+      end
+
+      # A config setup did not author is a config setup has not reviewed, so
+      # it is left untrusted. Saying so matters: without this branch the
+      # operator sees a successful setup and then an opaque "not trusted"
+      # refusal from the next command they run.
+      def settle_trust
+        return record_trust unless @preexisting_config
+
+        puts "\n⏭️  Keeping existing #{config_path}"
+        puts "   Review it, then run `riggs trust` to trust this project."
       end
     end
 

@@ -37,12 +37,15 @@ module Riggs
 
       # Fields a workflow file may not set, because a workflow file travels
       # with a repository just like the project config that is already barred
-      # from setting them (Config::Merge::PROVIDER_FIELDS). base_url is where
-      # the credential goes: OpenAICompatible sends the operator's key to it as
-      # a bearer token, so a workflow naming another host collects it. Pricing
-      # is the same shape of problem in a different currency and is handled by
-      # #pricing_for, which predates this list.
-      OPERATOR_ONLY_FIELDS = %i[base_url].freeze
+      # from setting them (Config::Merge::PROVIDER_FIELDS). These are the keys
+      # that choose how a provider is INVOKED: the binary, its arguments, the
+      # HTTP endpoint, the credential, and the child environment. base_url is
+      # where the credential goes -- OpenAICompatible sends the operator's key
+      # to it as a bearer token, so a workflow naming another host collects it.
+      # Pricing is the same shape of problem in a different currency and is
+      # handled by #pricing_for, which predates this list. A workflow may still
+      # set type, model, auth, relay_chain and every other non-invocation key.
+      OPERATOR_ONLY_FIELDS = %i[command args base_url api_key env].freeze
 
       def self.unmetered_chain?(chain)
         names = Array(chain).map(&:to_s)

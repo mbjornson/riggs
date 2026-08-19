@@ -7,6 +7,10 @@ require "json"
 require "erb"
 require "cgi/escape"
 require "stringio"
+require "psych"
+require "date"
+require "time"
+require "uri"
 
 require_relative "../config_store"
 require_relative "../identity"
@@ -32,8 +36,11 @@ module Riggs
       def self.resolve(request, config: nil)
         cfg = config || Identity.load_config
         mapped = Riggs.identity_mapper&.call(request)
+        return Identity.resolve(cli_user: mapped.to_s, config: cfg) unless mapped.nil?
+
+        raise Forbidden, "Web identity requires Riggs.identity_mapper" unless App.insecure_identity
+
         user =
-          mapped ||
           request.env["HTTP_X_RIGGS_USER"] ||
           request.cookies["riggs_user"] ||
           request.params["user"] ||
@@ -41,6 +48,8 @@ module Riggs
 
         Identity.resolve(cli_user: user.to_s, config: cfg)
       rescue Error
+        raise unless App.insecure_identity
+
         Identity.resolve(cli_user: cfg[:default_user].to_s, config: cfg)
       end
 
@@ -64,10 +73,27 @@ module Riggs
       # stream drains again immediately instead of sleeping or signalling done.
       STREAM_PAGE_SIZE = 500
       DEFAULT_STREAM_POLL_SECONDS = 1.0
+      YAML_CONFIG_MAX_BYTES = 64 * 1024
+      # One permission per top-level key. Auth.require! ORs its arguments, so
+      # callers must pass a single permission for an ALL-of / exact check.
+      CONFIG_KEY_PERMISSIONS = {
+        "users" => "edit_workflow",
+        "roles" => "edit_workflow",
+        "default_user" => "edit_workflow",
+        "providers" => "edit_workflow",
+        "mcp_servers" => "manage_mcp",
+        "sqlite_memory" => "configure_memory",
+        "sqlite_path" => "configure_memory"
+      }.freeze
+      GATE_DECISION_STATUSES = %w[paused awaiting_approval].freeze
+      MUTATING_METHODS = %w[POST PATCH PUT DELETE].freeze
 
       class << self
         # Overridable so tests do not have to wait out the production cap.
         attr_writer :stream_timeout_seconds, :stream_poll_seconds
+        # When false (the default), identity comes only from Riggs.identity_mapper
+        # and mutating requests need a matching Origin or Referer host.
+        attr_accessor :insecure_identity
 
         def stream_timeout_seconds
           @stream_timeout_seconds || DEFAULT_STREAM_TIMEOUT_SECONDS
@@ -77,6 +103,8 @@ module Riggs
           @stream_poll_seconds || DEFAULT_STREAM_POLL_SECONDS
         end
       end
+
+      self.insecure_identity = false
 
       def self.call(env)
         new.call(env)
@@ -93,6 +121,7 @@ module Riggs
         @path = normalize_path(req.path_info)
 
         begin
+          reject_cross_site!(req)
           @config = Identity.load_config
           @identity = Auth.resolve(req, config: @config)
           @store = ConfigStore.default(cwd: Dir.pwd, trust: Trust.default)
@@ -113,6 +142,26 @@ module Riggs
         p = "/" if p.empty?
         p = p.sub(%r{/\z}, "") unless p == "/"
         p
+      end
+
+      def reject_cross_site!(req)
+        return if self.class.insecure_identity
+        return unless MUTATING_METHODS.include?(req.request_method)
+        return if origin_matches_host?(req)
+
+        raise Forbidden, "Cross-site request rejected"
+      end
+
+      def origin_matches_host?(req)
+        expected = req.host.to_s.downcase
+        %w[HTTP_ORIGIN HTTP_REFERER].any? do |key|
+          raw = req.get_header(key).to_s
+          next false if raw.empty?
+
+          URI.parse(raw).host.to_s.downcase == expected
+        rescue URI::InvalidURIError
+          false
+        end
       end
 
       def dispatch(req)
@@ -241,7 +290,7 @@ module Riggs
 
         res = Rack::Response.new
         res.redirect(url("/"))
-        res.set_cookie("riggs_user", value: user, path: cookie_path, httponly: true)
+        res.set_cookie("riggs_user", value: user, path: cookie_path, httponly: true, same_site: :lax)
         res.finish
       end
 
@@ -249,21 +298,22 @@ module Riggs
         section = req.params["section"].to_s
         case section
         when "users"
+          # parse_users_form only writes users / default_user, never roles or MCP.
           Auth.require!(@identity, "edit_workflow")
           @store.merge!(parse_users_form(req))
         when "providers"
-          Auth.require!(@identity, "edit_workflow", "configure_memory")
+          Auth.require!(@identity, "edit_workflow")
           @store.merge!(parse_providers_form(req))
         when "mcp"
-          Auth.require!(@identity, "edit_workflow", "manage_mcp")
+          Auth.require!(@identity, "manage_mcp")
           @store.merge!(parse_mcp_form(req))
         when "memory"
           Auth.require!(@identity, "configure_memory")
           @store.merge!(parse_memory_form(req))
         when "yaml"
-          Auth.require!(@identity, "edit_workflow")
-          raw = Psych.safe_load(req.params["yaml"].to_s, permitted_classes: [Symbol], aliases: true) || {}
-          @store.write!(raw)
+          parsed = parse_yaml_config_param(req.params["yaml"])
+          authorize_config_keys!(parsed.keys)
+          @store.merge!(parsed)
         else
           raise Error, "Unknown config section"
         end
@@ -312,12 +362,15 @@ module Riggs
       end
 
       def api_patch_config(req)
-        Auth.require!(@identity, "edit_workflow", "configure_memory", "manage_mcp", "manage_skills")
         body = parse_json_body(req)
         raise Error, "JSON object required" unless body.is_a?(Hash)
 
-        @store.merge!(reject_masked_secrets(body))
-        json_ok(@store.public_view)
+        patch = reject_masked_secrets(body)
+        authorize_config_keys!(patch.keys)
+        # merge! invalidates project trust; do not call public_view (trusted
+        # load_config) here. The merged document is the write we just made.
+        merged = @store.merge!(patch)
+        json_ok(merged)
       end
 
       def api_show_workflow(name)
@@ -483,7 +536,11 @@ module Riggs
 
         workflow = Workflow::Loader.load(path: path)
         require_workflow_access!(workflow, path)
-        gate_handler = ->(_step, _io) { :approved }
+        gate_handler = if auto_approve
+                         ->(_step, _io) { :approved }
+                       else
+                         ->(_step, _io) { :paused }
+                       end
 
         engine = Workflow::GraphEngine.new(
           workflow: workflow,
@@ -514,6 +571,11 @@ module Riggs
           session = storage.find_session(id)
           raise Error, "Session not found" unless session
 
+          status = session["status"].to_s
+          unless GATE_DECISION_STATUSES.include?(status)
+            raise Error, "Session is not waiting for a gate decision (status=#{status})"
+          end
+
           storage.audit(
             session_id: id,
             event_type: "gate_decision",
@@ -524,7 +586,7 @@ module Riggs
             return "rejected"
           end
 
-          unless session["status"] == "paused" && storage.load_resume_state(id)
+          unless status == "paused" && storage.load_resume_state(id)
             storage.update_session(id, status: "approved_pending_resume")
             return "approved_pending_resume"
           end
@@ -558,8 +620,8 @@ module Riggs
           workflow: workflow,
           db_path: sqlite_path,
           hub_config: @config,
-          # Later gates in the resumed run auto-approve, matching how the web
-          # runner already handles gates in execute_workflow.
+          # The paused gate was already approved. Later gates in this resume
+          # auto-approve so the operator is not re-prompted in-process.
           gate_handler: ->(_step, _io) { :approved },
           skill_registry: SkillRegistry.new,
           io: StringIO.new
@@ -700,6 +762,27 @@ module Riggs
         JSON.parse(raw)
       rescue JSON::ParserError
         raise Error, "Invalid JSON body"
+      end
+
+      def parse_yaml_config_param(raw)
+        text = raw.to_s
+        raise Error, "YAML config exceeds 64KB" if text.bytesize > YAML_CONFIG_MAX_BYTES
+
+        parsed = Psych.safe_load(text, permitted_classes: [Symbol, Date, Time], aliases: false)
+        raise Error, "YAML config must be a mapping" unless parsed.is_a?(Hash)
+
+        parsed
+      rescue Psych::Exception => e
+        raise Error, "Invalid YAML config (#{e.class}: #{e.message})"
+      end
+
+      def authorize_config_keys!(keys)
+        keys.each do |key|
+          perm = CONFIG_KEY_PERMISSIONS[key.to_s]
+          raise Error, "Unknown config key: #{key}" unless perm
+
+          Auth.require!(@identity, perm)
+        end
       end
 
       def reject_masked_secrets(obj)

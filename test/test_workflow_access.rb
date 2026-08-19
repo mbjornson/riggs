@@ -5,6 +5,15 @@ require "rack/mock"
 require "stringio"
 
 class TestWorkflowAccess < Minitest::Test
+  def setup
+    @insecure_identity = Riggs::Web::App.insecure_identity
+    Riggs::Web::App.insecure_identity = true
+  end
+
+  def teardown
+    Riggs::Web::App.insecure_identity = @insecure_identity
+  end
+
   def test_run_workflow_still_runs_anything
     assert_permits(identity(:engineer, %w[run_workflow]), owner: nil, tier: :bundled)
     assert_permits(identity(:engineer, %w[run_workflow]), owner: "pm", tier: :project)

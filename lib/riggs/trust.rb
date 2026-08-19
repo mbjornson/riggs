@@ -3,6 +3,7 @@
 require "time"
 require_relative "trust/executable"
 require_relative "trust/digest"
+require_relative "trust/fingerprint"
 require_relative "trust/store"
 
 module Riggs
@@ -25,7 +26,9 @@ module Riggs
     end
 
     def self.default
-      new(path: default_path)
+      trust = new(path: default_path)
+      Legacy.new(trust: trust).import
+      trust
     end
 
     def self.digest(command:, args:, env:)
@@ -62,6 +65,15 @@ module Riggs
     def grant!(project_path)
       update { |data| project_entry(data, project_path)["trusted_at"] ||= now }
       project_path.to_s
+    end
+
+    def record_config!(project_path, config_path)
+      update { |data| project_entry(data, project_path)["config"] = Fingerprint.record(config_path) }
+      config_path
+    end
+
+    def config_current?(project_path, config_path)
+      trusted?(project_path) && Fingerprint.matches?(entry(project_path)&.fetch("config", nil), config_path)
     end
 
     # Returns the path it forgot, or nil when there was nothing to forget.
@@ -135,3 +147,6 @@ module Riggs
     end
   end
 end
+
+require_relative "trust/legacy"
+require_relative "trust/config_gate"

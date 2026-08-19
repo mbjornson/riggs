@@ -4,9 +4,9 @@ require_relative "test_helper"
 
 # CI and every other test build the database from scratch, so the schema is
 # always current and Storage#ensure_columns! never actually runs its ALTER.
-# The real risk is a database that predates Phase 6: it has riggs_sessions
-# without resume_state and no riggs_messages table at all. These tests seed
-# exactly that shape with raw SQLite3 and then open it with Storage.
+# The real risk is a database that predates a later column: CREATE TABLE IF
+# NOT EXISTS leaves the old table untouched. These tests seed that shape with
+# raw SQLite3 and then open it with Storage.
 class TestStorageMigration < Minitest::Test
   # The riggs_sessions/riggs_steps/riggs_audit shape as it stood before
   # resume_state and riggs_messages were introduced. Written out by hand on
@@ -138,6 +138,33 @@ class TestStorageMigration < Minitest::Test
     3.times { open_storage }
 
     assert_equal 1, raw_columns("riggs_sessions").count("resume_state")
+  end
+
+  # steps/audit never gained columns after first ship, so this fixture is a
+  # current-schema table with one ALTER-safe column stripped. CREATE TABLE IF
+  # NOT EXISTS will not add it; ensure_columns! must.
+  def test_opening_a_stripped_memories_table_adds_missing_columns
+    with_raw_db do |db|
+      db.execute(<<~SQL)
+        CREATE TABLE riggs_memories (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          namespace TEXT NOT NULL,
+          content TEXT NOT NULL
+        )
+      SQL
+      db.execute("INSERT INTO riggs_memories (namespace, content) VALUES (?, ?)", %w[eng_bob_private old-note])
+    end
+
+    refute_includes raw_columns("riggs_memories"), "context"
+
+    open_storage
+
+    assert_includes raw_columns("riggs_memories"), "context"
+    row = with_raw_db { |db| db.get_first_row("SELECT namespace, content, context FROM riggs_memories") }
+
+    assert_equal "eng_bob_private", row["namespace"]
+    assert_equal "old-note", row["content"]
+    assert_nil row["context"]
   end
 
   # riggs_sessions is declared TWICE: in db/init_riggs_schema.sql, which

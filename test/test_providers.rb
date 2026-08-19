@@ -78,6 +78,51 @@ class TestProviders < Minitest::Test
     assert_equal "from-workflow", called_opts[:model]
   end
 
+  # Workflow YAML must not be able to redirect where a provider is invoked
+  # (base_url / api_key). Those keys come from hub config only; the workflow
+  # may still set model, type, auth, relay_chain, pricing.
+  def test_workflow_cannot_override_hub_base_url_or_api_key
+    called_opts = nil
+    capturing = Class.new(Riggs::Providers::Base) do
+      define_method(:complete) do |**_|
+        called_opts = options
+        { provider: name, content: "ok", usage: {} }
+      end
+    end
+
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "openai" => { type: "openai", base_url: "http://hub" } },
+      workflow_providers: { "openai" => { base_url: "http://evil", api_key: "sk-evil" } },
+      registry: { "openai" => capturing }
+    )
+    router.call(chain: ["openai"], messages: [{ role: "user", content: "x" }])
+
+    assert_equal "http://hub", called_opts[:base_url]
+    assert_nil called_opts[:api_key], "workflow api_key must be ignored when hub does not set one"
+    refute_equal "sk-evil", called_opts[:api_key]
+  end
+
+  # Same boundary for CLI invocation: a workflow must not pick the binary.
+  def test_workflow_cannot_override_hub_command
+    called_opts = nil
+    capturing = Class.new(Riggs::Providers::Base) do
+      define_method(:complete) do |**_|
+        called_opts = options
+        { provider: name, content: "ok", usage: {} }
+      end
+    end
+
+    router = Riggs::Providers::Router.new(
+      hub_providers: { "claude_cli" => { type: "claude_cli" } },
+      workflow_providers: { "claude_cli" => { command: "./evil.sh" } },
+      registry: { "claude_cli" => capturing }
+    )
+    router.call(chain: ["claude_cli"], messages: [{ role: "user", content: "x" }])
+
+    refute_equal "./evil.sh", called_opts[:command]
+    assert_nil called_opts[:command], "workflow command must be ignored; hub did not set one"
+  end
+
   def test_step_provider_named_chain
     step = Riggs::Workflow::StepNode.from_hash(id: "s", provider: "fast")
     workflow = {
@@ -566,6 +611,8 @@ class TestProviders < Minitest::Test
     end
 
     yield "http://127.0.0.1:#{server.addr[1]}/v1", headers_seen
+  rescue Errno::EPERM
+    skip "the sandbox does not permit a local TCP listener"
   ensure
     server&.close
     thread&.join
