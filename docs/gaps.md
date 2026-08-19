@@ -58,14 +58,22 @@ See [`specs/phase11-hook-bus.md`](specs/phase11-hook-bus.md).
 
 See [`specs/phase12-project-trust.md`](specs/phase12-project-trust.md).
 
-**Spec:** `docs/specs/phase11-config-tiers-and-project-trust.md` (approved, not
-yet implemented). Takes both halves of the shape above rather than choosing
-between them: a one-time trust prompt keyed by absolute path gates whether the
-project tier is read at all, and identity, roles, providers and MCP definitions
-move to `~/.riggs/` while the repo keeps workflows and skills. Adds per-server
-MCP approval on top, since folder trust alone lets a later commit introduce a
-new command silently. Split into 11a (tiers, trust, approval) and 11b
-(attribution, memory scoping).
+Takes both halves of the shape above rather than choosing between them: trust
+keyed by absolute path gates whether the project tier is read at all, and
+identity, roles, providers and MCP definitions move to `~/.riggs/` while the repo
+keeps workflows and skills. Per-server MCP approval sits on top, since folder
+trust alone lets a later commit introduce a new command silently. Shipped as 11a
+(tiers, trust, approval) and 11b (attribution, memory scoping).
+
+**One system, not two.** This landed twice, from opposite ends: `ProjectTrust` on
+`main` keyed trust to a SHA256 of the config file, so an edit revoked it, and
+prompted on a TTY; `Trust` on the phase-11 branch keyed trust to a path and added
+the MCP approvals. The merge kept `Trust` and folded main's two ideas into it —
+`Trust::Fingerprint` records the bytes the operator reviewed, `Trust::ConfigGate`
+asks once on a TTY before refusing, and `Trust::Legacy` imports the old
+`trusted_projects.json` once so nobody re-trusts what they already trusted.
+`ProjectTrust` is gone. The global tier is exempt from the gate: `~/.riggs/config.yml`
+is the file the operator writes, not one a repository ships.
 
 ---
 
@@ -150,32 +158,20 @@ event. Narrowing it to the provider error types would separate them.
 
 ---
 
-## Found separately — schema migration only covers one table
+## ~~Found separately — schema migration only covers one table~~ — shipped
 
-Not from the Pi comparison. Surfaced while building the CI gates in PR #4.
+`Storage#ensure_columns!` no longer inspects `riggs_sessions` alone. `EXPECTED_COLUMNS`
+declares the expected columns for all six tables — sessions, steps, audit, messages,
+provider_calls, memories — and the same `PRAGMA table_info` guard runs per table, so a
+column added to any of them reaches databases that predate it. Empty hashes are kept for
+the tables that have never gained a column, so the next one is a one-line addition.
 
-**Now:** `Storage#ensure_columns!` reads `PRAGMA table_info(riggs_sessions)` and
-adds `resume_state` if it is absent. That is the only table it inspects.
-`riggs_steps`, `riggs_audit`, and `riggs_memories` have no migration path at all —
-they exist only as `CREATE TABLE IF NOT EXISTS`, which by definition does nothing
-to a table that already exists.
-
-**Why it matters:** The next column added to any of those three tables will apply
-cleanly to fresh databases and silently not apply to existing ones. Nothing fails
-loudly; the column is simply missing until something reads it and raises
-`no such column` at runtime. CI would not catch it either, because CI builds its
-schema from scratch — the same blind spot `test/test_storage_migration.rb` was
-written to close for `riggs_sessions`.
-
-**Shape:** Generalize `ensure_columns!` from one hardcoded table to a declared
-map of table to expected columns, applying the same `PRAGMA table_info` guard per
-table. `test/test_storage_migration.rb` is already structured so a second table
-is cheap to add — its fixture builds a legacy schema by hand and asserts the
-migration ran, and a drift guard checks the fixture really predates the change so
-the assertions cannot pass vacuously.
-
-**Done when:** Adding a column to any Riggs table migrates existing databases,
-and a test proves it against a hand-built database that predates the column.
+`test/test_storage_migration.rb` proves it the way the entry asked: a hand-built legacy
+`riggs_memories` table missing `context` gains the column on open, with the existing row
+preserved and the new column NULL. `test_fixture_really_predates_the_migration` still
+guards the fixture so the assertions cannot pass vacuously, and
+`test_both_declarations_of_riggs_sessions_agree` covers the second declaration in
+Storage's embedded fallback heredoc drifting from `db/init_riggs_schema.sql`.
 
 ---
 
