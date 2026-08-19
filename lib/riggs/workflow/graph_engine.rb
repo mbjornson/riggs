@@ -74,8 +74,7 @@ module Riggs
 
         @session_id = @storage.create_session(
           workflow_name: @workflow[:name],
-          user_id: @user_identity[:id],
-          memory_namespace: @user_identity[:memory_namespace],
+          identity: @user_identity,
           config_snapshot: {
             max_llm_calls: @workflow[:max_llm_calls],
             context_window: @workflow[:context_window],

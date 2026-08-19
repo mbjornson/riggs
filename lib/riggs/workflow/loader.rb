@@ -29,6 +29,10 @@ module Riggs
         steps = Array(cfg[:steps]).map { |s| StepNode.from_hash(s) }
         {
           name: cfg[:name].to_s,
+          # A LABEL, not a grant: WorkflowAccess only honours it for a role the
+          # operator's own config granted run_owned_workflow, and only on a
+          # tier the operator supplied. Absent means "needs run_workflow".
+          owner_role: cfg[:owner_role]&.to_s,
           display_name: (cfg[:display_name] || humanize(cfg[:name])).to_s,
           description: (cfg[:description] || "").to_s,
           triggers: Array(cfg[:triggers]),

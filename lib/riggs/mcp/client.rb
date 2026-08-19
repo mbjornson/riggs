@@ -21,25 +21,16 @@ module Riggs
         @initialized = false
       end
 
-      def self.from_config(servers)
-        return nil if servers.nil? || servers.empty?
-
-        _name, cfg = servers.first
-        cfg = Identity.deep_symbolize(cfg)
-        new(command: cfg[:command], args: cfg[:args] || [], env: cfg[:env] || {})
-      end
-
       def start!
         return self if @wait_thr&.alive?
 
         raise Error, "MCP command is blank" if @command.nil? || @command.to_s.strip.empty?
 
-        binary = Providers::CliRunner.resolve_binary(@command)
-        raise Error, "MCP binary not found on PATH: #{@command}" unless binary
+        binary = Trust.resolve_executable(command: @command, env: @env)
+        raise Error, "MCP binary not found on PATH: #{@command}" if unresolved?(binary)
 
         @initialized = false
-        env = @env.transform_keys(&:to_s)
-        @stdin, @stdout, @wait_thr = Open3.popen2(env, binary, *@args)
+        @stdin, @stdout, @wait_thr = Open3.popen2(spawn_environment, binary, *@args, unsetenv_others: true)
         initialize_session!
         self
       end
@@ -70,6 +61,30 @@ module Riggs
       end
 
       private
+
+      # Resolved against the SAME environment the approval digest was taken
+      # over, so the binary that runs is the binary the operator approved.
+      def unresolved?(binary)
+        binary.start_with?(Trust::Executable::UNRESOLVED_PREFIX)
+      end
+
+      def spawn_environment
+        declared_environment.merge("PATH" => path)
+      end
+
+      def declared_environment
+        @env.transform_keys(&:to_s)
+      end
+
+      # PATH is forwarded even for an absolute command because an MCP server
+      # may use a #!/usr/bin/env shebang or spawn a documented helper. No other
+      # Riggs environment variable is needed by the child; every other entry is
+      # named explicitly by the server declaration and is bound into its digest.
+      def path
+        return declared_environment["PATH"] if declared_environment.key?("PATH")
+
+        ENV.fetch("PATH", "/bin:/usr/bin")
+      end
 
       def initialize_session!
         return if @initialized

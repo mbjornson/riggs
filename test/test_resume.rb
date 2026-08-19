@@ -229,11 +229,11 @@ class TestResume < Minitest::Test
       storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
       session = storage.find_session(paused.session_id)
       assert_equal "eng_bob", session["user_id"], "resume must not rewrite the session owner"
-      assert_equal "eng_bob_private", session["memory_namespace"]
+      assert_equal paused.instance_variable_get(:@user_identity)[:memory_namespace], session["memory_namespace"]
       storage.close
 
       namespaces = memory_namespaces
-      assert_includes namespaces, "eng_bob_private"
+      assert_includes namespaces, session["memory_namespace"]
       refute_includes namespaces, "team_shared",
                       "an approver resuming must not persist into their own memory namespace"
     end

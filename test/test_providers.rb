@@ -611,6 +611,8 @@ class TestProviders < Minitest::Test
     end
 
     yield "http://127.0.0.1:#{server.addr[1]}/v1", headers_seen
+  rescue Errno::EPERM
+    skip "the sandbox does not permit a local TCP listener"
   ensure
     server&.close
     thread&.join
@@ -1122,6 +1124,19 @@ class TestProviders < Minitest::Test
   # A provider that reports a real vendor-shaped usage block. The mock provider
   # deliberately reports none (it has no tokenizer and must not invent counts),
   # so metering tests need something that does.
+  # Records the base_url the provider was actually built with, which is the
+  # only thing that settles where a credential would have been sent. Asserting
+  # on the config hash the router assembled would agree with the router's own
+  # belief, and that belief is what was wrong.
+  def endpoint_probe(seen)
+    Class.new(Riggs::Providers::Base) do
+      define_method(:complete) do |**|
+        seen << options[:base_url]
+        { provider: name, content: "ok", usage: {} }
+      end
+    end
+  end
+
   def metered_provider
     Class.new(Riggs::Providers::Base) do
       def complete(**)
@@ -1144,6 +1159,65 @@ class TestProviders < Minitest::Test
 
     assert result[:usage][:measured]
     assert_kind_of Integer, result[:usage][:total_tokens]
+  end
+
+  # Pricing is billing truth, and a workflow file travels with a repository.
+  # Letting a workflow set pricing let a clone report $0.00 for a run that
+  # cost $60.00 -- verified against these exact numbers before the guard.
+  # Every other provider field still merges hub <- workflow; this one does not.
+  def test_a_workflow_cannot_zero_the_operators_pricing
+    router = Riggs::Providers::Router.new(
+      hub_providers: { metered: { type: "metered", model: "priced-model",
+                                  pricing: { "priced-model" => { input: 1000.0, output: 1000.0 } } } },
+      workflow_providers: { metered: { pricing: { "priced-model" => { input: 0.0, output: 0.0 } } } },
+      registry: { "metered" => metered_provider }
+    )
+
+    result = router.call(chain: ["metered"], messages: [{ role: "user", content: "hello" }])
+
+    assert result[:cost_usd].positive?, "a workflow must not be able to zero the ledger"
+  end
+
+  def test_a_workflow_cannot_invent_a_price_the_operator_never_set
+    router = Riggs::Providers::Router.new(
+      hub_providers: { metered: { type: "metered", model: "unpriced-xyz" } },
+      workflow_providers: { metered: { pricing: { "unpriced-xyz" => { input: 5.0, output: 5.0 } } } },
+      registry: { "metered" => metered_provider }
+    )
+
+    result = router.call(chain: ["metered"], messages: [{ role: "user", content: "hello" }])
+
+    assert_nil result[:cost_usd], "an unpriced model stays unpriced rather than taking a workflow's word"
+  end
+
+  # base_url is where the credential GOES, and a workflow file travels with a
+  # repository exactly like the project config that was already barred from
+  # setting it. Closing only the config tier left the same redirect open one
+  # file over: an OpenAICompatible provider sends the operator's key to
+  # base_url as a bearer token, so a workflow naming an attacker host collects
+  # it. Same treatment as pricing -- hub only, workflow ignored.
+  def test_a_workflow_cannot_redirect_the_operators_endpoint
+    seen = []
+    probe = endpoint_probe(seen)
+    Riggs::Providers::Router.new(
+      hub_providers: { openai: { base_url: "https://operator.invalid/v1" } },
+      workflow_providers: { openai: { base_url: "https://attacker.invalid/v1" } },
+      registry: { "openai" => probe }
+    ).call(chain: ["openai"], messages: [])
+
+    assert_equal ["https://operator.invalid/v1"], seen, "a workflow must not be able to move the endpoint"
+  end
+
+  def test_a_workflow_cannot_supply_an_endpoint_the_operator_never_set
+    seen = []
+    probe = endpoint_probe(seen)
+    Riggs::Providers::Router.new(
+      hub_providers: { openai: { model: "gpt-4" } },
+      workflow_providers: { openai: { base_url: "https://attacker.invalid/v1" } },
+      registry: { "openai" => probe }
+    ).call(chain: ["openai"], messages: [])
+
+    assert_equal [nil], seen, "an unset endpoint stays unset rather than taking a workflow's word"
   end
 
   def test_router_prices_a_call_using_hubrc_overrides

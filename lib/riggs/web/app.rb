@@ -124,7 +124,7 @@ module Riggs
           reject_cross_site!(req)
           @config = Identity.load_config
           @identity = Auth.resolve(req, config: @config)
-          @store = ConfigStore.new(path: Identity.config_path)
+          @store = ConfigStore.default(cwd: Dir.pwd, trust: Trust.default)
           dispatch(req) || respond_error(req, 404, "Not found")
         rescue Forbidden => e
           respond_error(req, 403, e.message)
@@ -180,7 +180,7 @@ module Riggs
 
         if m == "GET" && p == "/workflows"
           Auth.require!(@identity, "read_workflow")
-          return html(:workflows, title: "Playbooks", workflows: list_workflows)
+          return html(:workflows, title: "Playbooks", workflows: Triggers.list_declared)
         end
         if m == "GET" && (wm = p.match(%r{\A/workflows/([^/]+)\z}))
           return show_workflow(wm[1])
@@ -216,7 +216,7 @@ module Riggs
           Auth.require!(@identity, "read_workflow")
           q = req.params["q"].to_s
           matches = q.empty? ? [] : trigger_matches(q)
-          declared = Triggers.list_declared(dir: workflows_dir)
+          declared = Triggers.list_declared
           return html(:triggers, title: "Triggers", query: q, matches: matches, declared: declared)
         end
 
@@ -229,7 +229,7 @@ module Riggs
 
         if m == "GET" && p == "/api/workflows"
           Auth.require!(@identity, "read_workflow")
-          return json_ok(list_workflows)
+          return json_ok(Triggers.list_declared.map { |workflow| workflow[:name] })
         end
         if m == "GET" && (wm = p.match(%r{\A/api/workflows/([^/]+)\z}))
           return api_show_workflow(wm[1])
@@ -276,7 +276,7 @@ module Riggs
         end
         if m == "GET" && p == "/api/triggers"
           Auth.require!(@identity, "read_workflow")
-          return json_ok(Triggers.list_declared(dir: workflows_dir))
+          return json_ok(Triggers.list_declared)
         end
         return json_ok(ok: true, identity: @identity[:id]) if m == "GET" && p == "/health"
 
@@ -325,7 +325,7 @@ module Riggs
 
       def show_workflow(name)
         Auth.require!(@identity, "read_workflow")
-        path = workflow_path(name)
+        path = Triggers.find_path(name)
         raise Error, "Workflow not found" unless path
 
         wf = Workflow::Loader.load(path: path)
@@ -334,7 +334,7 @@ module Riggs
       end
 
       def run_workflow_web(req, name)
-        Auth.require!(@identity, "run_workflow")
+        Auth.require!(@identity, "run_workflow", "run_owned_workflow")
         result = execute_workflow(name, input: form_input(req), auto_approve: truthy?(req.params["auto_approve"]))
         res = Rack::Response.new
         res.redirect(url("/sessions/#{result[:session_id]}"))
@@ -375,7 +375,7 @@ module Riggs
 
       def api_show_workflow(name)
         Auth.require!(@identity, "read_workflow")
-        path = workflow_path(name)
+        path = Triggers.find_path(name)
         return json_error(404, "not found") unless path
 
         wf = Workflow::Loader.load(path: path)
@@ -387,7 +387,7 @@ module Riggs
       end
 
       def api_run_workflow(req, name)
-        Auth.require!(@identity, "run_workflow")
+        Auth.require!(@identity, "run_workflow", "run_owned_workflow")
         body = parse_json_body(req)
         raw_input = body["input"] || body[:input] || {}
         input = raw_input.each_with_object({}) { |(k, v), h| h[k.to_sym] = v }
@@ -522,11 +522,20 @@ module Riggs
         json_ok(ok: true, decision: decision, status: status)
       end
 
+      # Both web run routes reach execution through execute_workflow, so the
+      # rule is applied there once rather than restated at each route.
+      def require_workflow_access!(workflow, path)
+        denial = WorkflowAccess.denial(identity: @identity, workflow: workflow,
+                                       tier: Triggers.tier_for(File.dirname(path)))
+        raise Forbidden, denial if denial
+      end
+
       def execute_workflow(name, input:, auto_approve:)
-        path = workflow_path(name)
+        path = Triggers.find_path(name)
         raise Error, "Workflow not found: #{name}" unless path
 
         workflow = Workflow::Loader.load(path: path)
+        require_workflow_access!(workflow, path)
         gate_handler = if auto_approve
                          ->(_step, _io) { :approved }
                        else
@@ -590,14 +599,25 @@ module Riggs
         resume_session_run(id, workflow_name)
       end
 
+      # Approving a paused gate RESUMES the engine, so this executes the
+      # remaining steps -- it is an execution entry point, not a bookkeeping
+      # one, and the approve routes ask only for approve_gates. Without this
+      # check a role holding approve_gates alone ran workflows it was refused
+      # 403 for starting, one route over.
       def resume_session_run(id, workflow_name)
-        path = workflow_path(workflow_name)
+        path = Triggers.find_path(workflow_name)
         raise Error, "Workflow not found: #{workflow_name}" unless path
 
-        engine = Workflow::GraphEngine.resume(
+        workflow = Workflow::Loader.load(path: path)
+        require_workflow_access!(workflow, path)
+        resume_engine(id, workflow).status.to_s
+      end
+
+      def resume_engine(id, workflow)
+        Workflow::GraphEngine.resume(
           session_id: id,
           user_identity: @identity,
-          workflow: Workflow::Loader.load(path: path),
+          workflow: workflow,
           db_path: sqlite_path,
           hub_config: @config,
           # The paused gate was already approved. Later gates in this resume
@@ -606,35 +626,12 @@ module Riggs
           skill_registry: SkillRegistry.new,
           io: StringIO.new
         )
-        engine.status.to_s
-      end
-
-      def list_workflows
-        dirs = [
-          File.expand_path("config/riggs/workflows"),
-          File.expand_path("../../../config/riggs/workflows", __dir__)
-        ]
-        dirs.flat_map { |d| Dir.glob(File.join(d, "*.yml")).map { |p| File.basename(p, ".yml") } }.uniq.sort
-      end
-
-      def workflows_dir
-        local = File.expand_path("config/riggs/workflows")
-        return local if File.directory?(local)
-
-        File.expand_path("../../../config/riggs/workflows", __dir__)
       end
 
       def trigger_matches(query)
-        Triggers.find_workflows(text: query, dir: workflows_dir).map do |wf|
+        Triggers.find_workflows(text: query).map do |wf|
           { "name" => wf[:name], "display_name" => wf[:display_name] }
         end
-      end
-
-      def workflow_path(name)
-        [
-          File.expand_path("config/riggs/workflows/#{name}.yml"),
-          File.expand_path("../../../config/riggs/workflows/#{name}.yml", __dir__)
-        ].find { |p| File.exist?(p) }
       end
 
       def list_skills

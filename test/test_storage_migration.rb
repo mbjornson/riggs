@@ -62,6 +62,7 @@ class TestStorageMigration < Minitest::Test
   # current-schema and every other test in this file would pass vacuously.
   def test_fixture_really_predates_the_migration
     refute_includes raw_columns("riggs_sessions"), "resume_state"
+    refute_includes raw_columns("riggs_sessions"), "project_path"
     refute_includes raw_tables, "riggs_messages"
     refute_includes raw_tables, "riggs_provider_calls"
   end
@@ -70,6 +71,23 @@ class TestStorageMigration < Minitest::Test
     open_storage
 
     assert_includes raw_columns("riggs_sessions"), "resume_state"
+  end
+
+  # Second column on the same table, so the migration must add BOTH rather than
+  # stopping at the first absent one.
+  def test_opening_a_legacy_database_adds_the_project_path_column
+    open_storage
+
+    assert_includes raw_columns("riggs_sessions"), "project_path"
+  end
+
+  # Rows written before the column exists are NULL, not blank. Both roll-ups
+  # bucket them as (unattributed), which only works if they stay distinguishable
+  # from a row that genuinely recorded an empty path.
+  def test_rows_that_predate_the_column_stay_null
+    storage = open_storage
+
+    assert_nil storage.find_session(LEGACY_SESSION_ID)["project_path"]
   end
 
   def test_migrated_resume_state_column_round_trips_through_storage
@@ -149,7 +167,32 @@ class TestStorageMigration < Minitest::Test
     assert_nil row["context"]
   end
 
+  # riggs_sessions is declared TWICE: in db/init_riggs_schema.sql, which
+  # Storage#schema_sql reads when it is reachable, and in the embedded fallback
+  # heredoc it uses when the gem layout puts that file out of reach. Nothing
+  # made them agree, so a column added to one and not the other exists in
+  # development and is absent in a packaged gem -- with no failure until
+  # something selects it. Compared as declared column names because that is the
+  # part a migration depends on.
+  def test_both_declarations_of_riggs_sessions_agree
+    assert_equal declared_columns(File.read(SCHEMA_FILE)),
+                 declared_columns(File.read(STORAGE_SOURCE)),
+                 "db/init_riggs_schema.sql and Storage's embedded fallback have drifted"
+  end
+
+  SCHEMA_FILE = File.expand_path("../db/init_riggs_schema.sql", __dir__)
+  STORAGE_SOURCE = File.expand_path("../lib/riggs/storage.rb", __dir__)
+
   private
+
+  # Reads the source text on purpose: the invariant being guarded is that two
+  # textual declarations say the same thing, and only one of them is reachable
+  # through the API at a time.
+  def declared_columns(source)
+    body = source[/CREATE TABLE IF NOT EXISTS riggs_sessions \((.*?)\);/m, 1]
+    refute_nil body, "no riggs_sessions declaration found"
+    body.lines.map { |line| line.strip.split(/\s+/).first }.compact.reject(&:empty?)
+  end
 
   def open_storage
     storage = Riggs::Storage.new(db_path: @db_path)

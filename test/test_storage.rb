@@ -8,8 +8,7 @@ class TestStorageMessages < Minitest::Test
     @storage = Riggs::Storage.new(db_path: File.join(@dir, "db", "riggs.sqlite3"))
     @session_id = @storage.create_session(
       workflow_name: "example_triage",
-      user_id: "eng_bob",
-      memory_namespace: "eng_bob_private"
+      identity: { id: "eng_bob", memory_namespace: "eng_bob_private" }
     )
   end
 
@@ -82,7 +81,7 @@ class TestStorageMessages < Minitest::Test
   end
 
   def test_same_seq_in_a_different_session_is_allowed
-    other = @storage.create_session(workflow_name: "w", user_id: "u", memory_namespace: "n")
+    other = @storage.create_session(workflow_name: "w", identity: { id: "u", memory_namespace: "n" })
     @storage.append_message(session_id: @session_id, step_key: "classify", role: "user", content: "a", seq: 3)
     @storage.append_message(session_id: other, step_key: "classify", role: "user", content: "b", seq: 3)
 

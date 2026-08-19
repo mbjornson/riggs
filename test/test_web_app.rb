@@ -23,6 +23,30 @@ class TestWebApp < Minitest::Test
     Riggs.identity_mapper = @prev_identity_mapper
   end
 
+  # The page mapped list_declared down to bare names, discarding the tier each
+  # entry carries, so a global workflow and a project one rendered
+  # identically -- the operator could not tell which file a name came from,
+  # which is the whole reason the tier is on the entry. No test covered this
+  # route at all, so the contract change went unnoticed.
+  def test_workflows_page_labels_the_tier_each_playbook_came_from
+    with_tmp_project do
+      global = File.join(Riggs::Trust.home, "workflows")
+      FileUtils.mkdir_p(global)
+      File.write(File.join(global, "deploy.yml"), Psych.dump(
+                                                    "name" => "deploy", "display_name" => "Deploy",
+                                                    "triggers" => [{ "type" => "manual" }],
+                                                    "steps" => [{ "id" => "a", "kind" => "prompt", "prompt" => "hi" }]
+                                                  ))
+      header "X-Riggs-User", "eng_bob"
+
+      get "/workflows"
+
+      assert_equal 200, last_response.status
+      assert_match(%r{deploy</a></td>\s*<td><code>global</code>}, last_response.body)
+      assert_match(%r{example_triage</a></td>\s*<td><code>project</code>}, last_response.body)
+    end
+  end
+
   def test_health_and_config_get
     with_tmp_project do
       header "X-Riggs-User", "eng_bob"
@@ -61,7 +85,7 @@ class TestWebApp < Minitest::Test
   def test_config_patch_memory_role_cannot_change_roles_or_mcp
     with_tmp_project do
       write_memory_only_user
-      before = File.read(".agent_hubrc")
+      before = File.read(Riggs::Config::Resolver.global_config)
 
       header "X-Riggs-User", "mem_erin"
       header "Content-Type", "application/json"
@@ -71,7 +95,7 @@ class TestWebApp < Minitest::Test
       patch "/api/config", JSON.generate("mcp_servers" => { "evil" => { "command" => "true" } })
       assert_equal 403, last_response.status, last_response.body
 
-      assert_equal before, File.read(".agent_hubrc"), "unauthorized keys must not be written"
+      assert_equal before, File.read(Riggs::Config::Resolver.global_config), "unauthorized keys must not be written"
     end
   end
 
@@ -85,7 +109,7 @@ class TestWebApp < Minitest::Test
         "mcp_args" => [""]
       }
       assert_equal 403, last_response.status, last_response.body
-      refute_match(/mcp_servers:\s*\n\s*evil:/, File.read(".agent_hubrc"))
+      refute_match(/mcp_servers:\s*\n\s*evil:/, File.read(Riggs::Config::Resolver.global_config))
     end
   end
 
@@ -166,8 +190,7 @@ class TestWebApp < Minitest::Test
       storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
       sid = storage.create_session(
         workflow_name: "example_triage",
-        user_id: "eng_bob",
-        memory_namespace: "eng_bob_private"
+        identity: { id: "eng_bob", memory_namespace: "eng_bob_private" }
       )
       storage.update_session(sid, status: "awaiting_approval")
       storage.close
@@ -249,8 +272,7 @@ class TestWebApp < Minitest::Test
     storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
     sid = storage.create_session(
       workflow_name: "example_triage",
-      user_id: "eng_bob",
-      memory_namespace: "eng_bob_private"
+      identity: { id: "eng_bob", memory_namespace: "eng_bob_private" }
     )
     events.times { |i| storage.audit(session_id: sid, event_type: "step_start", payload: { "n" => i }) }
     storage.update_session(sid, status: status)
@@ -390,23 +412,23 @@ class TestWebApp < Minitest::Test
 
   # Every seeded role in test_helper holds inspect_run, so add one that does not.
   def write_role_without_inspect_run
-    cfg = Psych.safe_load(File.read(".agent_hubrc"), permitted_classes: [Symbol], aliases: true)
+    global_config = Riggs::Config::Resolver.global_config
+    cfg = Psych.safe_load(File.read(global_config), permitted_classes: [Symbol], aliases: true)
     cfg["users"]["blind_dan"] = {
       "id" => "blind_dan", "name" => "Dan", "role" => "blind", "memory_namespace" => "blind_dan_private"
     }
     cfg["roles"]["blind"] = ["read_workflow"]
-    File.write(".agent_hubrc", Psych.dump(cfg))
-    trust_hubrc!
+    File.write(global_config, Psych.dump(cfg))
   end
 
   def write_memory_only_user
-    cfg = Psych.safe_load(File.read(".agent_hubrc"), permitted_classes: [Symbol, Date, Time], aliases: false)
+    global_config = Riggs::Config::Resolver.global_config
+    cfg = Psych.safe_load(File.read(global_config), permitted_classes: [Symbol, Date, Time], aliases: false)
     cfg["users"]["mem_erin"] = {
       "id" => "mem_erin", "name" => "Erin", "role" => "memory", "memory_namespace" => "mem_erin_private"
     }
     cfg["roles"]["memory"] = ["configure_memory"]
-    File.write(".agent_hubrc", Psych.dump(cfg))
-    trust_hubrc!
+    File.write(global_config, Psych.dump(cfg))
   end
 
   def alias_bomb_config_yaml
@@ -706,7 +728,7 @@ class TestWebApp < Minitest::Test
 
   def create_session_with_usage
     storage = Riggs::Storage.new(db_path: "./db/riggs.sqlite3")
-    id = storage.create_session(workflow_name: "example_triage", user_id: "eng_bob", memory_namespace: "ns")
+    id = storage.create_session(workflow_name: "example_triage", identity: { id: "eng_bob", memory_namespace: "ns" })
     storage.record_provider_call(
       session_id: id, step_key: "triage", provider: "mock", model: "m", relay_attempt: 1,
       usage: { input_tokens: 10, output_tokens: 5, cache_read_tokens: nil,

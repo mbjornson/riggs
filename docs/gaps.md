@@ -58,6 +58,15 @@ See [`specs/phase11-hook-bus.md`](specs/phase11-hook-bus.md).
 
 See [`specs/phase12-project-trust.md`](specs/phase12-project-trust.md).
 
+**Spec:** `docs/specs/phase11-config-tiers-and-project-trust.md` (approved, not
+yet implemented). Takes both halves of the shape above rather than choosing
+between them: a one-time trust prompt keyed by absolute path gates whether the
+project tier is read at all, and identity, roles, providers and MCP definitions
+move to `~/.riggs/` while the repo keeps workflows and skills. Adds per-server
+MCP approval on top, since folder trust alone lets a later commit introduce a
+new command silently. Split into 11a (tiers, trust, approval) and 11b
+(attribution, memory scoping).
+
 ---
 
 ## ~~Deferred from Phase 6 — CLI `--mode json`~~ — shipped

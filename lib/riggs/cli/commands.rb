@@ -15,6 +15,8 @@ require_relative "../mcp/client"
 require_relative "../mcp/manager"
 require_relative "../providers/router"
 require_relative "../triggers"
+require_relative "setup"
+require_relative "trust_commands"
 
 module Riggs
   class CLI < Thor
@@ -40,182 +42,61 @@ module Riggs
     map "skills:show" => :skills_show
     map "providers:ping" => :providers_ping
     map "mcp:list" => :mcp_list
+    map "mcp:approve" => :mcp_approve
     map "mcp:ping" => :mcp_ping
+    map "trust:grant" => :trust
+    map "trust:list" => :trust_list
+    map "projects:list" => :projects
+    map "cost:show" => :cost
+    map "trust:forget" => :trust_forget
     map "triggers:match" => :triggers_match
     map "triggers:list" => :triggers_list
-    map "trust" => :trust_project
 
-    desc "setup", "Create .agent_hubrc, db/, config/riggs/workflows/, and SQLite database."
+    desc "setup", "Create Riggs global and project configuration tiers."
     def setup
-      require "sqlite3"
-
-      puts "🔧 Starting Riggs setup…"
-      base_dir = Dir.pwd
-      db_dir = File.expand_path("db", base_dir)
-      workflows_dir = File.expand_path("config/riggs/workflows", base_dir)
-      skills_dir = File.expand_path("config/riggs/skills", base_dir)
-
-      [db_dir, workflows_dir, skills_dir].each { |d| FileUtils.mkdir_p(d) }
-      puts "✅ Created dirs: #{db_dir}, #{workflows_dir}, #{skills_dir}"
-
-      hub_cfg = {
-        "default_user" => "pm_alice",
-        "users" => {
-          "pm_alice" => {
-            "id" => "pm_alice",
-            "name" => "Alice PM",
-            "role" => "pm",
-            "github_username" => "@alicepm",
-            "memory_namespace" => "team_shared"
-          },
-          "eng_bob" => {
-            "id" => "eng_bob",
-            "name" => "Bob Eng",
-            "role" => "engineer",
-            "github_username" => "@bobbuilder",
-            "memory_namespace" => "eng_bob_private"
-          },
-          "view_cara" => {
-            "id" => "view_cara",
-            "name" => "Cara Viewer",
-            "role" => "viewer",
-            "memory_namespace" => "readonly"
-          }
-        },
-        "roles" => {
-          "pm" => %w[edit_workflow manage_skills configure_memory publish read_workflow inspect_run],
-          "engineer" => %w[run_workflow approve_gates read_workflow inspect_run manage_mcp],
-          "viewer" => %w[read_workflow inspect_run]
-        },
-        "sqlite_path" => File.join(db_dir, "riggs.sqlite3"),
-        "sqlite_memory" => {
-          "vector_path" => ENV.fetch("RIGGS_VECTOR_EXT", nil),
-          "memory_path" => ENV.fetch("RIGGS_MEMORY_EXT", nil),
-          "embed_model" => ENV.fetch("RIGGS_EMBED_MODEL", nil)
-        },
-        "providers" => {
-          "mock" => { "type" => "mock" },
-          "claude" => { "type" => "anthropic" },
-          "openai" => { "type" => "openai" },
-          "ollama" => { "type" => "ollama", "base_url" => "http://127.0.0.1:11434/v1", "model" => "llama3" },
-          "cursor" => { "type" => "cursor" },
-          "claude_cli" => { "type" => "claude_cli" },
-          "codex" => { "type" => "codex" },
-          "cursor_cloud" => {
-            "type" => "cursor_cloud",
-            "model" => "composer-2.5",
-            "repos" => [],
-            "poll_interval_seconds" => 5
-          }
-        },
-        "mcp_servers" => {}
-      }
-
-      config_file = File.expand_path(".agent_hubrc", base_dir)
-      if File.exist?(config_file)
-        puts "⏭️  Keeping existing #{config_file} (delete it and re-run setup to regenerate)"
-        puts "Review #{config_file}, then run `riggs trust` to trust this project."
-      else
-        File.write(config_file, Psych.dump(hub_cfg))
-        puts "✅ Created #{config_file}"
-        ProjectTrust.trust!(base_dir, config_path: config_file)
-        puts "✅ Trusted #{config_file} for this machine"
-      end
-
-      # Copy example playbook + skill into the project if missing
-      example_src = File.expand_path("../../../config/riggs/workflows/example_triage.yml", __dir__)
-      example_dst = File.join(workflows_dir, "example_triage.yml")
-      if File.exist?(example_src) && !File.exist?(example_dst)
-        FileUtils.cp(example_src, example_dst)
-        puts "✅ Installed example playbook → #{example_dst}"
-      end
-
-      skill_src = File.expand_path("../../../config/riggs/skills/triage_v1/SKILL.yml", __dir__)
-      skill_dst_dir = File.join(skills_dir, "triage_v1")
-      if File.exist?(skill_src)
-        FileUtils.mkdir_p(skill_dst_dir)
-        FileUtils.cp(skill_src, File.join(skill_dst_dir, "SKILL.yml")) unless File.exist?(File.join(skill_dst_dir, "SKILL.yml"))
-      end
-
-      db_path = File.join(db_dir, "riggs.sqlite3")
-      Storage.new(db_path: db_path).close
-      puts "✅ Database ready at #{db_path}"
-      puts "\n🎉 Riggs setup complete!"
+      # Trust.home, not Dir.home. It is the one place the global tier's
+      # location is decided, and every reader already goes through it, so
+      # deriving it separately here wrote a tier that nothing would read
+      # whenever RIGGS_HOME was set.
+      Setup.new(riggs_home: Trust.home, cwd: Dir.pwd).call
     end
 
-    desc "trust", "Trust this project's .agent_hubrc (users, roles, MCP) on this machine."
+    desc "trust", "Trust this project's config (users, roles, MCP) on this machine."
     method_option :yes, type: :boolean, default: false, aliases: "-y",
                         desc: "Trust without prompting (for scripts)"
-    def trust_project
-      path = Identity.config_path
-      abort "❌ Missing .agent_hubrc in #{Dir.pwd}. Run 'riggs setup' first." unless path
+    def trust
+      trust_commands.review_and_grant!(Config::Resolver.project_path, options[:yes])
+    end
 
-      # Show a short summary from the untrusted read so the operator knows what
-      # they are approving, without granting the process identity yet.
-      cfg = Identity.load_config_untrusted(path)
-      users = (cfg[:users] || {}).keys.map(&:to_s).sort
-      print_header("Trust project config")
-      puts "Config: #{File.expand_path(path)}"
-      puts "Users:  #{users.empty? ? '(none)' : users.join(', ')}"
+    desc "trust:list", "List trusted project paths and mark missing directories."
+    def trust_list
+      require_permission! %w[run_workflow manage_mcp]
+      print_header("Trusted Projects")
+      trust_commands.list
+    end
 
-      puts "MCP:"
-      mcp = cfg[:mcp_servers]
-      if mcp.is_a?(Hash) && !mcp.empty?
-        mcp.each do |name, spec|
-          spec = {} unless spec.is_a?(Hash)
-          puts "  #{sanitize_for_terminal(name)}:"
-          puts "    command: #{sanitize_for_terminal(spec[:command])}"
-          args = Array(spec[:args]).map { |a| sanitize_for_terminal(a) }
-          puts "    args: #{args.join(' ')}"
-          env = spec[:env]
-          keys = env.is_a?(Hash) ? env.keys.map { |k| sanitize_for_terminal(k) } : []
-          puts "    env keys: #{keys.empty? ? '(none)' : keys.join(', ')}"
-        end
-      else
-        puts "  (none)"
-      end
+    desc "projects", "List every project riggs knows about, with runs and spend."
+    def projects
+      require_permission! %w[inspect_run read_workflow]
+      print_header("Projects")
+      Projects::Table.render(project_rows).each { |line| puts line }
+    end
 
-      puts "Providers:"
-      providers = cfg[:providers]
-      if providers.is_a?(Hash) && !providers.empty?
-        providers.each do |name, spec|
-          spec = {} unless spec.is_a?(Hash)
-          label = sanitize_for_terminal(name)
-          url = spec[:base_url]
-          if url
-            puts "  #{label}: base_url=#{sanitize_for_terminal(url)}"
-          else
-            puts "  #{label}: (no base_url)"
-          end
-        end
-      else
-        puts "  (none)"
-      end
+    # The optional argument is the spec'd interface: with no argument the
+    # roll-up IS the command, and naming one project narrows it to that
+    # project's providers.
+    desc "cost [PROJECT]", "Report spend per project, or one project broken down by provider."
+    def cost(project = nil)
+      require_permission! %w[inspect_run read_workflow]
+      lines = cost_lines(project)
+      print_header("Cost")
+      lines.each { |line| puts line }
+    end
 
-      puts "Roles:"
-      roles = cfg[:roles]
-      if roles.is_a?(Hash) && !roles.empty?
-        roles.each do |name, perms|
-          list = Array(perms).map { |p| sanitize_for_terminal(p) }.join(", ")
-          puts "  #{sanitize_for_terminal(name)}: #{list.empty? ? '(none)' : list}"
-        end
-      else
-        puts "  (none)"
-      end
-
-      confirmed =
-        if options[:yes]
-          true
-        elsif $stdin.respond_to?(:tty?) && $stdin.tty?
-          print "Trust this project's .agent_hubrc? [y/N] "
-          $stdin.gets.to_s.strip.match?(/\Ay(es)?\z/i)
-        else
-          false
-        end
-      abort "❌ Trust aborted. Review .agent_hubrc, then re-run `riggs trust` (use --yes in scripts)." unless confirmed
-
-      ProjectTrust.trust!(Dir.pwd, config_path: path)
-      puts "✅ Trusted. Re-run `riggs trust` after editing .agent_hubrc."
+    desc "trust:forget PATH", "Forget a trusted project path."
+    def trust_forget(path)
+      require_permission! %w[run_workflow manage_mcp]
+      trust_commands.forget!(path)
     end
 
     desc "identity:show", "Show current user, role, GitHub handle, and memory scope."
@@ -232,7 +113,7 @@ module Riggs
     desc "config:show", "Show .agent_hubrc with secrets masked."
     def config_show
       require_permission! %w[read_workflow edit_workflow configure_memory]
-      store = ConfigStore.new
+      store = ConfigStore.default(cwd: Dir.pwd, trust: Trust.default)
       print_header("Config (#{store.path})")
       puts Psych.dump(store.public_view)
     end
@@ -277,7 +158,7 @@ module Riggs
         puts "No playbooks matched #{text.inspect}."
       else
         matches.each do |wf|
-          puts "• #{wf[:name]} — #{wf[:display_name] || wf[:name]}"
+          puts "• #{wf[:name]} (#{wf[:tier]}) — #{wf[:display_name] || wf[:name]}"
         end
       end
     end
@@ -288,7 +169,7 @@ module Riggs
       rows = Triggers.list_declared
       print_header("Playbook Triggers")
       if rows.empty?
-        puts "No playbooks found in config/riggs/workflows/."
+        puts "No playbooks found. Searched: #{Triggers.default_roots.join(', ')}"
         return
       end
       rows.each do |row|
@@ -300,7 +181,7 @@ module Riggs
           end
         end.join(", ")
         summary = "(none)" if summary.empty?
-        puts "• #{row[:name]} — #{summary}"
+        puts "• #{row[:name]} (#{row[:tier]}) — #{summary}"
       end
     end
 
@@ -316,7 +197,10 @@ module Riggs
     method_option :validate, type: :boolean, default: true, desc: "Validate after write"
     def workflow_new(name)
       require_permission! %w[edit_workflow]
-      path = "./config/riggs/workflows/#{name}.yml"
+      name = Triggers.safe_name(name)
+      abort "❌ Invalid workflow name" unless name
+
+      path = File.join(Triggers.project_workflows_dir, "#{name}.yml")
       FileUtils.mkdir_p(File.dirname(path))
       abort "❌ Already exists: #{path}" if File.exist?(path)
 
@@ -405,11 +289,13 @@ module Riggs
     method_option :ticket, type: :string, desc: "Shorthand for input ticket text"
     method_option :auto_approve, type: :boolean, default: false, desc: "Auto-approve HITL gates (CI)"
     def workflow_run(name)
-      require_permission! %w[run_workflow]
-      workflow = load_workflow(name)
-      identity = current_identity
-      cfg = load_config
       json_mode = options[:mode].to_s == "json"
+      require_permission_for_run!(json_mode)
+      workflow = load_runnable_workflow(name)
+      identity = identity_for_run(json_mode)
+      trust = current_trust
+      resolved = current_resolved
+      cfg = resolved.config
 
       unless json_mode
         print_header("Running Workflow: #{workflow[:display_name] || name}")
@@ -430,7 +316,13 @@ module Riggs
 
       skill_registry = SkillRegistry.new
       mcp_manager = begin
-        MCP::Manager.from_config(cfg[:mcp_servers])
+        MCP::Manager.from_config(
+          cfg[:mcp_servers],
+          provenance: resolved.provenance[:mcp_servers],
+          trust: trust,
+          project_path: resolved.project_path,
+          interactive: $stdin.tty?
+        )
       rescue StandardError => e
         warn "⚠️  MCP disabled for this run — mcp_servers config error: #{e.message}" unless json_mode
         nil
@@ -468,8 +360,10 @@ module Riggs
 
     desc "workflow:resume SESSION_ID", "Resume a workflow session paused at a HITL gate."
     def workflow_resume(session_id)
-      require_permission! %w[run_workflow]
-      cfg = load_config
+      require_permission! %w[run_workflow run_owned_workflow]
+      trust = current_trust
+      resolved = current_resolved
+      cfg = resolved.config
       db_path = cfg[:sqlite_path] || "./db/riggs.sqlite3"
 
       storage = Storage.new(db_path: db_path)
@@ -477,7 +371,7 @@ module Riggs
       storage.close
       abort "❌ Session not found: #{session_id}" unless session
 
-      workflow = load_workflow(session["workflow_name"])
+      workflow = load_runnable_workflow(session["workflow_name"])
       identity = current_identity
 
       print_header("Resuming Workflow: #{workflow[:display_name] || session['workflow_name']}")
@@ -486,7 +380,13 @@ module Riggs
       puts "🔁 Session: #{session_id} (status=#{session['status']})"
 
       mcp_manager = begin
-        MCP::Manager.from_config(cfg[:mcp_servers])
+        MCP::Manager.from_config(
+          cfg[:mcp_servers],
+          provenance: resolved.provenance[:mcp_servers],
+          trust: trust,
+          project_path: resolved.project_path,
+          interactive: $stdin.tty?
+        )
       rescue StandardError => e
         warn "⚠️  MCP disabled for this run — mcp_servers config error: #{e.message}"
         nil
@@ -532,7 +432,9 @@ module Riggs
       storage.close
     end
 
-    desc "memory:recall QUERY", "Search long-term memory for current user."
+    desc "memory:recall QUERY", "Search long-term memory for current user in this project."
+    method_option :legacy, type: :boolean, default: false,
+                           desc: "Read the uncomposed namespace memories written before project scoping."
     def memory_recall(query)
       require_permission! %w[configure_memory run_workflow]
       identity = current_identity
@@ -541,10 +443,10 @@ module Riggs
 
       print_header("Memory Recall")
       puts "🔍 Query: #{query}"
-      puts "🧠 Scope: #{identity[:memory_namespace]}"
+      puts "🧠 Scope: #{recall_namespace(identity)}"
 
       memory = MemoryService.new(
-        namespace: identity[:memory_namespace],
+        namespace: recall_namespace(identity),
         db_path: db_path,
         config: cfg[:sqlite_memory] || {}
       )
@@ -618,8 +520,16 @@ module Riggs
     desc "mcp:list", "List configured MCP servers and their tools."
     def mcp_list
       require_permission! %w[manage_mcp run_workflow]
-      cfg = load_config
-      mgr = MCP::Manager.from_config(cfg[:mcp_servers])
+      trust = current_trust
+      resolved = current_resolved
+      cfg = resolved.config
+      mgr = MCP::Manager.from_config(
+        cfg[:mcp_servers],
+        provenance: resolved.provenance[:mcp_servers],
+        trust: trust,
+        project_path: resolved.project_path,
+        interactive: false
+      )
       if mgr.server_names.empty?
         puts "No mcp_servers configured in .agent_hubrc"
         return
@@ -634,11 +544,27 @@ module Riggs
       mgr.close
     end
 
+    desc "mcp:approve NAME", "Approve a project-declared MCP server command."
+    def mcp_approve(name)
+      require_permission! %w[manage_mcp run_workflow]
+      mcp_approval.approve!(name)
+    rescue Error => e
+      abort "❌ #{e.message}"
+    end
+
     desc "mcp:ping [SERVER]", "Ping MCP server(s) and report tool counts."
     def mcp_ping(server = nil)
       require_permission! %w[manage_mcp run_workflow]
-      cfg = load_config
-      mgr = MCP::Manager.from_config(cfg[:mcp_servers])
+      trust = current_trust
+      resolved = current_resolved
+      cfg = resolved.config
+      mgr = MCP::Manager.from_config(
+        cfg[:mcp_servers],
+        provenance: resolved.provenance[:mcp_servers],
+        trust: trust,
+        project_path: resolved.project_path,
+        interactive: false
+      )
       abort "No mcp_servers configured" if mgr.server_names.empty?
 
       print_header("MCP Ping")
@@ -699,8 +625,79 @@ module Riggs
         Identity.load_config
       end
 
+      def trust_commands
+        @trust_commands ||= TrustCommands.new(trust: current_trust, io: $stdout)
+      end
+
+      def mcp_approval
+        @mcp_approval ||= MCPApproval.new(trust: current_trust, resolved: current_resolved, io: $stdout)
+      end
+
+      def current_trust
+        @current_trust ||= Trust.default
+      end
+
+      def current_resolved
+        @current_resolved ||= Identity.resolved(trust: current_trust)
+      end
+
       def current_identity
-        @current_identity ||= Identity.resolve(cli_user: options[:user])
+        return @current_identity if @current_identity
+
+        @current_identity = resolved_identity
+        puts "▸ running as #{@current_identity[:id]} (#{@current_identity[:role]}) " \
+             "— from #{identity_source_path(@current_identity)}"
+        @current_identity
+      end
+
+      def identity_for_run(json_mode)
+        return current_identity unless json_mode
+
+        resolved_identity
+      end
+
+      def resolved_identity
+        Identity.resolve(
+          cli_user: options[:user], config: current_resolved.config,
+          project_path: current_resolved.project_path
+        )
+      end
+
+      def identity_source_path(identity)
+        return project_source_path if identity_source_tier(identity) == :project
+
+        Config::Resolver.global_config
+      end
+
+      def project_source_path
+        current_resolved.project_config_path || Config::Resolver.global_config
+      end
+
+      # The user map is the direct provenance for who is running. default_user
+      # only selects which key is used when no explicit user was passed.
+      def identity_source_tier(identity)
+        found = user_source_tier(identity)
+        return found unless found.nil?
+
+        current_resolved.provenance[:default_user]
+      end
+
+      def user_source_tier(identity)
+        users = current_resolved.provenance[:users] || {}
+        by_id = lookup_tier(users, identity[:id])
+        return by_id unless by_id.nil?
+
+        lookup_tier(users, selected_user_key)
+      end
+
+      def selected_user_key
+        options[:user] || current_resolved.config[:default_user]
+      end
+
+      def lookup_tier(tiers, key)
+        return nil if key.nil?
+
+        tiers[key.to_sym] || tiers[key.to_s]
       end
 
       # Pass an array to require ANY of the listed permissions; use require_all_permissions! for ALL.
@@ -712,13 +709,74 @@ module Riggs
         abort "⛔ Access denied. '#{identity[:role]}' lacks required permission(s): #{needed.join(' or ')}"
       end
 
+      def require_permission_for_run!(json_mode)
+        return require_permission!(%w[run_workflow run_owned_workflow]) unless json_mode
+
+        require_permission_for_identity!(identity_for_run(true))
+      end
+
+      def require_permission_for_identity!(identity)
+        needed = %w[run_workflow run_owned_workflow]
+        return if needed.intersect?(identity[:permissions])
+
+        abort "⛔ Access denied. '#{identity[:role]}' lacks required permission(s): #{needed.join(' or ')}"
+      end
+
       def load_workflow(name)
-        path = "./config/riggs/workflows/#{name}.yml"
-        # Also try gem-bundled examples
-        path = File.expand_path("../../../config/riggs/workflows/#{name}.yml", __dir__) unless File.exist?(path)
-        abort "❌ Workflow not found: #{name}.yml" unless File.exist?(path)
+        path = Triggers.find_path(name)
+        abort "❌ Workflow not found: #{name}.yml" unless path
 
         Workflow::Loader.load(path: path)
+      end
+
+      # Resolves the path ONCE and gates on the tier of that same file. Asking
+      # Triggers again after loading would gate a different resolution than the
+      # one that was loaded, which is the whole shape of a TOCTOU.
+      def load_runnable_workflow(name)
+        path = Triggers.find_path(name)
+        abort "❌ Workflow not found: #{name}.yml" unless path
+
+        runnable(Workflow::Loader.load(path: path), path, identity_for_run(options[:mode].to_s == "json"))
+      end
+
+      def runnable(workflow, path, identity)
+        denial = WorkflowAccess.denial(identity: identity, workflow: workflow,
+                                       tier: Triggers.tier_for(File.dirname(path)))
+        abort "⛔ Access denied. #{denial}" if denial
+
+        workflow
+      end
+
+      # Memories written before R11.7 carry an uncomposed namespace and match no
+      # project. They are deliberately not migrated, so --legacy is the only
+      # thing standing between them and being stranded.
+      def recall_namespace(identity)
+        return identity[:legacy_memory_namespace] if options[:legacy]
+
+        identity[:memory_namespace]
+      end
+
+      def project_rows
+        with_storage { |storage| Projects.new(storage: storage, trust: Trust.default).rows }
+      end
+
+      # An ambiguous or unknown selector must report no figure at all -- a
+      # misreported number is worse than a refusal, because nothing about it
+      # looks wrong.
+      def cost_lines(project)
+        with_storage { |storage| Cost.new(storage: storage, trust: Trust.default, cwd: Dir.pwd).lines(project) }
+      rescue Error => e
+        abort "❌ #{e.message}"
+      end
+
+      # Opened and closed around the report rather than memoized: these
+      # commands answer and exit, and a held handle on the shared database
+      # outlives the answer.
+      def with_storage
+        storage = Storage.new(db_path: load_config[:sqlite_path] || "./db/riggs.sqlite3")
+        yield storage
+      ensure
+        storage&.close
       end
 
       def print_header(title)

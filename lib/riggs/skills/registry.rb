@@ -282,9 +282,20 @@ module Riggs
 
     def default_roots
       [
-        File.expand_path("./config/riggs/skills"),
-        File.expand_path("../../config/riggs/skills", __dir__)
-      ]
+        # The project root is nil unless the path is trusted, so an untrusted repo
+        # contributes no skills and resolution falls through to global and bundled.
+        Config::Resolver.new.project_roots[:skills],
+        # RIGGS_HOME rather than Dir.home so config, trust, skills and workflows
+        # all name the same global install.
+        File.join(Trust.home, "skills"),
+        # Three levels, not two. __dir__ here is lib/riggs/skills, so the
+        # existing "../../" resolves to lib/config/riggs/skills -- a directory
+        # that has never existed, which is why no bundled skill has ever
+        # loaded. Pre-existing bug, fixed here because this task rewrites this
+        # exact method and shipping the tier list with a dead entry in it would
+        # make the new global tier look broken for the same reason.
+        File.expand_path("../../../config/riggs/skills", __dir__)
+      ].compact
     end
   end
 end

@@ -7,7 +7,7 @@ class TestStorageAuditPaging < Minitest::Test
     @dir = Dir.mktmpdir("riggs-storage-audit")
     @storage = Riggs::Storage.new(db_path: File.join(@dir, "db", "riggs.sqlite3"))
     @session_id = @storage.create_session(
-      workflow_name: "example_triage", user_id: "eng_bob", memory_namespace: "ns"
+      workflow_name: "example_triage", identity: { id: "eng_bob", memory_namespace: "ns" }
     )
     5.times { |i| @storage.audit(session_id: @session_id, event_type: "step_executed", payload: { n: i }) }
   end
@@ -43,7 +43,7 @@ class TestStorageAuditPaging < Minitest::Test
   end
 
   def test_list_audit_after_scopes_to_session
-    other = @storage.create_session(workflow_name: "w", user_id: "u", memory_namespace: "n")
+    other = @storage.create_session(workflow_name: "w", identity: { id: "u", memory_namespace: "n" })
     @storage.audit(session_id: other, event_type: "workflow_start", payload: {})
 
     rows = @storage.list_audit_after(@session_id, 0)

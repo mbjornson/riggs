@@ -30,7 +30,7 @@ module Riggs
     # never gained a column after first ship; keep the key so the next one is
     # a one-line addition.
     EXPECTED_COLUMNS = {
-      "riggs_sessions" => { "resume_state" => "TEXT" }.freeze,
+      "riggs_sessions" => { "resume_state" => "TEXT", "project_path" => "TEXT" }.freeze,
       "riggs_steps" => {}.freeze,
       "riggs_audit" => {}.freeze,
       "riggs_messages" => {
@@ -65,6 +65,8 @@ module Riggs
 
     # CREATE TABLE IF NOT EXISTS never alters a table that already exists, so
     # columns added after a database is in the field need an explicit backfill.
+    # Declared rather than hardcoded per column: the one-ALTER version stopped
+    # at the first absent name, so a database missing two columns got one.
     def ensure_columns!
       EXPECTED_COLUMNS.each do |table, expected|
         cols = @db.execute("PRAGMA table_info(#{table})").map { |r| r["name"] }
@@ -101,12 +103,17 @@ module Riggs
       end
     end
 
-    def create_session(workflow_name:, user_id:, memory_namespace:, config_snapshot: {})
+    # Takes the identity rather than its three fields unpacked. They describe
+    # one thing -- who ran this and where -- always travel together, and the
+    # caller already holds them as one object. Unpacking them here would also
+    # put this method at five parameters.
+    def create_session(workflow_name:, identity:, config_snapshot: {})
       id = SecureRandom.uuid
       @db.execute(
-        "INSERT INTO riggs_sessions (id, workflow_name, user_id, status, memory_namespace, config_snapshot) " \
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        [id, workflow_name, user_id, "running", memory_namespace, JSON.generate(config_snapshot)]
+        "INSERT INTO riggs_sessions (id, workflow_name, user_id, status, memory_namespace, project_path, " \
+        "config_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [id, workflow_name, identity[:id], "running", identity[:memory_namespace],
+         identity[:project_path], JSON.generate(config_snapshot)]
       )
       id
     end
@@ -249,6 +256,45 @@ module Riggs
       @db.last_insert_row_id
     end
 
+    # LEFT JOIN, not INNER: a project whose sessions made no provider call at
+    # all still ran, and an inner join would drop it from the roll-up entirely.
+    # Grouped on the session's project because a call reaches a project only
+    # through its session -- the column deliberately lives on one table.
+    PROJECT_TOTALS = <<~SQL
+      SELECT s.project_path AS project_path,
+             COUNT(DISTINCT s.id) AS runs,
+             MAX(s.started_at) AS last_run,
+             COUNT(c.id) AS calls,
+             SUM(CASE WHEN c.cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS priced_calls,
+             SUM(c.cost_usd) AS cost_usd
+      FROM riggs_sessions s
+      LEFT JOIN riggs_provider_calls c ON c.session_id = s.id
+      GROUP BY s.project_path
+    SQL
+
+    def project_totals
+      @db.execute(PROJECT_TOTALS)
+    end
+
+    # `IS`, not `=`: the (unattributed) bucket is a NULL project_path, and
+    # `= NULL` is never true, so an equality test would report that bucket as
+    # having no provider calls at all.
+    PROVIDER_TOTALS = <<~SQL
+      SELECT c.provider AS provider,
+             COUNT(c.id) AS calls,
+             SUM(CASE WHEN c.cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS priced_calls,
+             SUM(c.cost_usd) AS cost_usd
+      FROM riggs_provider_calls c
+      JOIN riggs_sessions s ON s.id = c.session_id
+      WHERE s.project_path IS ?
+      GROUP BY c.provider
+      ORDER BY c.provider
+    SQL
+
+    def provider_totals(project_path)
+      @db.execute(PROVIDER_TOTALS, [project_path])
+    end
+
     def session_usage(session_id)
       row = @db.get_first_row("#{USAGE_SELECT} WHERE session_id = ?", [utf8(session_id)])
       usage_row(row)
@@ -336,6 +382,7 @@ module Riggs
             started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             ended_at DATETIME,
             memory_namespace TEXT,
+            project_path TEXT,
             config_snapshot TEXT
           );
           CREATE TABLE IF NOT EXISTS riggs_steps (

@@ -1,17 +1,21 @@
 <h1>Playbooks</h1>
-<p class="lead">YAML workflows in <code>config/riggs/workflows/</code>.</p>
+<p class="lead">
+  YAML workflows from the project, global and bundled tiers.
+  A project workflow shadows a global one of the same name.
+</p>
 
 <div class="panel">
   <% if workflows.empty? %>
     <p class="muted">No playbooks found.</p>
   <% else %>
     <table>
-      <thead><tr><th>Name</th><th></th></tr></thead>
+      <thead><tr><th>Name</th><th>Tier</th><th></th></tr></thead>
       <tbody>
-        <% workflows.each do |name| %>
+        <% workflows.each do |workflow| %>
           <tr>
-            <td><a href="<%= h(url("/workflows/#{name}")) %>"><%= h(name) %></a></td>
-            <td><a href="<%= h(url("/workflows/#{name}")) %>">Open</a></td>
+            <td><a href="<%= h(url("/workflows/#{workflow[:name]}")) %>"><%= h(workflow[:name]) %></a></td>
+            <td><code><%= h(workflow[:tier].to_s) %></code></td>
+            <td><a href="<%= h(url("/workflows/#{workflow[:name]}")) %>">Open</a></td>
           </tr>
         <% end %>
       </tbody>

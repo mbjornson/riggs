@@ -35,11 +35,17 @@ module Riggs
       # or compact a conversation running on them.
       UNMETERED = %w[cursor cursor_cli cursor_cloud claude_cli anthropic_cli codex openai_cli cli].freeze
 
-      # Keys that choose how a provider is invoked. A workflow may set type,
-      # model, auth, relay_chain, pricing, and other non-invocation keys, but
-      # it must not pick the binary, its args, the HTTP endpoint, the
-      # credential, or the child environment -- those stay hub-only.
-      INVOCATION_KEYS = %i[command args base_url api_key env].freeze
+      # Fields a workflow file may not set, because a workflow file travels
+      # with a repository just like the project config that is already barred
+      # from setting them (Config::Merge::PROVIDER_FIELDS). These are the keys
+      # that choose how a provider is INVOKED: the binary, its arguments, the
+      # HTTP endpoint, the credential, and the child environment. base_url is
+      # where the credential goes -- OpenAICompatible sends the operator's key
+      # to it as a bearer token, so a workflow naming another host collects it.
+      # Pricing is the same shape of problem in a different currency and is
+      # handled by #pricing_for, which predates this list. A workflow may still
+      # set type, model, auth, relay_chain and every other non-invocation key.
+      OPERATOR_ONLY_FIELDS = %i[command args base_url api_key env].freeze
 
       def self.unmetered_chain?(chain)
         names = Array(chain).map(&:to_s)
@@ -226,17 +232,34 @@ module Riggs
         end
       end
 
-      # Merge: hub ← workflow (workflow wins), except INVOCATION_KEYS, which
-      # are taken from hub only. A workflow value for those keys is ignored.
+      # Merge: hub <- workflow (workflow wins on conflict), except for the
+      # fields below, which the workflow may not move at all.
       def provider_config(name)
+        hub = Identity.deep_symbolize(entry(@hub_providers, name))
+        merged = hub.merge(Identity.deep_symbolize(entry(@workflow_providers, name)))
+        OPERATOR_ONLY_FIELDS.each { |field| apply_operator_field(merged, hub, field) }
+        merged
+      end
+
+      # Deleted when the operator did not set it, not merely left alone: the
+      # guarantee is "the workflow cannot choose this", and letting a workflow
+      # supply the value whenever the operator omitted it is the same redirect
+      # with an extra precondition.
+      def apply_operator_field(merged, hub, field)
+        return merged.delete(field) unless hub.key?(field)
+
+        merged[field] = hub[field]
+      end
+
+      # One lookup for both maps. These were two near-copies, and the endpoint
+      # bug was exactly that pricing_for grew a hub-only rule while the copy
+      # next to it did not.
+      def entry(map, name)
         key = name.to_s
-        hub = @hub_providers[key.to_sym] || @hub_providers[key] || {}
-        wf = @workflow_providers[key.to_sym] || @workflow_providers[key] || {}
-        hub = {} unless hub.is_a?(Hash)
-        wf = {} unless wf.is_a?(Hash)
-        hub = Identity.deep_symbolize(hub)
-        wf = Identity.deep_symbolize(wf)
-        hub.merge(wf.except(*INVOCATION_KEYS))
+        found = map[key.to_sym] || map[key] || {}
+        return {} unless found.is_a?(Hash)
+
+        found
       end
 
       # Non-CLI providers take an API key by definition, so a stray `auth:` on
@@ -274,13 +297,26 @@ module Riggs
       # Normalizes vendor usage and prices it. Only Router resolves provider
       # config, so the per-model pricing override is only reachable here.
       def meter(result, name)
-        opts = provider_config(name)
         usage = Usage.normalize(result[:usage])
-        overrides = opts[:pricing] || {}
         result.merge(
           usage: usage,
-          cost_usd: ModelInfo.cost(model: result[:model], usage: usage, overrides: overrides)
+          cost_usd: ModelInfo.cost(model: result[:model], usage: usage, overrides: pricing_for(name))
         )
+      end
+
+      # Pricing comes from the HUB config alone, deliberately not through
+      # #provider_config -- which merges hub <- workflow and lets the workflow
+      # win, as every other field should. A workflow file travels with a
+      # repository, so that merge let a clone declare its own prices and
+      # report $0.00 for a run that cost $60.00. riggs exists to tell the
+      # operator what their agents cost, so pricing is the operator's the same
+      # way credentials are; Config::Merge::PROVIDER_FIELDS is the matching
+      # guard for the project config tier.
+      # Not deep_symbolized on purpose: these keys are MODEL NAMES, and
+      # symbolizing them makes "gpt-4" stop matching the model actually being
+      # priced.
+      def pricing_for(name)
+        entry(@hub_providers, name)[:pricing] || {}
       end
     end
   end
